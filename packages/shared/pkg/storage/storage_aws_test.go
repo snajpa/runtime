@@ -729,3 +729,71 @@ func TestS3UploadSignedURLNeedsNoRequestHeaders(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, body, read.Bytes())
 }
+
+// Blob reads use a progress-based idle deadline: a stalled body fails without
+// a whole-transfer cap, while a progressing copy completes (REQ-B2).
+func TestAWSWriteToIdleDeadline(t *testing.T) {
+	t.Parallel()
+
+	// The stalled case wants a deadline short enough to fail fast. The progressing
+	// case needs headroom: it flaked in a gate's parallel run when both subtests
+	// shared one 80 ms deadline and scheduling jitter between two writes exceeded
+	// it (2026-09-19).
+	const stalledIdle = 80 * time.Millisecond
+
+	t.Run("stalled body fails", func(t *testing.T) {
+		t.Parallel()
+
+		client := newTestS3Client(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "64")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+
+			<-r.Context().Done()
+		})
+
+		obj := &awsObject{client: client, bucketName: "b", path: "k", readIdleTimeout: stalledIdle}
+
+		_, err := obj.WriteTo(t.Context(), io.Discard)
+		require.Error(t, err)
+	})
+
+	t.Run("progressing body succeeds", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			// The transfer outlives the idle window while every write sits
+			// far below it, so progress keeps resetting the cap and
+			// multi-second load stalls cannot look like a stall. Widened with
+			// the wrapper test after the concurrent-load full-package runs
+			// tripped the 1 s window (2026-09-19).
+			chunks        = 300
+			progressEvery = 20 * time.Millisecond
+			progressIdle  = 5 * time.Second
+		)
+
+		client := newTestS3Client(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(chunks))
+			w.WriteHeader(http.StatusOK)
+
+			f, _ := w.(http.Flusher)
+			for range chunks {
+				_, _ = w.Write([]byte("x"))
+				if f != nil {
+					f.Flush()
+				}
+				time.Sleep(progressEvery)
+			}
+		})
+
+		obj := &awsObject{client: client, bucketName: "b", path: "k", readIdleTimeout: progressIdle}
+
+		var buf bytes.Buffer
+		n, err := obj.WriteTo(t.Context(), &buf)
+		require.NoError(t, err)
+		require.Equal(t, int64(chunks), n)
+		require.Equal(t, strings.Repeat("x", chunks), buf.String())
+	})
+}

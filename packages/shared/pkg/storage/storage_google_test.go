@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"net/http"
 	"testing"
+	"time"
 
 	gcs "cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
@@ -173,4 +174,16 @@ func TestGCSObjectStoreFileSmallUncompressed(t *testing.T) {
 	_, err = obj.WriteTo(t.Context(), &got)
 	require.NoError(t, err)
 	require.Equal(t, sha256.Sum256(data), sha256.Sum256(got.Bytes()))
+}
+
+// The declared GCS budgets are pinned: small writes are hard-capped, and
+// streaming reads use an inactivity deadline with a declared default (REQ-B2).
+func TestGCSDeclaredBudgets(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 30*time.Second, googleWriteTimeout)
+	require.Positive(t, googleReadTimeout)
+	require.Equal(t, googleReadTimeout, (&gcpObject{}).readIdle(),
+		"objects without an explicit override use the declared default")
+	require.Equal(t, time.Second, (&gcpObject{readIdleTimeout: time.Second}).readIdle())
 }

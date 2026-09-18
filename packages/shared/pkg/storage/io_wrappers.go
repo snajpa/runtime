@@ -268,3 +268,45 @@ func (r *fileSectionReader) Len() int {
 
 	return int(r.Size() - cur)
 }
+
+// idleDeadlineReader cancels a streaming transfer's context when the wrapped
+// reads stop making progress: every read that returns data extends the
+// deadline, so a large-but-healthy transfer is never capped while a stalled
+// one fails promptly (REQ-B2). It is the streaming counterpart of the
+// read-path idle timeout.
+type idleDeadlineReader struct {
+	io.ReadCloser
+
+	timeout time.Duration
+	cancel  context.CancelFunc
+	timer   *time.Timer
+}
+
+func newIdleDeadlineReader(body io.ReadCloser, timeout time.Duration, cancel context.CancelFunc) *idleDeadlineReader {
+	r := &idleDeadlineReader{
+		ReadCloser: body,
+		timeout:    timeout,
+		cancel:     cancel,
+	}
+	r.timer = time.AfterFunc(timeout, cancel)
+
+	return r
+}
+
+func (r *idleDeadlineReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	switch {
+	case err != nil:
+		r.timer.Stop()
+	case n > 0:
+		r.timer.Reset(r.timeout)
+	}
+
+	return n, err
+}
+
+// stop halts the idle deadline; callers defer it so a completed transfer can
+// never cancel its own context afterwards.
+func (r *idleDeadlineReader) stop() {
+	r.timer.Stop()
+}

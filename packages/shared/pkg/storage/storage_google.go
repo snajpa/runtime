@@ -34,6 +34,7 @@ import (
 const (
 	googleReadTimeout             = 10 * time.Second
 	googleOperationTimeout        = 5 * time.Second
+	googleWriteTimeout            = 30 * time.Second
 	googleBufferSize              = 4 << 20 // 4 MiB
 	googleInitialBackoff          = 10 * time.Millisecond
 	googleMaxBackoff              = 10 * time.Second
@@ -61,6 +62,10 @@ type gcpObject struct {
 	path    string
 	handle  *storage.ObjectHandle
 	objType SeekableObjectType
+
+	// readIdleTimeout is the inactivity budget for streaming blob reads; zero
+	// (objects built in tests) falls back to googleReadTimeout.
+	readIdleTimeout time.Duration
 
 	limiter *limit.Limiter
 }
@@ -330,6 +335,11 @@ func (r *idleTimeoutReader) Close(_ context.Context) (*ReadStats, error) {
 }
 
 func (o *gcpObject) Put(ctx context.Context, data []byte, opts ...PutOption) error {
+	// Small writes are hard-capped like AWS and Azure (REQ-B2); the GCS SDK
+	// writer otherwise inherits only the caller's context.
+	ctx, cancel := context.WithTimeout(ctx, googleWriteTimeout)
+	defer cancel()
+
 	timer := googleWriteTimerFactory.Begin(attribute.String(gcsOperationAttr, gcsOperationAttrWrite))
 
 	w := o.handle.NewWriter(ctx)
@@ -381,8 +391,13 @@ func (o *gcpObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err er
 	start := time.Now()
 	defer func() { RecordReadBlob(ctx, time.Since(start), n, o.path, SourceGCS, err) }()
 
-	ctx, cancel := context.WithTimeout(ctx, googleReadTimeout)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// The idle deadline also covers the open: a stalled reader creation fails
+	// after the same inactivity window as a stalled body (REQ-B2).
+	openTimer := time.AfterFunc(o.readIdle(), cancel)
+	defer openTimer.Stop()
 
 	reader, err := o.handle.NewReader(ctx)
 	if err != nil {
@@ -395,13 +410,27 @@ func (o *gcpObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err er
 
 	defer reader.Close()
 
+	openTimer.Stop()
+	body := newIdleDeadlineReader(reader, o.readIdle(), cancel)
+	defer body.stop()
+
 	buff := make([]byte, googleBufferSize)
-	n, err = io.CopyBuffer(dst, reader, buff)
+	n, err = io.CopyBuffer(dst, body, buff)
 	if err != nil {
 		return n, fmt.Errorf("failed to copy %q to buffer: %w", o.path, err)
 	}
 
 	return n, nil
+}
+
+// readIdle is the streaming read inactivity budget; objects without an
+// explicit override use the declared default.
+func (o *gcpObject) readIdle() time.Duration {
+	if o.readIdleTimeout > 0 {
+		return o.readIdleTimeout
+	}
+
+	return googleReadTimeout
 }
 
 func (o *gcpObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (_ *FullFrameTable, _ [32]byte, e error) {
