@@ -687,6 +687,42 @@ func TestCopyFromProcess_MAX_RW_COUNT_Misalignment_Hugepage(t *testing.T) {
 	}
 }
 
+// TestCacheBorrowKeepsTheRangeUntilReleased pins the borrow contract the
+// chunker's ReadAt relies on: a leased range is the mapping itself, kept valid
+// by the cache's read lock, so Close waits for the release instead of unmapping
+// the bytes a borrower is still copying (S-17's ownership model).
+func TestCacheBorrowKeepsTheRangeUntilReleased(t *testing.T) {
+	t.Parallel()
+
+	chunker, _, _, frameSize := newWarmedChunker(t, testFrameSize/1024)
+	cache := chunker.cache
+
+	borrowed, release, err := cache.sliceLease(0, frameSize)
+	require.NoError(t, err)
+	require.Equal(t, makeTestData(int(frameSize)), borrowed, "the borrow must hand out the cached bytes")
+
+	closed := make(chan struct{})
+
+	go func() {
+		_ = cache.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+		t.Fatal("the cache closed while a range was still borrowed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cache did not close after its borrow was released")
+	}
+}
+
 func BenchmarkCopyFromHugepagesFile(b *testing.B) {
 	pageSize := int64(header.HugepageSize)
 	size := pageSize * 500

@@ -34,6 +34,7 @@ type Chunker struct {
 
 	fetchMu       sync.Mutex
 	fetchSessions []*fetchSession
+	pattern       readPattern
 }
 
 func NewChunker(
@@ -60,31 +61,65 @@ func NewChunker(
 
 // ReadAt and Slice take {upstream, ft} as a paired snapshot from the caller.
 // The caller is responsible for keeping them consistent.
+//
+// ReadAt copies the range into the caller's buffer, so it borrows the mapping
+// and copies once; Slice returns an owned copy for callers that keep the bytes
+// (S-17's ownership model, INV-4).
 func (c *Chunker) ReadAt(ctx context.Context, b []byte, off int64, upstream storage.RangeOpener, ft *storage.FrameTable) (int, error) {
-	slice, err := c.Slice(ctx, off, int64(len(b)), upstream, ft)
+	ct := ft.CompressionType()
+	start := time.Now()
+
+	slice, release, src, err := c.acquire(ctx, off, int64(len(b)), upstream, ft)
 	if err != nil {
+		c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(start), 0, storage.ErrAttrs(c.objType, src, ct, err))
+
 		return 0, fmt.Errorf("failed to slice cache at %d-%d: %w", off, off+int64(len(b)), err)
 	}
+	defer release()
 
-	return copy(b, slice), nil
+	n := copy(b, slice)
+
+	c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(start), int64(n), storage.OKAttrs(c.objType, src, ct))
+
+	return n, nil
 }
 
+// Slice returns an owned copy of the requested range: the caller owns the bytes,
+// so they stay valid after the cache is closed. Callers that copy the bytes
+// into a buffer of their own should use ReadAt, which copies once.
 func (c *Chunker) Slice(ctx context.Context, off, length int64, upstream storage.RangeOpener, ft *storage.FrameTable) ([]byte, error) {
 	ct := ft.CompressionType()
-	sliceStart := time.Now()
+	start := time.Now()
 
-	// Fast path: already cached.
-	b, err := c.cache.Slice(off, length)
+	slice, release, src, err := c.acquire(ctx, off, length, upstream, ft)
+	if err != nil {
+		c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(start), 0, storage.ErrAttrs(c.objType, src, ct, err))
+
+		return nil, err
+	}
+	defer release()
+
+	out := append([]byte(nil), slice...)
+
+	c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(start), length, storage.OKAttrs(c.objType, src, ct))
+
+	return out, nil
+}
+
+// acquire returns the bytes of the requested range together with the release of
+// the borrow that keeps them valid. Cached bytes are lent straight from the
+// mapping (no copy); a fetched range is lent once its fetch session confirmed
+// the data. Callers must copy or consume the bytes before releasing: a held
+// borrow keeps the cache's read lock, and with it Close.
+func (c *Chunker) acquire(ctx context.Context, off, length int64, upstream storage.RangeOpener, ft *storage.FrameTable) ([]byte, func(), storage.Source, error) {
+	// Fast path: already cached, lent under the cache's read lease.
+	b, release, err := c.cache.sliceLease(off, length)
 	if err == nil {
-		c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), length, storage.OKAttrs(c.objType, storage.SourceMmap, ct))
-
-		return b, nil
+		return b, release, storage.SourceMmap, nil
 	}
 
 	if !errors.As(err, &BytesNotAvailableError{}) {
-		c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), 0, storage.ErrAttrs(c.objType, storage.SourceMmap, ct, err))
-
-		return nil, fmt.Errorf("failed read from cache at offset %d: %w", off, err)
+		return nil, func() {}, storage.SourceMmap, fmt.Errorf("failed read from cache at offset %d: %w", off, err)
 	}
 
 	// Resolve every chunk of the span and start its fetch session before
@@ -104,10 +139,12 @@ func (c *Chunker) Slice(ctx context.Context, off, length int64, upstream storage
 	for cur := off; cur < end; {
 		chunkOff, chunkLen, lerr := c.locateChunk(cur, ft)
 		if lerr != nil {
-			c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), 0, storage.ErrAttrs(c.objType, src, ct, lerr))
-
-			return nil, fmt.Errorf("failed to locate chunk for offset %d: %w", cur, lerr)
+			return nil, func() {}, src, fmt.Errorf("failed to locate chunk for offset %d: %w", cur, lerr)
 		}
+		if cur == off {
+			c.pattern.observe(ctx, chunkOff, chunkLen, c.objType)
+		}
+
 		chunkEnd := chunkOff + chunkLen
 		rangeEnd := min(end, chunkEnd)
 
@@ -124,25 +161,20 @@ func (c *Chunker) Slice(ctx context.Context, off, length int64, upstream storage
 	for _, span := range spans {
 		spanSrc, err := span.session.waitForRange(ctx, span.off, span.end)
 		if err != nil {
-			c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), 0, storage.ErrAttrs(c.objType, spanSrc, ct, err))
-
-			return nil, fmt.Errorf("failed to ensure data at %d-%d: %w", span.off, span.end, err)
+			return nil, func() {}, spanSrc, fmt.Errorf("failed to ensure data at %d-%d: %w", span.off, span.end, err)
 		}
 
 		src = max(src, spanSrc)
 	}
 
-	// sliceDirect skips isCached — the waiter already confirmed the data is in the mmap.
-	b, cacheErr := c.cache.sliceDirect(off, length)
+	// sliceDirectLease skips isCached — the waiter already confirmed the data is
+	// in the mmap — and lends the range instead of copying it.
+	b, release, cacheErr := c.cache.sliceDirectLease(off, length)
 	if cacheErr != nil {
-		c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), 0, storage.ErrAttrs(c.objType, src, ct, cacheErr))
-
-		return nil, fmt.Errorf("failed to read from cache after ensuring data at %d-%d: %w", off, off+length, cacheErr)
+		return nil, func() {}, src, fmt.Errorf("failed to read from cache after ensuring data at %d-%d: %w", off, off+length, cacheErr)
 	}
 
-	c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), length, storage.OKAttrs(c.objType, src, ct))
-
-	return b, nil
+	return b, release, src, nil
 }
 
 // getOrCreateSession returns a fetch session for the chunk at [off, off+length),
