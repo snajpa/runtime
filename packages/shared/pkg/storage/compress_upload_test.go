@@ -5,6 +5,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -191,6 +192,68 @@ func TestCompressStreamRoundTrip(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, original, decompressed)
 		})
+	}
+}
+
+// recordingUploader drives the shared stream's abort/residue accounting: it
+// can fail one part and records Close calls.
+type recordingUploader struct {
+	abortable  bool
+	failPart   int
+	completed  bool
+	closeCalls atomic.Int32
+}
+
+func (u *recordingUploader) Start(context.Context) error { return nil }
+
+func (u *recordingUploader) UploadPart(_ context.Context, partIndex int, _ ...[]byte) error {
+	if partIndex == u.failPart {
+		return errors.New("part upload failed")
+	}
+
+	return nil
+}
+
+func (u *recordingUploader) Complete(context.Context) error {
+	u.completed = true
+
+	return nil
+}
+
+func (u *recordingUploader) Close() error {
+	u.closeCalls.Add(1)
+
+	return nil
+}
+
+func (u *recordingUploader) Abortable() bool { return u.abortable }
+
+func TestClassifyUploadEnd(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, uploadEndCommitted, classifyUploadEnd(true, true, nil))
+	require.Equal(t, uploadEndCommitted, classifyUploadEnd(true, false, errors.New("abort")))
+	require.Equal(t, uploadEndAborted, classifyUploadEnd(false, true, nil))
+	require.Equal(t, uploadEndResidue, classifyUploadEnd(false, true, errors.New("abort failed")))
+	require.Equal(t, uploadEndResidue, classifyUploadEnd(false, false, nil))
+}
+
+// Every failed upload must still release (or explicitly classify) its staged
+// parts: the deferred Close runs for abortable providers, and non-abortable
+// ones are counted as residue instead (REQ-A3).
+func TestCompressStreamClosesFailedUpload(t *testing.T) {
+	t.Parallel()
+
+	for _, abortable := range []bool{true, false} {
+		data := generateSemiRandomData(megabyte)
+		up := &recordingUploader{abortable: abortable, failPart: 1}
+		cfg := defaultCfg(CompressionLZ4, 1, 256*1024)
+
+		_, _, err := compressStream(t.Context(), bytes.NewReader(data), cfg, up, 2, nil)
+		require.Error(t, err)
+		require.False(t, up.completed)
+		require.Equal(t, int32(1), up.closeCalls.Load(),
+			"failed uploads must release staged parts (abortable=%v)", abortable)
 	}
 }
 

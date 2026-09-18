@@ -647,6 +647,15 @@ func (m *azurePartUploader) Close() error {
 	return nil
 }
 
+// Abortable reports false: Azure stages blocks in a per-blob namespace with no
+// abort API, so a failed upload leaves residue the service garbage-collects
+// after ~7 days; the shared layer records it (REQ-A3). Committing an empty
+// block list is not an alternative — it would leave a visible empty object
+// where readers expect none.
+func (m *azurePartUploader) Abortable() bool { return false }
+
+func (m *azurePartUploader) ProviderName() string { return "azure" }
+
 // azureMetadataKeyUnsafe reports whether a key cannot survive the encoding
 // below. "__" would decode back to "-", and a "_" adjacent to a "-" encodes
 // into a run of three underscores that decodes ambiguously (a_-b and a-_b

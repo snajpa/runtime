@@ -13,6 +13,8 @@ import (
 
 type partUploaderTestAdapter struct {
 	abortsOnClose bool
+	abortable     bool
+	provider      string
 	new           func(t *testing.T, recorder *partUploaderRecorder) partUploader
 }
 
@@ -36,6 +38,9 @@ func testPartUploaderContract(t *testing.T, adapter partUploaderTestAdapter) {
 
 		recorder := &partUploaderRecorder{}
 		uploader := adapter.new(t, recorder)
+
+		require.Equal(t, adapter.abortable, uploader.Abortable())
+		require.Equal(t, adapter.provider, uploaderProviderName(uploader))
 
 		require.NoError(t, uploader.Start(t.Context()))
 		require.NoError(t, uploader.UploadPart(t.Context(), 2, []byte("two")))

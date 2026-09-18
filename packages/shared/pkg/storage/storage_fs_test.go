@@ -125,3 +125,13 @@ func TestWriteToNonExistentObject(t *testing.T) {
 	_, err = GetBlob(t.Context(), obj)
 	require.ErrorIs(t, err, ErrObjectNotExist)
 }
+
+// The filesystem uploader stages parts in memory and writes the object
+// atomically on Complete, so a failed upload leaves no file behind.
+func TestFSPartUploaderResidueContract(t *testing.T) {
+	t.Parallel()
+
+	uploader := &fsPartUploader{}
+	require.True(t, uploader.Abortable())
+	require.Equal(t, "fs", uploader.ProviderName())
+}
