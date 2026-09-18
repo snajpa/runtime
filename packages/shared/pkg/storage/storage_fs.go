@@ -147,7 +147,11 @@ func (o *fsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err err
 	return n, err
 }
 
-func (o *fsObject) Put(_ context.Context, data []byte, _ ...PutOption) error {
+func (o *fsObject) Put(_ context.Context, data []byte, opts ...PutOption) error {
+	if err := ApplyPutOptions(opts).Metadata.Validate(); err != nil {
+		return fmt.Errorf("invalid object metadata for %s: %w", o.path, err)
+	}
+
 	return o.atomicWriteFile(0o644, func(w io.Writer) error {
 		_, err := io.Copy(w, bytes.NewReader(data))
 
@@ -157,6 +161,10 @@ func (o *fsObject) Put(_ context.Context, data []byte, _ ...PutOption) error {
 
 func (o *fsObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (*FullFrameTable, [32]byte, error) {
 	putOpts := ApplyPutOptions(opts)
+	if err := putOpts.Metadata.Validate(); err != nil {
+		return nil, [32]byte{}, fmt.Errorf("invalid object metadata for %s: %w", o.path, err)
+	}
+
 	cfg := CompressConfigFromOpts(putOpts)
 	if cfg.IsCompressionEnabled() {
 		ft, checksum, err := o.storeFileCompressed(ctx, path, cfg, putOpts.FrameSink)

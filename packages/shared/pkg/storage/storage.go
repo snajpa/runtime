@@ -89,6 +89,14 @@ type (
 	FrameSink      = storageopts.FrameSink
 )
 
+// Shared object-metadata bounds, re-exported for callers that validate their
+// own metadata before writing (REQ-H1).
+const (
+	MaxMetadataKeyBytes   = storageopts.MaxMetadataKeyBytes
+	MaxMetadataValueBytes = storageopts.MaxMetadataValueBytes
+	MaxMetadataBytes      = storageopts.MaxMetadataBytes
+)
+
 const (
 	ObjectMetadataTeamID           = storageopts.ObjectMetadataTeamID
 	ObjectMetadataTemplateID       = storageopts.ObjectMetadataTemplateID

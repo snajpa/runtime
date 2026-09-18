@@ -335,6 +335,10 @@ func (r *idleTimeoutReader) Close(_ context.Context) (*ReadStats, error) {
 }
 
 func (o *gcpObject) Put(ctx context.Context, data []byte, opts ...PutOption) error {
+	if err := ApplyPutOptions(opts).Metadata.Validate(); err != nil {
+		return fmt.Errorf("invalid object metadata for %s: %w", o.path, err)
+	}
+
 	// Small writes are hard-capped like AWS and Azure (REQ-B2); the GCS SDK
 	// writer otherwise inherits only the caller's context.
 	ctx, cancel := context.WithTimeout(ctx, googleWriteTimeout)
@@ -434,6 +438,10 @@ func (o *gcpObject) readIdle() time.Duration {
 }
 
 func (o *gcpObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (_ *FullFrameTable, _ [32]byte, e error) {
+	if err := ApplyPutOptions(opts).Metadata.Validate(); err != nil {
+		return nil, [32]byte{}, fmt.Errorf("invalid object metadata for %s: %w", o.path, err)
+	}
+
 	ctx, span := tracer.Start(ctx, "write to gcp from file system")
 	defer func() {
 		recordError(span, e)
