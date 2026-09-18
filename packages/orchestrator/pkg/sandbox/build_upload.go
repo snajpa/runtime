@@ -178,7 +178,7 @@ func (u *Upload) publish(ctx context.Context, t build.DiffType, h *headers.Heade
 // an uncompressed upload. Feature flags override the base config when active.
 // Returns zero-value CompressConfig when compression is disabled. fileType,
 // useCase are added to the LD evaluation context; blockSize constrains legal
-// frame sizes — see validateCompressConfig.
+// frame sizes — see storage.CompressConfig.ValidateFrameSize.
 func resolveCompressConfig(ctx context.Context, base storage.CompressConfig, ff *featureflags.Client, fileType string, blockSize uint64, useCase string) (storage.CompressConfig, bool, error) {
 	resolved := base
 	var useV4 bool
@@ -207,39 +207,30 @@ func resolveCompressConfig(ctx context.Context, base storage.CompressConfig, ff 
 				FrameEncodeWorkers: v.Get("frameEncodeWorkers").IntValue(),
 				EncoderConcurrency: v.Get("encoderConcurrency").IntValue(),
 			}
+			// Validate before the shortcut below: an unknown type used to be
+			// discarded silently, leaving the base config in place.
+			if err := ldCfg.Validate(); err != nil {
+				return storage.CompressConfig{}, false, fmt.Errorf("compress-config flag: %w", err)
+			}
 			if ldCfg.CompressionType() != storage.CompressionNone {
 				resolved = ldCfg
 			}
 		}
 	}
 
+	// A configuration that asks for compression but names a type this build
+	// cannot produce is a misconfiguration, not a disabled config.
+	if err := resolved.Validate(); err != nil {
+		return storage.CompressConfig{}, false, err
+	}
+
 	if !resolved.IsCompressionEnabled() {
 		return storage.CompressConfig{}, useV4, nil
 	}
 
-	if err := validateCompressConfig(resolved, blockSize); err != nil {
+	if err := resolved.ValidateFrameSize(blockSize); err != nil {
 		return storage.CompressConfig{}, false, err
 	}
 
 	return resolved, useV4, nil
-}
-
-// validateCompressConfig checks that the resolved config is internally
-// consistent for the given block size. Frame size must be a positive multiple
-// of blockSize so that every block-sized read served by the chunker lies
-// inside one frame — otherwise Chunker.fetch fetches only the start frame and
-// cache.sliceDirect returns uninitialized mmap bytes for the tail.
-func validateCompressConfig(c storage.CompressConfig, blockSize uint64) error {
-	fs := c.FrameSize()
-	if fs <= 0 {
-		return fmt.Errorf("frame size must be positive, got %d KB", c.FrameSizeKB)
-	}
-	if blockSize == 0 {
-		return errors.New("block size must be positive")
-	}
-	if uint64(fs)%blockSize != 0 {
-		return fmt.Errorf("frame size (%d) must be a multiple of block size (%d)", fs, blockSize)
-	}
-
-	return nil
 }

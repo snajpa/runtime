@@ -1,5 +1,10 @@
 package storage
 
+import (
+	"errors"
+	"fmt"
+)
+
 const (
 	// DefaultCompressFrameSize is the default uncompressed size of each
 	// compression frame (2 MiB). Overridable via CompressConfig.FrameSizeKB.
@@ -60,4 +65,45 @@ func (c CompressConfig) MinPartSize() int64 {
 // IsCompressionEnabled reports whether compression is configured and active.
 func (c CompressConfig) IsCompressionEnabled() bool {
 	return c.Enabled && c.CompressionType() != CompressionNone
+}
+
+// Validate checks the configuration for internal consistency. A disabled
+// configuration is always valid because none of its fields are used; an
+// enabled one must name a supported compression type. Frame-size checks that
+// depend on the reader's block size are in ValidateFrameSize.
+func (c CompressConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+
+	if _, err := ParseCompressionType(c.Type); err != nil {
+		return err
+	}
+
+	if fs := c.FrameSize(); fs <= 0 {
+		return fmt.Errorf("frame size must be positive, got %d KB", c.FrameSizeKB)
+	}
+
+	return nil
+}
+
+// ValidateFrameSize checks that the frame size is a positive multiple of
+// blockSize so that every block-sized read served by the chunker lies inside
+// one frame — otherwise Chunker.fetch fetches only the start frame and
+// cache.sliceDirect returns uninitialized mmap bytes for the tail.
+func (c CompressConfig) ValidateFrameSize(blockSize uint64) error {
+	fs := c.FrameSize()
+	if fs <= 0 {
+		return fmt.Errorf("frame size must be positive, got %d KB", c.FrameSizeKB)
+	}
+
+	if blockSize == 0 {
+		return errors.New("block size must be positive")
+	}
+
+	if uint64(fs)%blockSize != 0 {
+		return fmt.Errorf("frame size (%d) must be a multiple of block size (%d)", fs, blockSize)
+	}
+
+	return nil
 }

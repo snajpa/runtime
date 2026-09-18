@@ -170,6 +170,10 @@ func Parse() (Config, error) {
 		return config, err
 	}
 
+	if err = config.StorageConfig.CompressConfig.Validate(); err != nil {
+		return config, fmt.Errorf("storage config: %w", err)
+	}
+
 	if config.PersistentVolumeMounts != nil {
 		for name, path := range config.PersistentVolumeMounts {
 			path = filepath.Clean(path)
@@ -201,6 +205,10 @@ func ParseBuilder() (BuilderConfig, error) {
 
 	if err = model.NetworkConfig.Validate(); err != nil {
 		return BuilderConfig{}, err
+	}
+
+	if err = model.StorageConfig.CompressConfig.Validate(); err != nil {
+		return BuilderConfig{}, fmt.Errorf("storage config: %w", err)
 	}
 
 	return model, nil
