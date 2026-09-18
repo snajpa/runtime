@@ -4,12 +4,16 @@ import (
 	"bytes"
 
 	"go.opentelemetry.io/otel"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 )
 
+// The canonical size definitions (and their derivation checks) live in
+// packages/shared/pkg/units; these names stay for the call sites.
 const (
-	PageSize        = 4 << 10 // 4 KiB
-	HugepageSize    = 2 << 20 // 2 MiB
-	RootfsBlockSize = 4 << 10 // 4 KiB
+	PageSize        = units.PageSize
+	HugepageSize    = units.HugepageSize
+	RootfsBlockSize = units.RootfsBlockSize
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/shared/pkg/storage/header")

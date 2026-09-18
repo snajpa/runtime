@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	oldMemfileHugePageSize = 2 << 20 // 2 MiB
-	oldRootfsBlockSize     = 4 << 10 // 4 KiB
+	// Sizes assumed for old-style templates without a header; the same host
+	// sizes as the canonical ones in packages/shared/pkg/units.
+	oldMemfileHugePageSize = header.HugepageSize
+	oldRootfsBlockSize     = header.RootfsBlockSize
 )
 
 type Storage struct {
