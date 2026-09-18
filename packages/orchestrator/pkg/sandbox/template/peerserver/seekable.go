@@ -14,6 +14,11 @@ import (
 
 var _ SeekableSource = &seekableSource{}
 
+// peerStreamChunkSize bounds how much of a requested range is materialized at
+// once: the range is sliced and sent window by window, so serving a large
+// range never allocates O(length) (REQ-D7, audit §9.2).
+const peerStreamChunkSize = 4 << 20 // 4 MiB
+
 // seekableSource serves seekable diff files (memfile, rootfs.ext4).
 // Supports Size and random-access streaming via offset/length.
 type seekableSource struct {
@@ -35,25 +40,31 @@ func (f *seekableSource) Stream(ctx context.Context, offset, length int64, sende
 	))
 	defer span.End()
 
-	// P2P always serves uncompressed bytes — pass nil FrameTable.
-	data, err := f.diff.Slice(ctx, offset, length, nil)
-	if err != nil {
-		span.RecordError(err)
+	// P2P always serves uncompressed bytes — pass nil FrameTable. The range
+	// is sliced window by window and each window is sent before the next is
+	// read, so memory stays O(window) instead of O(length).
+	for sent := int64(0); sent < length; {
+		window := min(length-sent, peerStreamChunkSize)
 
-		return fmt.Errorf("slice diff at offset %d: %w", offset, err)
-	}
+		data, err := f.diff.Slice(ctx, offset+sent, window, nil)
+		if err != nil {
+			span.RecordError(err)
 
-	blockSize := int(f.diff.BlockSize())
+			return fmt.Errorf("slice diff at offset %d: %w", offset+sent, err)
+		}
+		if len(data) == 0 {
+			// No progress: stop rather than spin on a source that returned
+			// nothing for a non-empty window.
+			break
+		}
 
-	for len(data) > 0 {
-		take := min(len(data), blockSize)
-		if err := sender.Send(data[:take]); err != nil {
+		if err := sendChunked(sender, data); err != nil {
 			span.RecordError(err)
 
 			return fmt.Errorf("send diff chunk: %w", err)
 		}
 
-		data = data[take:]
+		sent += int64(len(data))
 	}
 
 	return nil

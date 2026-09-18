@@ -101,6 +101,13 @@ func TestHeaderSource_Stream_ServesDurableHeader(t *testing.T) {
 	sender := &collectSender{}
 	require.NoError(t, src.Stream(t.Context(), sender))
 	assert.NotEmpty(t, sender.data)
+
+	served, err := storageheader.DeserializeBytes(sender.data)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(storageheader.MetadataVersionV5), served.Metadata.Version,
+		"peer-served headers are always V5 on the wire")
+	assert.True(t, served.IncompletePendingUpload,
+		"a peer-served header is provisional and must not be treated as final")
 }
 
 // A header on a heavily fragmented build serializes past the transport's
