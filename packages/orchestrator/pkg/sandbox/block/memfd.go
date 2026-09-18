@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -183,6 +184,11 @@ type MemfdCache struct {
 	cache  *Cache
 	cancel context.CancelFunc
 	done   *utils.SetOnce[struct{}]
+
+	// closeAfterCopy hands the cache's close to the copy goroutine when Close
+	// times out: the cache must not be unmapped under an in-flight copy, and
+	// teardown must not hang on it (S-33, INV-5).
+	closeAfterCopy atomic.Bool
 }
 
 // NewCacheFromMemfdAsync starts the memfd→cache copy on a goroutine so
@@ -232,6 +238,14 @@ func (m *MemfdCache) runCopy(ctx context.Context, memfd *Memfd, dirty *roaring.B
 		err = errors.Join(err, fmt.Errorf("close memfd: %w", closeErr))
 	}
 	_ = m.done.SetResult(struct{}{}, err)
+
+	// A Close that timed out handed this goroutine the cache's close: the
+	// cache must not be closed while the copy can still write to it (S-33).
+	if m.closeAfterCopy.Load() {
+		if closeErr := m.cache.Close(); closeErr != nil {
+			logger.L().Warn(ctx, "failed to close memfd cache after a timed-out Close", zap.Error(closeErr))
+		}
+	}
 }
 
 // Wait blocks until the background copy completes (or ctx is cancelled).
@@ -272,9 +286,22 @@ func (m *MemfdCache) waitBounded() error {
 }
 
 func (m *MemfdCache) Close() error {
-	if m.cancel != nil {
-		m.cancel()
-		<-m.done.Done
+	if m.cancel == nil {
+		return m.cache.Close()
+	}
+
+	m.cancel()
+
+	select {
+	case <-m.done.Done:
+	case <-time.After(memfdWaitTimeout):
+		// The copy outlived the bound: hand the cache's close to the copy
+		// goroutine (runCopy closes it once the promise resolves) so Close
+		// stays bounded without unmapping the cache under an in-flight writer
+		// (S-33, INV-5).
+		m.closeAfterCopy.Store(true)
+
+		return fmt.Errorf("memfd cache copy did not finish within %s; the copy will close the cache", memfdWaitTimeout)
 	}
 
 	return m.cache.Close()
@@ -673,6 +700,16 @@ func (d *DedupedMemfdCache) ServeMemfd(b []byte, off int64) (int, error) {
 
 func (d *DedupedMemfdCache) Close() error {
 	d.cancel()
+
+	// Bounded: a drain that never resolves must not hang teardown (S-33,
+	// INV-5). On timeout the drain still owns the output, so the partial file
+	// is left for it to finish (or clean up) rather than removed under a
+	// writer.
+	select {
+	case <-d.done.Done:
+	case <-time.After(memfdWaitTimeout):
+		return fmt.Errorf("deduped memfd cache drain did not finish within %s", memfdWaitTimeout)
+	}
 
 	c, waitErr := d.done.Wait()
 	if c != nil {

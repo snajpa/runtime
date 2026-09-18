@@ -129,8 +129,18 @@ func (o *DirectProvider) FoldSealed(_ context.Context) (*block.Cache, error) {
 	return nil, nil
 }
 
+// signalFinishedOperations publishes the overlay-release signal without ever
+// blocking: Close may run twice, and a second blocking send on the buffer-1
+// channel would hang teardown forever (S-33, INV-5).
+func (o *DirectProvider) signalFinishedOperations() {
+	select {
+	case o.finishedOperations <- struct{}{}:
+	default:
+	}
+}
+
 func (o *DirectProvider) Close(ctx context.Context) error {
-	o.finishedOperations <- struct{}{}
+	o.signalFinishedOperations()
 
 	if !o.closed.CompareAndSwap(false, true) {
 		return nil
