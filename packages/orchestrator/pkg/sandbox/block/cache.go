@@ -499,19 +499,38 @@ func (c *Cache) Size() (int64, error) {
 // and its mapping is unmapped — no lock or lifetime contract crosses the
 // package boundary.
 func (c *Cache) Slice(off, length int64) ([]byte, error) {
+	slice, release, err := c.sliceLease(off, length)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	return append([]byte(nil), slice...), nil
+}
+
+// sliceLease borrows the requested range of the mapping and returns the release
+// that ends the borrow. The cache's read lock is held until release is called,
+// so the alias stays valid while the borrow is held and Close cannot unmap the
+// range underneath it. Callers that copy the bytes out themselves (the
+// chunker's ReadAt) avoid the owned copy Slice makes; a borrow must be released
+// promptly, because a held one keeps Close waiting.
+func (c *Cache) sliceLease(off, length int64) ([]byte, func(), error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 
 	if c.isClosed() {
-		return nil, NewErrCacheClosed(c.filePath)
+		c.mu.RUnlock()
+
+		return nil, func() {}, NewErrCacheClosed(c.filePath)
 	}
 
 	slice, err := c.sliceLocked(off, length)
 	if err != nil {
-		return nil, err
+		c.mu.RUnlock()
+
+		return nil, func() {}, err
 	}
 
-	return append([]byte(nil), slice...), nil
+	return slice, c.mu.RUnlock, nil
 }
 
 // sliceLocked returns the requested range of the mapping; the caller must
@@ -534,24 +553,42 @@ func (c *Cache) sliceLocked(off, length int64) ([]byte, error) {
 // isCached. Used by the streaming chunker after the waiter mechanism has
 // confirmed data availability.
 func (c *Cache) sliceDirect(off, length int64) ([]byte, error) {
+	slice, release, err := c.sliceDirectLease(off, length)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	return append([]byte(nil), slice...), nil
+}
+
+// sliceDirectLease borrows the requested range of the mapping, like sliceLease
+// but without the isCached check: the caller has already confirmed that the
+// data is in the mapping (the chunker waits for its fetch session first).
+func (c *Cache) sliceDirectLease(off, length int64) ([]byte, func(), error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 
 	if c.isClosed() {
-		return nil, NewErrCacheClosed(c.filePath)
+		c.mu.RUnlock()
+
+		return nil, func() {}, NewErrCacheClosed(c.filePath)
 	}
 
 	if c.mmap == nil {
-		return nil, nil
+		c.mu.RUnlock()
+
+		return nil, func() {}, nil
 	}
 
 	if off < 0 || off >= c.size {
-		return nil, BytesNotAvailableError{}
+		c.mu.RUnlock()
+
+		return nil, func() {}, BytesNotAvailableError{}
 	}
 
 	end := min(off+length, c.size)
 
-	return append([]byte(nil), (*c.mmap)[off:end]...), nil
+	return (*c.mmap)[off:end], c.mu.RUnlock, nil
 }
 
 // Zero blocks are treated as cached: the mmap region reads back as zero (punched).
