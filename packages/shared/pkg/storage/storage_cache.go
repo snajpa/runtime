@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -78,6 +77,10 @@ func WrapInNFSCache(
 }
 
 func (c cache) DeleteObjectsWithPrefix(ctx context.Context, prefix string) error {
+	if err := ValidateRelativePath(prefix); err != nil {
+		return err
+	}
+
 	// no need to wait for cache deletion before returning
 	go func(ctx context.Context) {
 		c.deleteCachedObjectsWithPrefix(ctx, prefix)
@@ -91,12 +94,16 @@ func (c cache) UploadSignedURL(ctx context.Context, path string, ttl time.Durati
 }
 
 func (c cache) OpenBlob(ctx context.Context, path string) (Blob, error) {
+	localPath, err := ContainedPath(c.rootPath, path)
+	if err != nil {
+		return nil, err
+	}
+
 	innerObject, err := c.inner.OpenBlob(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open object: %w", err)
 	}
 
-	localPath := filepath.Join(c.rootPath, path)
 	if err = os.MkdirAll(localPath, CacheDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
@@ -117,12 +124,16 @@ func (c cache) OpenBlob(ctx context.Context, path string) (Blob, error) {
 }
 
 func (c cache) OpenSeekable(ctx context.Context, path string) (Seekable, error) {
+	localPath, err := ContainedPath(c.rootPath, path)
+	if err != nil {
+		return nil, err
+	}
+
 	innerObject, err := c.inner.OpenSeekable(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open object: %w", err)
 	}
 
-	localPath := filepath.Join(c.rootPath, path)
 	if err = os.MkdirAll(localPath, CacheDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
@@ -157,7 +168,15 @@ func (c cache) Capabilities() Capabilities {
 }
 
 func (c cache) deleteCachedObjectsWithPrefix(ctx context.Context, prefix string) {
-	fullPrefix := filepath.Join(c.rootPath, prefix)
+	fullPrefix, err := ContainedPath(c.rootPath, prefix)
+	if err != nil {
+		logger.L().Error(ctx, "refusing to remove cached objects for an invalid prefix",
+			zap.String("prefix", prefix),
+			zap.Error(err))
+
+		return
+	}
+
 	if err := os.RemoveAll(fullPrefix); err != nil {
 		logger.L().Error(ctx, "failed to remove object with prefix",
 			zap.String("prefix", prefix),

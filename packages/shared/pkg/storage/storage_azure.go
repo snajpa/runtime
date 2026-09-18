@@ -164,9 +164,11 @@ func parseConnectionStringSharedKey(connectionString string) (accountName, accou
 }
 
 func (s *azureStorage) DeleteObjectsWithPrefix(ctx context.Context, prefix string) error {
-	// An empty prefix would match, and delete, every blob in the container.
-	if prefix == "" {
-		return errors.New("refusing to delete objects with an empty prefix")
+	// An empty prefix would match, and delete, every blob in the container; the
+	// shared guard also refuses absolute, backslash and ".."-bearing forms (see
+	// ValidateRelativePath).
+	if err := ValidateRelativePath(prefix); err != nil {
+		return err
 	}
 
 	// Deletes are sequential per blob for now. azblob does have Blob Batch

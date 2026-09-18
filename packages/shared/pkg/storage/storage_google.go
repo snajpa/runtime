@@ -97,6 +97,12 @@ func NewGCP(ctx context.Context, bucketName string, limiter *limit.Limiter) (Sto
 }
 
 func (s *gcpStorage) DeleteObjectsWithPrefix(ctx context.Context, prefix string) error {
+	// The guard runs before the bucket call, so an empty or escaping prefix
+	// never reaches the provider (see ValidateRelativePath).
+	if err := ValidateRelativePath(prefix); err != nil {
+		return err
+	}
+
 	objects := s.bucket.Objects(ctx, &storage.Query{Prefix: prefix + "/"})
 
 	for {
