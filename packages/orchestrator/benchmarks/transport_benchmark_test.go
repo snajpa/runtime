@@ -60,8 +60,10 @@ func BenchmarkTransportThroughput(b *testing.B) {
 				stats := runTransportFio(b, path, workload)
 
 				b.StopTimer()
-				b.ReportMetric(stats.bytesPerSecond/1e6, "MB/s")
-				b.ReportMetric(stats.iops, "iops")
+				// One metric per workload: a repeated unit would overwrite
+				// the previous workload's number.
+				b.ReportMetric(stats.bytesPerSecond/1e6, workload.name+"/MB/s")
+				b.ReportMetric(stats.iops, workload.name+"/iops")
 				b.Logf("%-14s %-10s %8.1f MB/s %10.0f iops", tc.name, workload.name, stats.bytesPerSecond/1e6, stats.iops)
 			}
 		})
