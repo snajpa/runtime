@@ -69,6 +69,8 @@ func TestMultipartUploader_PartUploaderContract(t *testing.T) {
 
 	testPartUploaderContract(t, partUploaderTestAdapter{
 		abortsOnClose: true,
+		abortable:     true,
+		provider:      "gcs",
 		new: func(t *testing.T, recorder *partUploaderRecorder) partUploader {
 			t.Helper()
 

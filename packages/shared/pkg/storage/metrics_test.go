@@ -50,3 +50,12 @@ func TestPrecomputedAttrsPopulated(t *testing.T) {
 		}
 	}
 }
+
+// The residue recorder is the monitoring hook for uploads that end without a
+// commit or a completed abort (REQ-A3); it must be safe on a plain context.
+func TestRecordUploadResidue(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "provider", AttrProvider)
+	require.NotPanics(t, func() { RecordUploadResidue(t.Context(), "azure") })
+}

@@ -537,3 +537,9 @@ func (m *awsPartUploader) Close() error {
 
 	return err
 }
+
+// Abortable reports true: Close aborts the S3 multipart upload and releases
+// its parts.
+func (m *awsPartUploader) Abortable() bool { return true }
+
+func (m *awsPartUploader) ProviderName() string { return "s3" }

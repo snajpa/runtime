@@ -23,6 +23,7 @@ const (
 	AttrOutcome  = "outcome"
 	AttrFileType = "file_type"
 	AttrTrigger  = "trigger"
+	AttrProvider = "provider"
 )
 
 // Writeback triggers: a read-miss cache fill vs a build/store write-through.
@@ -217,6 +218,15 @@ var (
 		"Blob deserialize/decompress wall (e.g. header LZ4 decode + parse)",
 		"Uncompressed bytes produced",
 	))
+
+	// upload.residue counts multipart uploads that ended without a commit or a
+	// completed abort, leaving staged parts to the provider's garbage
+	// collection; the paired warning log is the residue monitoring hook
+	// (REQ-A3). The bound is the provider's collection window (Azure: ~7 days).
+	uploadResidue = utils.Must(meter.Int64Counter(
+		"orchestrator.upload.residue",
+		metric.WithDescription("Multipart uploads that ended without commit or abort"),
+	))
 )
 
 // RecordReadOpen records one layer's own open attempt (not the delegated inner
@@ -293,6 +303,13 @@ func RecordReadBlobDecompress(ctx context.Context, dur time.Duration, bytes int6
 		attribute.String(AttrCodec, ct.String()),
 		attribute.String(AttrOutcome, Outcome(err)),
 	))
+}
+
+// RecordUploadResidue counts one upload that ended with staged parts left
+// behind: the provider has no abort (residue is bounded by its garbage
+// collection) or the abort itself failed.
+func RecordUploadResidue(ctx context.Context, provider string) {
+	uploadResidue.Add(ctx, 1, metric.WithAttributes(attribute.String(AttrProvider, provider)))
 }
 
 var meter = otel.Meter("github.com/e2b-dev/infra/packages/shared/pkg/storage")

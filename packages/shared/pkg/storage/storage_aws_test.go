@@ -32,6 +32,8 @@ func TestAWSPartUploader_PartUploaderContract(t *testing.T) {
 
 	testPartUploaderContract(t, partUploaderTestAdapter{
 		abortsOnClose: true,
+		abortable:     true,
+		provider:      "s3",
 		new: func(t *testing.T, recorder *partUploaderRecorder) partUploader {
 			t.Helper()
 

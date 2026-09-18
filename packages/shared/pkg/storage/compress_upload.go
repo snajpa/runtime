@@ -24,6 +24,26 @@ type partUploader interface {
 	UploadPart(ctx context.Context, partIndex int, data ...[]byte) error
 	Complete(ctx context.Context) error
 	Close() error
+	// Abortable reports whether Close releases the upload's staged parts.
+	// Providers that cannot release them early (Azure block blobs: the service
+	// garbage-collects uncommitted blocks) return false; an upload that ends
+	// without committing then leaves bounded residue, which the shared layer
+	// records for monitoring (REQ-A3).
+	Abortable() bool
+}
+
+// providerNamer is optional: uploaders that can name their backend for
+// monitoring labels.
+type providerNamer interface {
+	ProviderName() string
+}
+
+func uploaderProviderName(u partUploader) string {
+	if named, ok := u.(providerNamer); ok {
+		return named.ProviderName()
+	}
+
+	return "unknown"
 }
 
 const (
@@ -101,6 +121,12 @@ func (m *memPartUploader) UploadPart(_ context.Context, partIndex int, data ...[
 func (m *memPartUploader) Complete(context.Context) error { return nil }
 func (m *memPartUploader) Close() error                   { return nil }
 
+// Abortable reports true: closing drops the in-memory parts, so nothing is
+// staged outside the process.
+func (m *memPartUploader) Abortable() bool { return true }
+
+func (m *memPartUploader) ProviderName() string { return "memory" }
+
 func (m *memPartUploader) Assemble() []byte {
 	keys := make([]int, 0, len(m.parts))
 	for k := range m.parts {
@@ -165,6 +191,34 @@ func (p *part) addFrame(ctx context.Context, buf inputBuf, n int, pool *sync.Poo
 	})
 }
 
+// uploadEnd classifies how a multipart upload ended, for residue accounting.
+type uploadEnd int
+
+const (
+	// uploadEndCommitted: Complete succeeded; nothing is left behind.
+	uploadEndCommitted uploadEnd = iota
+	// uploadEndAborted: the upload had not committed and Close released its
+	// staged parts.
+	uploadEndAborted
+	// uploadEndResidue: the upload had not committed and its staged parts were
+	// not released — the provider cannot abort them (Azure block blobs are
+	// collected by the service after ~7 days) or the abort call failed.
+	uploadEndResidue
+)
+
+// classifyUploadEnd is the residue decision: only an uncommitted upload whose
+// abort failed or does not exist leaves staged parts behind.
+func classifyUploadEnd(committed, abortable bool, abortErr error) uploadEnd {
+	switch {
+	case committed:
+		return uploadEndCommitted
+	case abortable && abortErr == nil:
+		return uploadEndAborted
+	default:
+		return uploadEndResidue
+	}
+}
+
 func compressStream(ctx context.Context, in io.Reader, cfg CompressConfig, uploader partUploader, maxUploadConcurrency int, sink FrameSink) (*FullFrameTable, [32]byte, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -172,11 +226,26 @@ func compressStream(ctx context.Context, in io.Reader, cfg CompressConfig, uploa
 	if err := uploader.Start(ctx); err != nil {
 		return nil, [32]byte{}, fmt.Errorf("start upload: %w", err)
 	}
+
+	committed := false
 	// Close aborts the upload unless it was committed; the deferred error
-	// can't be returned, only logged.
+	// can't be returned, only logged. An uncommitted upload whose staged parts
+	// survive Close leaves residue — bounded by the provider's garbage
+	// collection where no abort exists, unbounded when the abort failed — so
+	// record it either way (REQ-A3).
 	defer func() {
-		if err := uploader.Close(); err != nil {
-			logger.L().Warn(ctx, "failed to abort multipart upload", zap.Error(err))
+		abortErr := uploader.Close()
+		if abortErr != nil && !committed {
+			logger.L().Warn(ctx, "failed to abort multipart upload", zap.Error(abortErr))
+		}
+
+		if classifyUploadEnd(committed, uploader.Abortable(), abortErr) == uploadEndResidue {
+			provider := uploaderProviderName(uploader)
+			RecordUploadResidue(ctx, provider)
+			if !uploader.Abortable() {
+				logger.L().Warn(ctx, "upload left staged parts for provider garbage collection",
+					zap.String("provider", provider))
+			}
 		}
 	}()
 
@@ -247,6 +316,7 @@ func compressStream(ctx context.Context, in io.Reader, cfg CompressConfig, uploa
 	if err := uploader.Complete(ctx); err != nil {
 		return nil, [32]byte{}, fmt.Errorf("complete upload: %w", err)
 	}
+	committed = true
 
 	ft := NewFullFrameTable(cfg.CompressionType(), frameSizes)
 

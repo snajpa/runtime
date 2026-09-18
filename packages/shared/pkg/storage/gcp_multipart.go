@@ -258,6 +258,12 @@ func (m *MultipartUploader) Close() error {
 	return m.abortUpload(ctx, m.uploadID)
 }
 
+// Abortable reports true: Close discards an in-flight multipart upload and its
+// staged parts.
+func (m *MultipartUploader) Abortable() bool { return true }
+
+func (m *MultipartUploader) ProviderName() string { return "gcs" }
+
 func NewMultipartUploaderWithRetryConfig(ctx context.Context, bucketName, objectName string, retryConfig RetryConfig, metadata ObjectMetadata) (*MultipartUploader, error) {
 	creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {

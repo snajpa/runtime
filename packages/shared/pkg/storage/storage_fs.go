@@ -388,6 +388,11 @@ func (u *fsPartUploader) Complete(_ context.Context) error {
 	})
 }
 
+// ProviderName overrides the embedded in-memory uploader: parts are staged in
+// memory and written atomically on Complete, so a failed upload leaves no file
+// behind.
+func (u *fsPartUploader) ProviderName() string { return "fs" }
+
 func (o *fsObject) OpenRangeReader(ctx context.Context, offsetU int64, length int64, frameTable *FrameTable) (_ RangeReader, _ Source, err error) {
 	start := time.Now()
 	defer func() { RecordReadOpen(ctx, time.Since(start), o.objType, SourceFS, frameTable.CompressionType(), err) }()
