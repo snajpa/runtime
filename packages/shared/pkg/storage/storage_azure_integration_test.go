@@ -332,8 +332,9 @@ func TestAzureIntegration(t *testing.T) {
 			assert.True(t, exists, "sibling blob %q must survive", path)
 		}
 
-		// An empty prefix would delete the entire container; it must error out.
-		require.ErrorContains(t, provider.DeleteObjectsWithPrefix(ctx, ""), "empty prefix")
+		// An empty prefix would delete the entire container; it must error out
+		// with the typed refusal every provider shares.
+		require.ErrorIs(t, provider.DeleteObjectsWithPrefix(ctx, ""), ErrInvalidStoragePath)
 	})
 
 	t.Run("UploadSignedURLRequiresTheReturnedHeaders", func(t *testing.T) {

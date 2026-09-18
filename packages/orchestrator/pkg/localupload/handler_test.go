@@ -186,6 +186,8 @@ func TestHandler_PathTraversal(t *testing.T) {
 		"../etc/passwd",
 		"foo/../../etc/shadow",
 		"../../../tmp/escape",
+		`..\evil`,
+		"/etc/passwd",
 	}
 
 	for _, p := range maliciousPaths {

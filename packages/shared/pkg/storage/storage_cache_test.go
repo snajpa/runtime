@@ -34,6 +34,32 @@ func TestNFSCacheDirPermissions(t *testing.T) {
 	}
 }
 
+// TestNFSCacheOpenRefusesEscapingPath: the cache joins caller paths onto its
+// root, so a traversal-shaped path must fail before the inner provider is
+// called and before any directory is created outside the root. The mock has no
+// expectations, so a guard miss would fail loudly here instead of writing.
+func TestNFSCacheOpenRefusesEscapingPath(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	provider := NewMockStorageProvider(t)
+
+	c := &cache{rootPath: rootPath, chunkSize: MemoryChunkSize, inner: provider, tracer: noopTracer}
+
+	for _, bad := range []string{"../evil", "a/../../evil", ""} {
+		_, err := c.OpenBlob(t.Context(), bad)
+		require.ErrorIsf(t, err, ErrInvalidStoragePath, "path %q", bad)
+
+		_, err = c.OpenSeekable(t.Context(), bad)
+		require.ErrorIsf(t, err, ErrInvalidStoragePath, "path %q", bad)
+	}
+
+	require.ErrorIs(t, c.DeleteObjectsWithPrefix(t.Context(), "../evil"), ErrInvalidStoragePath)
+
+	_, statErr := os.Stat(filepath.Join(filepath.Dir(rootPath), "evil"))
+	assert.ErrorIs(t, statErr, os.ErrNotExist, "no path outside the root may be created")
+}
+
 // TestNFSCacheDirPermissionsTightenLegacyModes pins the create+chmod policy:
 // an object cache directory left world-writable by an older release must be
 // tightened when the object is opened again.
