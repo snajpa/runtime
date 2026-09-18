@@ -10,3 +10,9 @@ go.work.sum
 /packages/fc-kernels
 /packages/fc-versions
 **/bin/
+
+# Nix dev environment
+/result
+/result-*
+/*.qcow2
+/e2b-dev-vm/
