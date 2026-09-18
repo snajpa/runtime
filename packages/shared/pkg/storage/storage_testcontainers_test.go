@@ -110,7 +110,12 @@ func startObjectStoreBackend(t *testing.T) *s3TestBackend {
 			Cmd:          spec.cmd,
 			Env:          spec.env,
 			ExposedPorts: []string{"9000/tcp"},
-			WaitingFor:   wait.ForHTTP(spec.healthPath).WithPort("9000/tcp"),
+			// The listening-port check runs inside the container, so it is
+			// family-agnostic; the readiness probe below then validates the
+			// exact IPv4-pinned endpoint the tests use. testcontainers' own
+			// HTTP wait resolves localhost, whose ::1-first pick missed the
+			// container under concurrent runs (S-54 flake 2026-09-18T21:37:44Z).
+			WaitingFor: wait.ForListeningPort("9000/tcp"),
 		},
 		Started: true,
 	})
@@ -131,12 +136,16 @@ func startObjectStoreBackend(t *testing.T) *s3TestBackend {
 	require.True(t, inspected.State != nil && inspected.State.Running,
 		"%s container is not running", spec.name)
 
+	endpoint := containerHTTPEndpoint(t, container, "9000")
+	require.NoError(t, waitForHTTPHealth(t.Context(), endpoint, spec.healthPath),
+		"%s health endpoint", spec.name)
+
 	backend := &s3TestBackend{
 		// Unique per test: a shared name collides with a concurrent run's
 		// bucket (and with the SDK's retry of a slow but successful create) —
 		// the BucketAlreadyOwnedByYou flake class (S-54).
 		bucket:   fmt.Sprintf("s3-test-%d-%d", time.Now().UnixNano(), testKeySeq.Add(1)),
-		endpoint: "http://" + containerHTTPEndpoint(t, container, "9000"),
+		endpoint: "http://" + endpoint,
 	}
 
 	require.NoError(t, createBucketTolerant(t.Context(), backend.newClient(t, nil), backend.bucket),
@@ -173,6 +182,45 @@ func containerHTTPEndpoint(t *testing.T, container testcontainers.Container, con
 	require.NoError(t, err)
 
 	return fmt.Sprintf("%s:%s", host, port.Port())
+}
+
+// waitForHTTPHealth polls path on an explicit host:port endpoint until it
+// answers 200 or the deadline passes. Keeping the readiness probe on the same
+// IPv4-pinned address the tests use makes a misaddressed endpoint fail at setup
+// with a clear error instead of mid-test (S-54).
+func waitForHTTPHealth(ctx context.Context, endpoint, path string) error {
+	deadline := time.Now().Add(60 * time.Second)
+
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+endpoint+path, nil)
+		if err != nil {
+			return err
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+
+	return fmt.Errorf("health probe on %s%s: %w", endpoint, path, lastErr)
 }
 
 // newClient builds an S3 client for the backend. httpClient is optional and
