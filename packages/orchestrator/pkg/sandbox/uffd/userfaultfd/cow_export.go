@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/RoaringBitmap/roaring/v2"
 )
@@ -17,13 +18,17 @@ import (
 // translates identity offset → rank(page) * pageSize. The page set must be
 // the window's set (immutable), or the ranks would not match the header.
 type PackedPageSink struct {
-	pages    *roaring.Bitmap
+	// packed is the immutable page set in ascending order, so the slot of
+	// packed[i] is i: one flat binary search resolves membership and rank
+	// together, replacing the per-page Contains + Rank pair whose Rank walks
+	// the bitmap's container index (S-29). Costs 4 bytes per captured page.
+	packed   []uint32
 	pageSize int64
 	dst      io.WriterAt
 }
 
 func NewPackedPageSink(pages *roaring.Bitmap, pageSize int64, dst io.WriterAt) *PackedPageSink {
-	return &PackedPageSink{pages: pages, pageSize: pageSize, dst: dst}
+	return &PackedPageSink{packed: pages.ToArray(), pageSize: pageSize, dst: dst}
 }
 
 func (s *PackedPageSink) WriteAt(p []byte, off int64) (int, error) {
@@ -31,11 +36,11 @@ func (s *PackedPageSink) WriteAt(p []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("packed sink: write [%d,%d) is not one aligned page", off, off+int64(len(p)))
 	}
 	idx := uint32(off / s.pageSize)
-	if !s.pages.Contains(idx) {
+	slot, ok := slices.BinarySearch(s.packed, idx)
+	if !ok {
 		return 0, fmt.Errorf("packed sink: page %d is not in the captured set", idx)
 	}
-	// Rank is 1-based; the page's slot in the packed artifact is Rank-1.
-	packedOff := int64(s.pages.Rank(idx)-1) * s.pageSize
+	packedOff := int64(slot) * s.pageSize
 
 	return s.dst.WriteAt(p, packedOff)
 }
