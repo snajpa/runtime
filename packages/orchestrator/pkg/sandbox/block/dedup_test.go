@@ -4,6 +4,7 @@ package block
 
 import (
 	"crypto/rand"
+	"os"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -295,4 +296,28 @@ func TestFetchWindowerCompact(t *testing.T) {
 		require.Equal(t, dedupPageCurrent, pages[2].kind)
 		require.Equal(t, dedupPageCurrent, pages[3].kind)
 	})
+}
+
+func TestDedupDrainFilePermissions(t *testing.T) {
+	t.Parallel()
+
+	pageSize := int64(header.PageSize)
+	outPath := t.TempDir() + "/dedup-cache"
+
+	// Simulate a cache file created by an older release with wider permissions.
+	require.NoError(t, os.WriteFile(outPath, nil, 0o644))
+	require.NoError(t, os.Chmod(outPath, 0o644))
+
+	pageDirty := fullDirty(pageSize, pageSize)
+	src := func(int64) ([]byte, error) {
+		return make([]byte, pageSize), nil
+	}
+
+	cache, err := dedupDrain(t.Context(), src, pageDirty, pageSize, outPath, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cache.Close() })
+
+	info, err := os.Stat(outPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(storage.CacheFilePerm), info.Mode().Perm())
 }

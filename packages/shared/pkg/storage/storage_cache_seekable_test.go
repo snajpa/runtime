@@ -756,3 +756,34 @@ func TestCacheWriteThroughReader(t *testing.T) {
 		assert.True(t, os.IsNotExist(err), "partially read data should not be cached")
 	})
 }
+
+func TestCachedSeekable_CacheFilePermissions(t *testing.T) {
+	t.Parallel()
+
+	c := cachedSeekable{path: t.TempDir(), chunkSize: 1024, tracer: noopTracer}
+
+	input := filepath.Join(t.TempDir(), "input.bin")
+	require.NoError(t, os.WriteFile(input, bytes.Repeat([]byte{0xAB}, 2048), CacheFilePerm))
+
+	f, err := os.Open(input)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+
+	// A chunk file that predates the permission policy must be tightened.
+	chunkPath := c.makeChunkFilename(0)
+	require.NoError(t, os.WriteFile(chunkPath, []byte("legacy"), 0o644))
+	require.NoError(t, os.Chmod(chunkPath, 0o644))
+
+	require.NoError(t, c.writeChunkFromFile(t.Context(), 0, f))
+
+	info, err := os.Stat(chunkPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(CacheFilePerm), info.Mode().Perm(), "chunk files must be owner-only")
+
+	// Size sidecars are written owner-only as well.
+	require.NoError(t, c.writeLocalSize(t.Context(), 2048))
+
+	sizeInfo, err := os.Stat(c.sizeFilename())
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(CacheFilePerm), sizeInfo.Mode().Perm(), "size sidecars must be owner-only")
+}

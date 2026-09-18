@@ -20,6 +20,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -68,9 +69,15 @@ func NewDiffStore(
 	cachePath string,
 	ttl, delay time.Duration,
 ) (*DiffStore, error) {
-	err := os.MkdirAll(cachePath, 0o755)
-	if err != nil {
+	if err := os.MkdirAll(cachePath, storage.CacheDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
+	// MkdirAll leaves an existing directory untouched and filters the create
+	// mode through the umask; enforce the cache policy explicitly (this also
+	// tightens directories that older releases left world-readable).
+	if err := os.Chmod(cachePath, storage.CacheDirPerm); err != nil {
+		return nil, fmt.Errorf("failed to set cache directory permissions: %w", err)
 	}
 
 	cache := ttlcache.New(

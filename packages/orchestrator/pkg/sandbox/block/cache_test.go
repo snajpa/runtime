@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/testutils"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
@@ -1304,4 +1305,34 @@ func TestCacheWriteAtShared(t *testing.T) {
 	_, err = cache.WriteAtShared(content[:blockSize], 0)
 	var closedErr *CacheClosedError
 	require.ErrorAs(t, err, &closedErr, "a straggler write after Close must fail closed")
+}
+
+func TestNewCacheFilePermissions(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// A cache file that predates the permission policy keeps its old mode
+	// unless the cache tightens it explicitly.
+	legacyPath := dir + "/legacy-cache"
+	require.NoError(t, os.WriteFile(legacyPath, nil, 0o644))
+	require.NoError(t, os.Chmod(legacyPath, 0o644))
+
+	legacy, err := NewCache(16, 4, legacyPath, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = legacy.Close() })
+
+	info, err := os.Stat(legacyPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(storage.CacheFilePerm), info.Mode().Perm())
+
+	// Fresh cache files are created owner-only too.
+	freshPath := dir + "/fresh-cache"
+	fresh, err := NewCache(16, 4, freshPath, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fresh.Close() })
+
+	info, err = os.Stat(freshPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(storage.CacheFilePerm), info.Mode().Perm())
 }
