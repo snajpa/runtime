@@ -122,6 +122,21 @@ func (s *gcpStorage) GetDetails() string {
 	return fmt.Sprintf("[GCP Storage, bucket set to %s]", s.bucket.BucketName())
 }
 
+// Capabilities implements CapabilityReporter. The GCS XML path deletes one
+// object per request, aborts multipart uploads, signs upload URLs, and
+// round-trips custom metadata; non-final parts share the 5 MiB minimum.
+func (s *gcpStorage) Capabilities() Capabilities {
+	return Capabilities{
+		Name:                 "gcs",
+		DeleteBatchSize:      1,
+		AbortUpload:          true,
+		SignedUploadURL:      true,
+		CustomMetadata:       true,
+		Multipart:            true,
+		MultipartMinPartSize: cloudMinPartSizeMB << 20,
+	}
+}
+
 func (s *gcpStorage) UploadSignedURL(_ context.Context, path string, ttl time.Duration) (UploadURL, error) {
 	token, err := parseServiceAccountBase64(consts.GoogleServiceAccountSecret)
 	if err != nil {

@@ -211,6 +211,21 @@ func (s *azureStorage) GetDetails() string {
 	return fmt.Sprintf("[Azure Storage, container set to %s]", s.containerName)
 }
 
+// Capabilities implements CapabilityReporter. Azure deletes one blob per
+// request (the Blob Batch API is deferred, S-08), cannot abort an upload —
+// staged blocks are garbage-collected by the service — signs upload URLs
+// (SAS plus the mandatory x-ms-blob-type header), round-trips custom
+// metadata, and stages blocks with no provider part minimum.
+func (s *azureStorage) Capabilities() Capabilities {
+	return Capabilities{
+		Name:            "azure",
+		DeleteBatchSize: 1,
+		SignedUploadURL: true,
+		CustomMetadata:  true,
+		Multipart:       true,
+	}
+}
+
 // Put Blob also requires the "x-ms-blob-type" request header, which a SAS cannot carry, so it travels back in Headers for the external client to send.
 func (s *azureStorage) UploadSignedURL(ctx context.Context, path string, ttl time.Duration) (UploadURL, error) {
 	blobURL := s.container.NewBlobClient(path).URL()
