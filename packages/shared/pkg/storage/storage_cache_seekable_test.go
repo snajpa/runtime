@@ -185,6 +185,44 @@ func TestCachedFileObjectProvider_WriteTo(t *testing.T) {
 		assert.Equal(t, []byte{1, 2, 3}, buffer[:read])
 	})
 
+	t.Run("torn cached chunk is evicted and refetched", func(t *testing.T) {
+		t.Parallel()
+
+		tempDir := t.TempDir()
+
+		inner := NewMockSeekable(t)
+		inner.EXPECT().
+			OpenRangeReader(mock.Anything, mock.Anything, mock.Anything, (*FrameTable)(nil)).
+			RunAndReturn(func(_ context.Context, off int64, length int64, _ *FrameTable) (RangeReader, Source, error) {
+				data := []byte{4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+
+				return NewRangeReader(io.NopCloser(bytes.NewReader(data[off : off+length]))), UnknownSource, nil
+			})
+
+		c := cachedSeekable{path: tempDir, chunkSize: 10, inner: inner, tracer: noopTracer}
+
+		// The object is 30 bytes; the cached first chunk is torn (5 of 10 bytes).
+		require.NoError(t, os.WriteFile(c.sizeFilename(), []byte("30"), CacheFilePerm))
+
+		chunkPath := c.makeChunkFilename(0)
+		require.NoError(t, os.MkdirAll(filepath.Dir(chunkPath), CacheDirPerm))
+		require.NoError(t, os.WriteFile(chunkPath, []byte{1, 2, 3, 4, 5}, CacheFilePerm))
+
+		buffer := make([]byte, 10)
+		read, err := testReadAt(t.Context(), &c, buffer, 0)
+		require.NoError(t, err)
+		assert.Equal(t, 10, read)
+		assert.Equal(t, []byte{4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, buffer,
+			"the torn entry must be refetched, never served")
+
+		// The refetch rewrites the chunk with the healthy bytes.
+		c.wg.Wait()
+
+		info, err := os.Stat(chunkPath)
+		require.NoError(t, err)
+		assert.EqualValues(t, 10, info.Size())
+	})
+
 	t.Run("consecutive ReadAt calls should cache", func(t *testing.T) {
 		t.Parallel()
 
