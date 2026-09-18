@@ -26,18 +26,21 @@ func (c *cachedSeekable) openReaderCompressed(ctx context.Context, offsetU int64
 	ct := frameTable.CompressionType()
 
 	// Cache hit: open the compressed frame from NFS, validate its size, and
-	// decompress. A size mismatch drops the stale file; on any miss/error we fall
-	// through to a refetch.
+	// decompress. A size mismatch drops the stale file — under the cache lock, so
+	// a concurrent fill that just republished the entry is never clobbered — and
+	// on any miss/error we fall through to a refetch.
 	start := time.Now()
-	var dec RangeReader
+	var (
+		dec RangeReader
+		fi  os.FileInfo
+	)
 	f, err := os.Open(path)
 	if err == nil {
-		var fi os.FileInfo
 		if fi, err = f.Stat(); err != nil {
 			f.Close()
 		} else if fi.Size() != int64(rng.Length) {
 			f.Close()
-			_ = os.Remove(path)
+			evictCachedEntry(ctx, path, fi)
 			err = fmt.Errorf("cached frame %s size %d != expected %d", path, fi.Size(), rng.Length)
 		} else if dec, err = NewDecompressReader(NewRangeReader(f), ct, SourceNFS, c.objType); err != nil {
 			f.Close()
@@ -50,10 +53,12 @@ func (c *cachedSeekable) openReaderCompressed(ctx context.Context, offsetU int64
 		// Close drains and CRC-verifies the frame, so a non-nil Close error means
 		// the cached bytes no longer decode (bit rot / torn write that still has
 		// the right size, which the size check above cannot catch) — evict it so
-		// the next read refetches instead of failing forever.
-		return &closeHookReader{RangeReader: dec, onClose: func(_ context.Context, err error) {
+		// the next read refetches instead of failing forever. The eviction takes
+		// the cache lock and re-checks the entry, so it cannot delete a fresh copy
+		// a concurrent fill published while this reader was decoding the old one.
+		return &closeHookReader{RangeReader: dec, onClose: func(ctx context.Context, err error) {
 			if err != nil {
-				_ = os.Remove(path)
+				evictCachedEntry(ctx, path, fi)
 			}
 		}}, SourceNFS, nil
 	}
