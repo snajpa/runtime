@@ -136,8 +136,20 @@ func (u *Uffd) Start(ctx context.Context) error {
 		ctx, span := tracer.Start(ctx, "serve uffd")
 		defer span.End()
 
-		// TODO: If the handle function fails, we should kill the sandbox
+		// The serve loop is the sandbox's memory backend. It returns either on
+		// a requested stop (the exit pipe fires; Serve returns nil) or on a
+		// failure (the FC handshake or the serve loop itself). Once it returns,
+		// no further fault can be served: the sandbox cannot make progress and
+		// cannot recover in place, so a handle error here is fatal to the
+		// sandbox, not a recoverable condition — there is no retry. The owner
+		// learns the outcome through Exit() (nil only for a requested stop) and
+		// must stop the sandbox; ResumeSandbox's exit watcher does that and
+		// joins this error into the sandbox exit error.
 		handleErr := u.handle(ctx, fdExit)
+		if handleErr != nil {
+			u.logger.Error(ctx, "uffd serve loop failed: no further faults can be served, the sandbox must stop",
+				zap.Error(handleErr))
+		}
 
 		// If handle failed before setting the handler value, set an error to unblock
 		// any waiters (e.g., prefetcher goroutines waiting on Prefault).
@@ -373,7 +385,15 @@ func peerCreds(conn *net.UnixConn) (*syscall.Ucred, error) {
 func (u *Uffd) Stop() error {
 	fdExit, err := u.fdExit.Result()
 	if err != nil {
-		return fmt.Errorf("fdExit not set or failed: %w", err)
+		if errors.Is(err, utils.NotSetError{}) {
+			// Start never created the exit pipe (it was never called, or it
+			// failed before the pipe existed): no serve loop is running, so
+			// teardown is a no-op success rather than a phantom error in the
+			// owner's cleanup.
+			return nil
+		}
+
+		return fmt.Errorf("failed to get exit fd: %w", err)
 	}
 
 	return fdExit.SignalExit()
