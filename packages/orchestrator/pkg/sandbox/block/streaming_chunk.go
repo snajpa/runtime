@@ -224,6 +224,16 @@ func (c *Chunker) runFetch(ctx context.Context, s *fetchSession, upstream storag
 		s.failIfRunning(errors.New("fetch exited without completing"))
 	}()
 
+	// Bound the upstream fetches this node runs at once: a burst of faults
+	// waits behind the admission gate instead of stampeding the object store
+	// (REQ-D2). The wait is bounded by the fetch timeout above.
+	if err := nodeFetchAdmission.acquire(ctx, c.featureFlags, c.metrics); err != nil {
+		s.fail(err)
+
+		return
+	}
+	defer func() { nodeFetchAdmission.release(context.WithoutCancel(ctx), c.metrics) }()
+
 	mmapSlice, releaseLock, err := c.cache.addressBytes(s.chunkOff, s.chunkLen)
 	if err != nil {
 		s.fail(err)
