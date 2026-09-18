@@ -200,3 +200,46 @@ func TestParseInstanceGroupName(t *testing.T) {
 		assert.Equal(t, "orch-client-pool-region-rig", config.InstanceGroupName)
 	})
 }
+
+// TestParseCompressConfig pins the fail-fast contract for the compression env
+// surface: an enabled config with an unknown type must fail startup instead of
+// silently degrading to uncompressed uploads.
+func TestParseCompressConfig(t *testing.T) {
+	t.Run("known type parses", func(t *testing.T) {
+		t.Setenv("COMPRESS_ENABLED", "true")
+		t.Setenv("COMPRESS_TYPE", "zstd")
+
+		config, err := Parse()
+		require.NoError(t, err)
+		assert.True(t, config.StorageConfig.IsCompressionEnabled())
+	})
+
+	t.Run("unknown type fails startup", func(t *testing.T) {
+		t.Setenv("COMPRESS_ENABLED", "true")
+		t.Setenv("COMPRESS_TYPE", "zstandard")
+
+		_, err := Parse()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "zstandard")
+	})
+
+	t.Run("unknown type is ignored while compression is disabled", func(t *testing.T) {
+		t.Setenv("COMPRESS_ENABLED", "false")
+		t.Setenv("COMPRESS_TYPE", "zstandard")
+
+		config, err := Parse()
+		require.NoError(t, err)
+		assert.False(t, config.StorageConfig.IsCompressionEnabled())
+	})
+}
+
+func TestParseBuilderCompressConfig(t *testing.T) {
+	t.Run("unknown type fails startup", func(t *testing.T) {
+		t.Setenv("COMPRESS_ENABLED", "true")
+		t.Setenv("COMPRESS_TYPE", "gzip")
+
+		_, err := ParseBuilder()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "gzip")
+	})
+}
