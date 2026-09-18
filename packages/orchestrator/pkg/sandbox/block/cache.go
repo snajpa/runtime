@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
@@ -60,12 +61,19 @@ type Cache struct {
 }
 
 func NewCache(size, blockSize int64, filePath string, dirtyFile bool) (*Cache, error) {
-	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, storage.CacheFilePerm)
 	if err != nil {
 		return nil, fmt.Errorf("error opening file: %w", err)
 	}
 
 	defer f.Close()
+
+	// The create mode is filtered by the umask and ignored for an existing
+	// file, so enforce the cache file policy explicitly; this also tightens
+	// files that older releases created with 0o644.
+	if err := f.Chmod(storage.CacheFilePerm); err != nil {
+		return nil, fmt.Errorf("error setting file permissions: %w", err)
+	}
 
 	if size == 0 {
 		return &Cache{
@@ -270,7 +278,7 @@ func dedupDrain(
 	if directIO {
 		openFlags |= unix.O_DIRECT
 	}
-	f, err := os.OpenFile(outPath, openFlags, 0o644)
+	f, err := os.OpenFile(outPath, openFlags, storage.CacheFilePerm)
 	if err != nil {
 		return nil, fmt.Errorf("open dedup cache: %w", err)
 	}

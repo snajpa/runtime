@@ -3,9 +3,12 @@
 package build
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
 // TestLocalDiffFileCloseToDiffRemovesPartialOnError verifies CloseToDiff does not
@@ -51,4 +54,16 @@ func TestLocalDiffFileCloseToDiffRemovesEmptyCacheFile(t *testing.T) {
 	require.NoError(t, err)
 	require.IsType(t, &NoDiff{}, diff)
 	require.NoFileExists(t, cachePath, "empty diff cache file must be removed")
+}
+
+func TestNewLocalDiffFilePermissions(t *testing.T) {
+	t.Parallel()
+
+	f, err := NewLocalDiffFile(t.TempDir(), "build-perm-test", Rootfs)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+
+	info, err := os.Stat(f.cachePath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(storage.CacheFilePerm), info.Mode().Perm())
 }
