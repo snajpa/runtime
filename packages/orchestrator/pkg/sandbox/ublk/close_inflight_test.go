@@ -97,7 +97,7 @@ func TestCloseWithInFlightIO(t *testing.T) {
 // kernel never got completed stays wedged — deleting it waits for that request
 // — so a device in that state cannot be cleaned up at all short of a reboot.
 // Never point this at a device a live daemon is serving.
-func TestDeleteStaleDevice(t *testing.T) {
+func TestDeleteStaleDevice(t *testing.T) { //nolint:paralleltest // operator helper: deletes devices deliberately, one at a time
 	ids := os.Getenv("UBLK_TEST_DELETE_IDS")
 	if ids == "" {
 		t.Skip("set UBLK_TEST_DELETE_IDS=0,1,6 to delete devices whose daemon is gone")
@@ -108,7 +108,7 @@ func TestDeleteStaleDevice(t *testing.T) {
 
 	defer func() { _ = mgr.Close() }()
 
-	for _, part := range strings.Split(ids, ",") {
+	for part := range strings.SplitSeq(ids, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
