@@ -363,6 +363,68 @@ func (m *MultipartUploader) uploadPart(ctx context.Context, uploadID string, par
 	return etag, nil
 }
 
+// uploadPartFile streams one part straight from the local file. The part's
+// Content-MD5 is computed in a bounded pre-pass (fixed buffer, not the whole
+// part), and the request body is re-created per retry from a file-section
+// reader, so no part-sized buffer is ever held in memory (REQ-B4).
+func (m *MultipartUploader) uploadPartFile(ctx context.Context, uploadID string, partNumber int, file *os.File, offset, length int64) (string, error) {
+	url := fmt.Sprintf("%s/%s?partNumber=%d&uploadId=%s",
+		m.baseURL, m.objectName, partNumber, uploadID)
+
+	sum, err := md5FileSection(file, offset, length)
+	if err != nil {
+		return "", fmt.Errorf("failed to checksum part %d: %w", partNumber, err)
+	}
+
+	// A zero-length body counts as "unknown length" to net/http and is sent
+	// chunked, which S3-compatible XML backends reject with 411; skip the body
+	// for empty parts so Content-Length: 0 is sent instead.
+	var body any
+	if length > 0 {
+		body = retryablehttp.ReaderFunc(func() (io.Reader, error) {
+			return newFileSectionReader(file, offset, length), nil
+		})
+	}
+
+	req, err := retryablehttp.NewRequestWithContext(ctx, "PUT", url, body)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+m.token)
+	req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(sum))
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+
+		return "", fmt.Errorf("failed to upload part %d (status %d): %s", partNumber, resp.StatusCode, string(body))
+	}
+
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		return "", fmt.Errorf("no ETag returned for part %d", partNumber)
+	}
+
+	return etag, nil
+}
+
+// md5FileSection hashes a file section with a small fixed-size buffer, so
+// hashing never materializes the section.
+func md5FileSection(file *os.File, offset, length int64) ([]byte, error) {
+	h := md5.New() //nolint:gosec // GCS multipart uses Content-MD5 for transport integrity.
+	if _, err := io.Copy(h, newFileSectionReader(file, offset, length)); err != nil {
+		return nil, err
+	}
+
+	return h.Sum(nil), nil
+}
+
 // uploadPartSlices uploads a part from multiple byte slices without concatenating them.
 func (m *MultipartUploader) uploadPartSlices(ctx context.Context, uploadID string, partNumber int, slices [][]byte) (string, error) {
 	totalLen := 0
@@ -605,21 +667,15 @@ func (m *MultipartUploader) uploadParts(ctx context.Context, maxConcurrency int,
 			default:
 			}
 
-			// Read chunk from file
+			// Stream the part from disk instead of materializing it: memory
+			// is O(read buffer), not O(chunkSize x concurrency) (REQ-B4).
 			offset := int64(partNumber-1) * gcpMultipartUploadChunkSize
-			chunkSize := gcpMultipartUploadChunkSize
-			if offset+int64(chunkSize) > fileSize {
-				chunkSize = int(fileSize - offset)
+			chunkSize := int64(gcpMultipartUploadChunkSize)
+			if offset+chunkSize > fileSize {
+				chunkSize = fileSize - offset
 			}
 
-			chunk := make([]byte, chunkSize)
-			_, err := file.ReadAt(chunk, offset)
-			if err != nil {
-				return fmt.Errorf("failed to read chunk for part %d: %w", partNumber, err)
-			}
-
-			// Upload part
-			etag, err := m.uploadPart(ctx, uploadID, partNumber, chunk)
+			etag, err := m.uploadPartFile(ctx, uploadID, partNumber, file, offset, chunkSize)
 			if err != nil {
 				return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
 			}

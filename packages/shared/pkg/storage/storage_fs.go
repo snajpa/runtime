@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -335,29 +336,45 @@ func (o *fsObject) openRead() (*os.File, error) {
 // always replaces the previous content (no stale tail). The file is fsynced
 // before the rename; the parent directory entry is not fsynced.
 func writeFileAtomic(path string, perm os.FileMode, write func(io.Writer) error) error {
+	tmp, err := createTempFor(path)
+	if err != nil {
+		return err
+	}
+
+	if err := write(tmp); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+
+		return fmt.Errorf("failed to write %s: %w", path, err)
+	}
+
+	return commitTempFile(tmp, path, perm)
+}
+
+// createTempFor creates the same-directory temp file that atomic writers and
+// the streaming part uploader commit through.
+func createTempFor(path string) (*os.File, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("failed to create temp file for %s: %w", path, err)
+		return nil, fmt.Errorf("failed to create temp file for %s: %w", path, err)
 	}
+
+	return tmp, nil
+}
+
+// commitTempFile fsyncs and atomically renames a same-directory temp file into
+// place, removing it on any failure.
+func commitTempFile(tmp *os.File, path string, perm os.FileMode) error {
 	tmpName := tmp.Name()
 
-	cleanup := func() {
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-	}
-
-	if err := write(tmp); err != nil {
-		cleanup()
-
-		return fmt.Errorf("failed to write %s: %w", path, err)
-	}
-	if err := tmp.Sync(); err != nil {
-		cleanup()
 
 		return fmt.Errorf("failed to sync %s: %w", path, err)
 	}
@@ -385,28 +402,128 @@ func (o *fsObject) atomicWriteFile(perm os.FileMode, write func(io.Writer) error
 	return writeFileAtomic(o.path, perm, write)
 }
 
-// fsPartUploader implements partUploader for local filesystem.
-// Embeds memPartUploader for concurrent-safe part collection,
-// then writes atomically on Complete.
+// fsPartUploader implements partUploader for the local filesystem by streaming
+// parts into a same-directory temp file as they arrive and renaming it into
+// place on Complete. Upload memory is O(part), not O(file): a compressed
+// artifact of any size is never assembled in memory (REQ-B4).
 type fsPartUploader struct {
-	memPartUploader
-
 	fullPath string
+
+	mu      sync.Mutex
+	tmp     *os.File
+	next    int
+	pending map[int][][]byte
+	closed  bool
 }
 
-func (u *fsPartUploader) Complete(_ context.Context) error {
-	data := u.Assemble()
+func (u *fsPartUploader) Start(context.Context) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 
-	return writeFileAtomic(u.fullPath, 0o644, func(w io.Writer) error {
-		_, err := w.Write(data)
+	u.next = 1
+	u.pending = make(map[int][][]byte)
 
-		return err
-	})
+	return nil
 }
 
-// ProviderName overrides the embedded in-memory uploader: parts are staged in
-// memory and written atomically on Complete, so a failed upload leaves no file
-// behind.
+// UploadPart appends one part in part order. Parts that arrive before their
+// turn wait in memory until the preceding parts are written, bounded by the
+// caller's concurrency window.
+func (u *fsPartUploader) UploadPart(_ context.Context, partIndex int, data ...[]byte) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.closed {
+		return errors.New("upload already closed")
+	}
+	if partIndex < 1 {
+		return fmt.Errorf("invalid part index %d", partIndex)
+	}
+	if u.pending == nil {
+		u.pending = make(map[int][][]byte)
+		u.next = 1
+	}
+
+	u.pending[partIndex] = data
+
+	return u.flushLocked()
+}
+
+// flushLocked writes every part that is next in line.
+func (u *fsPartUploader) flushLocked() error {
+	for {
+		data, ok := u.pending[u.next]
+		if !ok {
+			return nil
+		}
+
+		if u.tmp == nil {
+			tmp, err := createTempFor(u.fullPath)
+			if err != nil {
+				return err
+			}
+			u.tmp = tmp
+		}
+
+		for _, chunk := range data {
+			if _, err := u.tmp.Write(chunk); err != nil {
+				return fmt.Errorf("failed to write part %d of %s: %w", u.next, u.fullPath, err)
+			}
+		}
+
+		delete(u.pending, u.next)
+		u.next++
+	}
+}
+
+// Complete commits the streamed temp file. An upload with no parts commits an
+// empty object.
+func (u *fsPartUploader) Complete(context.Context) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.closed {
+		return errors.New("upload already closed")
+	}
+	u.closed = true
+
+	if u.tmp == nil {
+		return writeFileAtomic(u.fullPath, 0o644, func(io.Writer) error { return nil })
+	}
+
+	tmp := u.tmp
+	u.tmp = nil
+
+	return commitTempFile(tmp, u.fullPath, 0o644)
+}
+
+// Close discards the temp file of an upload that never committed; the target
+// object is untouched.
+func (u *fsPartUploader) Close() error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.closed {
+		return nil
+	}
+	u.closed = true
+
+	if u.tmp == nil {
+		return nil
+	}
+
+	tmp := u.tmp
+	u.tmp = nil
+	name := tmp.Name()
+	_ = tmp.Close()
+	_ = os.Remove(name)
+
+	return nil
+}
+
+// Abortable reports true: Close removes the staged temp file.
+func (u *fsPartUploader) Abortable() bool { return true }
+
 func (u *fsPartUploader) ProviderName() string { return "fs" }
 
 func (o *fsObject) OpenRangeReader(ctx context.Context, offsetU int64, length int64, frameTable *FrameTable) (_ RangeReader, _ Source, err error) {
