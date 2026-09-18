@@ -19,6 +19,7 @@ import (
 	"github.com/edsrzf/mmap-go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 const (
@@ -567,10 +569,36 @@ func (c *Cache) setIsCached(off, length int64) {
 	c.tracker.SetRange(start, end, Dirty)
 }
 
+// madviseRemove is the hole-punching syscall, swappable so tests can exercise
+// the unsupported-kernel/filesystem fallback.
+var madviseRemove = unix.Madvise
+
+// madviseRemoveFallbacks counts punches that fell back to zero-filling because
+// MADV_REMOVE was refused. The punch path is context-less by design — the cache
+// serves io interfaces that carry none — so the count is an atomic feeding an
+// observable counter: increments stay cheap and no caller context is invented
+// or dropped. Tests swap the instrument for a manual reader and read this same
+// atomic, mirroring memfdHeldBytes.
+var madviseRemoveFallbacks atomic.Int64
+
+var madviseRemoveFallbackCounter = utils.Must(meter.Int64ObservableCounter(
+	"orchestrator.block.cache.madv_remove_fallback",
+	metric.WithDescription("Cache holes that MADV_REMOVE refused and were zero-filled instead; the pages stay resident until the cache closes."),
+	metric.WithUnit("{punch}"),
+	metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+		o.Observe(madviseRemoveFallbacks.Load())
+
+		return nil
+	}),
+))
+
 // punchHole frees backing pages; clear() fallback if MADV_REMOVE is unsupported.
 func (c *Cache) punchHole(off, length int64) {
-	if err := unix.Madvise((*c.mmap)[off:off+length], unix.MADV_REMOVE); err != nil {
+	if err := madviseRemove((*c.mmap)[off:off+length], unix.MADV_REMOVE); err != nil {
 		clear((*c.mmap)[off : off+length])
+		// The range is still freed logically; the count exists because the
+		// pages stay resident until the cache closes (audit §8.2: silent).
+		madviseRemoveFallbacks.Add(1)
 	}
 }
 
