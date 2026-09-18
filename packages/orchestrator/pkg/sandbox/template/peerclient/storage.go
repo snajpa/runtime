@@ -11,15 +11,27 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 var (
 	tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/peerclient")
+
+	meter = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/peerclient")
+
+	// peerErrors counts failed peer read attempts by gRPC status code, so a
+	// failing peer is distinguishable from a peer that simply lacks the data
+	// (REQ-D7).
+	peerErrors = utils.Must(meter.Int64Counter("orchestrator.peer.errors",
+		metric.WithDescription("Peer read attempts that failed, classified by gRPC status code")))
 
 	attrResolveRedisError = attribute.String("peer_resolve", "redis_error")
 	attrResolveNoPeer     = attribute.String("peer_resolve", "no_peer")
@@ -75,7 +87,7 @@ func (p *routingProvider) resolveProvider(ctx context.Context, buildID string) s
 
 	span.SetAttributes(attribute.String("peer_address", res.addr))
 
-	return newPeerStorageProvider(p.base, res.client, res.uploaded)
+	return newPeerStorageProvider(p.base, res.client, res.uploaded, res.addr, p.resolver.dropPeerConn)
 }
 
 func (p *routingProvider) OpenBlob(ctx context.Context, path string) (storage.Blob, error) {
@@ -111,18 +123,36 @@ type peerStorageProvider struct {
 	// uploaded is set to true when the peer signals that GCS upload is complete
 	// (use_storage=true). Once set, all subsequent reads skip the peer and go to base.
 	uploaded *atomic.Bool
+	// addr identifies the peer behind peerClient; dropConn closes that peer's
+	// cached connection after a transport-level failure (REQ-D7).
+	addr     string
+	dropConn func(address string)
 }
 
 func newPeerStorageProvider(
 	base storage.StorageProvider,
 	peerClient orchestrator.ChunkServiceClient,
 	uploaded *atomic.Bool,
+	addr string,
+	dropConn func(address string),
 ) storage.StorageProvider {
 	return &peerStorageProvider{
 		base:       base,
 		peerClient: peerClient,
 		uploaded:   uploaded,
+		addr:       addr,
+		dropConn:   dropConn,
 	}
+}
+
+// dropPeerConnFor returns the handler that drops this provider's cached peer
+// connection, or nil when no resolver owns it.
+func (p *peerStorageProvider) dropPeerConnFor() func() {
+	if p.dropConn == nil || p.addr == "" {
+		return nil
+	}
+
+	return func() { p.dropConn(p.addr) }
 }
 
 func (p *peerStorageProvider) OpenBlob(_ context.Context, path string) (storage.Blob, error) {
@@ -134,6 +164,7 @@ func (p *peerStorageProvider) OpenBlob(_ context.Context, path string) (storage.
 			buildID:  buildID,
 			name:     t,
 			uploaded: p.uploaded,
+			dropConn: p.dropPeerConnFor(),
 		},
 		openBase: func(ctx context.Context) (storage.Blob, error) {
 			return p.base.OpenBlob(ctx, path)
@@ -159,6 +190,7 @@ func (p *peerStorageProvider) OpenSeekable(_ context.Context, path string) (stor
 			buildID:  buildID,
 			name:     t,
 			uploaded: p.uploaded,
+			dropConn: p.dropPeerConnFor(),
 		},
 		basePersistence: p.base,
 	}, nil
@@ -198,6 +230,11 @@ type peerHandle struct {
 	buildID  string
 	name     string
 	uploaded *atomic.Bool
+
+	// dropConn drops the cached connection to the peer behind client when a
+	// read fails at the transport level, so the next resolve re-dials instead
+	// of reusing a dead connection (REQ-D7). Optional.
+	dropConn func()
 }
 
 // peerAttempt is the result of a peer read attempt.
@@ -231,6 +268,20 @@ func tryPeer[T any](
 	}
 
 	res, err := peerFn(ctx)
+	if err != nil {
+		// Classify and count the failure: a peer that errors must be
+		// distinguishable from a peer that simply lacks the data, and a
+		// transport-level failure retires the cached connection so the next
+		// resolve re-dials (REQ-D7).
+		class := peerErrorClass(err)
+		span.SetAttributes(attribute.String("peer_error", class))
+		peerErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("code", class)))
+
+		if peerTransportError(err) && h.dropConn != nil {
+			h.dropConn()
+		}
+	}
+
 	if res.hit {
 		if err != nil {
 			span.RecordError(err)
@@ -250,6 +301,30 @@ func tryPeer[T any](
 	span.SetAttributes(attrPeerHitFalse)
 
 	return peerAttempt[T]{}, nil
+}
+
+// peerErrorClass maps a peer error to its gRPC status code, so peer failures
+// are classified in spans and metrics.
+func peerErrorClass(err error) string {
+	if err == nil {
+		return codes.OK.String()
+	}
+
+	return status.Code(err).String()
+}
+
+// peerTransportError reports whether the peer failed at the transport level
+// (as opposed to answering with an application error), in which case the
+// cached connection is no longer trustworthy. A caller-side cancellation
+// (codes.Canceled) says nothing about the peer, so it does not retire the
+// connection.
+func peerTransportError(err error) bool {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
+	}
 }
 
 var _ storage.RangeReader = (*peerStreamReader)(nil)

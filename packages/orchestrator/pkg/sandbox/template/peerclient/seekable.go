@@ -17,6 +17,11 @@ import (
 
 var _ storage.Seekable = (*peerSeekable)(nil)
 
+// peerTransitionRetryAfter is the local bound attached to a peer transition:
+// the peer wire format carries no retry hint yet (S-26), and a zero RetryAfter
+// would let the caller refresh the header back-to-back.
+const peerTransitionRetryAfter = time.Second
+
 // peerSeekable reads from the peer orchestrator first.
 // Peer fetches always use the basic (uncompressed) name. Only the base
 // (GCS/S3) fallthrough path needs to know the current compression type —
@@ -89,7 +94,7 @@ func (s *peerSeekable) Size(ctx context.Context) (int64, error) {
 	// table (the basic-name fall-through would 404 on compressed V4 builds), so
 	// transition to the authoritative header — and record that same transition.
 	if !res.hit {
-		err = &storage.PeerTransitionedError{}
+		err = &storage.PeerTransitionedError{RetryAfter: peerTransitionRetryAfter}
 	}
 	storage.RecordReadSize(ctx, time.Since(start), storage.UnknownSeekableObjectType, storage.SourcePeer, err)
 
@@ -131,7 +136,7 @@ func (s *peerSeekable) OpenRangeReader(ctx context.Context, off int64, length in
 	// return: a transition when uploaded, else a not_found miss that falls to base.
 	ct := frameTable.CompressionType()
 	if s.uploaded.Load() {
-		err = &storage.PeerTransitionedError{}
+		err = &storage.PeerTransitionedError{RetryAfter: peerTransitionRetryAfter}
 		storage.RecordReadOpen(ctx, time.Since(start), storage.UnknownSeekableObjectType, storage.SourcePeer, ct, err)
 
 		return nil, storage.SourcePeer, err

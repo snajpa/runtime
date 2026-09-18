@@ -1,8 +1,10 @@
 package peerclient
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +19,19 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 )
 
-const peerConnectTimeout = 5 * time.Second
+const (
+	peerConnectTimeout = 5 * time.Second
+
+	// peerConnIdleTTL is how long an unused peer connection stays cached: the
+	// Redis routing entry can outlive the peer's usefulness, so connections age
+	// out on their own (REQ-D7).
+	peerConnIdleTTL = 10 * time.Minute
+	// maxPeerConns bounds the connection cache; the least recently used
+	// connections are evicted first.
+	maxPeerConns = 32
+	// peerConnSweepInterval throttles the opportunistic idle sweep.
+	peerConnSweepInterval = time.Minute
+)
 
 // Resolver looks up peer addresses for build IDs and manages gRPC connections
 // to peer orchestrators. It is used by the routing provider to decide, per
@@ -28,6 +42,10 @@ type Resolver interface {
 	resolve(ctx context.Context, buildID string) (attribute.KeyValue, resolveResult)
 	IsActive(buildID string) bool
 	Purge(buildID string)
+	// dropPeerConn forgets and closes the cached connection to address, e.g.
+	// after a transport-level failure: the next resolve re-dials instead of
+	// reusing a dead connection.
+	dropPeerConn(address string)
 	Close()
 }
 
@@ -47,15 +65,30 @@ func (nopResolver) resolve(context.Context, string) (attribute.KeyValue, resolve
 }
 func (nopResolver) IsActive(string) bool { return false }
 func (nopResolver) Purge(string)         {}
+func (nopResolver) dropPeerConn(string)  {}
 func (nopResolver) Close()               {}
 
 // peerResolver is the real implementation that looks up peers via the Registry.
 type peerResolver struct {
 	registry       Registry
 	selfAddress    string
-	peerConns      sync.Map // address → *grpc.ClientConn
+	peerConns      sync.Map // address → *peerConn
 	uploadedBuilds sync.Map // buildID → *atomic.Bool
 	dialGroup      singleflight.Group
+	lastSweep      atomic.Int64 // unix nanos; throttles the idle sweep
+}
+
+// peerConn is one cached gRPC connection with its last use, so idle entries
+// can be swept and the cache bounded (REQ-D7).
+type peerConn struct {
+	conn     *grpc.ClientConn
+	lastUsed atomic.Int64 // unix nanos
+}
+
+func (c *peerConn) touch() { c.lastUsed.Store(time.Now().UnixNano()) }
+
+func (c *peerConn) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, c.lastUsed.Load()))
 }
 
 func NewResolver(registry Registry, selfAddress string) Resolver {
@@ -71,13 +104,16 @@ func (r *peerResolver) readPeerAddress(ctx context.Context, buildID string) (str
 
 // getOrDialPeer deduplicates concurrent dials via singleflight.
 func (r *peerResolver) getOrDialPeer(ctx context.Context, address string) (*grpc.ClientConn, error) {
-	if conn, ok := r.peerConns.Load(address); ok {
-		return conn.(*grpc.ClientConn), nil
+	if cached, ok := r.peerConns.Load(address); ok {
+		pconn := cached.(*peerConn)
+		pconn.touch()
+
+		return pconn.conn, nil
 	}
 
 	v, err, _ := r.dialGroup.Do(address, func() (any, error) {
-		if conn, ok := r.peerConns.Load(address); ok {
-			return conn, nil
+		if cached, ok := r.peerConns.Load(address); ok {
+			return cached, nil
 		}
 
 		conn, err := grpc.NewClient(address,
@@ -91,15 +127,80 @@ func (r *peerResolver) getOrDialPeer(ctx context.Context, address string) (*grpc
 
 		e2bgrpc.ObserveConnection(ctx, conn, "peer-orchestrator")
 
-		r.peerConns.Store(address, conn)
+		pconn := &peerConn{conn: conn}
+		pconn.touch()
 
-		return conn, nil
+		r.peerConns.Store(address, pconn)
+
+		return pconn, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return v.(*grpc.ClientConn), nil
+	return v.(*peerConn).conn, nil
+}
+
+// maybeSweep runs the idle sweep at most once per peerConnSweepInterval, so
+// resolve pays for it at most occasionally and no janitor goroutine is needed.
+func (r *peerResolver) maybeSweep(now time.Time) {
+	last := time.Unix(0, r.lastSweep.Load())
+	if now.Sub(last) < peerConnSweepInterval {
+		return
+	}
+
+	if !r.lastSweep.CompareAndSwap(r.lastSweep.Load(), now.UnixNano()) {
+		return
+	}
+
+	r.sweepPeerConns(now)
+}
+
+// sweepPeerConns closes connections idle beyond peerConnIdleTTL and evicts the
+// least recently used entries above maxPeerConns.
+func (r *peerResolver) sweepPeerConns(now time.Time) {
+	type entry struct {
+		address string
+		pconn   *peerConn
+	}
+
+	collect := func() []entry {
+		var entries []entry
+
+		r.peerConns.Range(func(key, value any) bool {
+			entries = append(entries, entry{address: key.(string), pconn: value.(*peerConn)})
+
+			return true
+		})
+
+		return entries
+	}
+
+	for _, e := range collect() {
+		if e.pconn.idleFor(now) > peerConnIdleTTL {
+			r.dropPeerConn(e.address)
+		}
+	}
+
+	entries := collect()
+	if len(entries) <= maxPeerConns {
+		return
+	}
+
+	slices.SortFunc(entries, func(a, b entry) int {
+		return cmp.Compare(b.pconn.idleFor(now), a.pconn.idleFor(now))
+	})
+
+	for _, e := range entries[maxPeerConns:] {
+		r.dropPeerConn(e.address)
+	}
+}
+
+// dropPeerConn forgets and closes one cached connection.
+func (r *peerResolver) dropPeerConn(address string) {
+	if v, ok := r.peerConns.LoadAndDelete(address); ok {
+		_ = v.(*peerConn).conn.Close()
+	}
 }
 
 func (r *peerResolver) isSelfAddress(address string) bool {
@@ -133,6 +234,8 @@ func (r *peerResolver) Purge(buildID string) {
 // a remote peer is found. Returns a nil client when the base provider should
 // be used instead (uploaded, no peer, self, or error).
 func (r *peerResolver) resolve(ctx context.Context, buildID string) (attribute.KeyValue, resolveResult) {
+	r.maybeSweep(time.Now())
+
 	// Fast path: a prior resolve flagged this build as peer-served and a
 	// reader has since observed the switch to storage.
 	if v, ok := r.uploadedBuilds.Load(buildID); ok && v.(*atomic.Bool).Load() {
@@ -185,7 +288,7 @@ func (r *peerResolver) IsActive(buildID string) bool {
 
 func (r *peerResolver) Close() {
 	r.peerConns.Range(func(_, value any) bool {
-		_ = value.(*grpc.ClientConn).Close()
+		_ = value.(*peerConn).conn.Close()
 
 		return true
 	})
