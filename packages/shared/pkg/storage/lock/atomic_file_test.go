@@ -137,3 +137,86 @@ func TestOpenFileCommitPublishesAndRemovesTemp(t *testing.T) {
 	_, err = os.Stat(tempName)
 	assert.True(t, os.IsNotExist(err), "commit must remove the temp file")
 }
+
+// TestOpenFileFirstWriterWins pins the immutable-file contract: a later writer
+// never overwrites the first one, and losing the commit race is a successful
+// dedup by default.
+func TestOpenFileFirstWriterWins(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	filename := filepath.Join(tempDir, "test.bin")
+
+	first, err := OpenFile(t.Context(), filename)
+	require.NoError(t, err)
+
+	_, err = first.Write([]byte("first"))
+	require.NoError(t, err)
+	require.NoError(t, first.Commit(t.Context()))
+
+	second, err := OpenFile(t.Context(), filename)
+	require.NoError(t, err)
+
+	_, err = second.Write([]byte("second"))
+	require.NoError(t, err)
+	require.NoError(t, second.Commit(t.Context()))
+
+	data, err := os.ReadFile(filename)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("first"), data, "the first writer's bytes stay")
+}
+
+// TestOpenFileContentCheckMatching pins that an opted-in writer that wrote the
+// same bytes as the winner still commits successfully (dedup confirmed).
+func TestOpenFileContentCheckMatching(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	filename := filepath.Join(tempDir, "test.bin")
+
+	first, err := OpenFile(t.Context(), filename)
+	require.NoError(t, err)
+
+	_, err = first.Write([]byte("same"))
+	require.NoError(t, err)
+	require.NoError(t, first.Commit(t.Context()))
+
+	second, err := OpenFile(t.Context(), filename, WithContentCheck())
+	require.NoError(t, err)
+
+	_, err = second.Write([]byte("same"))
+	require.NoError(t, err)
+	require.NoError(t, second.Commit(t.Context()), "identical content is a successful dedup")
+
+	data, err := os.ReadFile(filename)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("same"), data)
+}
+
+// TestOpenFileContentCheckMismatch pins that an opted-in writer whose bytes
+// differ from the winning file gets ErrContentMismatch instead of a silent
+// success — and never overwrites the winner.
+func TestOpenFileContentCheckMismatch(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	filename := filepath.Join(tempDir, "test.bin")
+
+	first, err := OpenFile(t.Context(), filename)
+	require.NoError(t, err)
+
+	_, err = first.Write([]byte("first"))
+	require.NoError(t, err)
+	require.NoError(t, first.Commit(t.Context()))
+
+	second, err := OpenFile(t.Context(), filename, WithContentCheck())
+	require.NoError(t, err)
+
+	_, err = second.Write([]byte("second"))
+	require.NoError(t, err)
+	require.ErrorIs(t, second.Commit(t.Context()), ErrContentMismatch)
+
+	data, err := os.ReadFile(filename)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("first"), data, "a mismatch never overwrites the winner")
+}
