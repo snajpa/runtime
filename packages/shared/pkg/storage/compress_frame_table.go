@@ -304,6 +304,12 @@ func DeserializeFrameTable(r io.Reader) (*FrameTable, error) {
 		return nil, nil
 	}
 
+	// Reject types that do not survive the uint32->byte narrowing: accepting
+	// one would build a table whose compression contradicts its frame count.
+	if ct >= uint32(numCompressionTypes) {
+		return nil, fmt.Errorf("unknown compression type %d: corrupted header", ct)
+	}
+
 	if n > maxDeserializedFrames {
 		return nil, fmt.Errorf("frame count %d exceeds maximum %d", n, maxDeserializedFrames)
 	}
@@ -316,6 +322,15 @@ func DeserializeFrameTable(r io.Reader) (*FrameTable, error) {
 	for i := range entries {
 		if entries[i].SizeU <= 0 || entries[i].SizeC <= 0 {
 			return nil, fmt.Errorf("frame %d has zero or negative size: SizeU=%d SizeC=%d", i, entries[i].SizeU, entries[i].SizeC)
+		}
+		if entries[i].StartU < 0 || entries[i].StartC < 0 {
+			return nil, fmt.Errorf("frame %d has negative start: StartU=%d StartC=%d", i, entries[i].StartU, entries[i].StartC)
+		}
+		if endU := entries[i].StartU + int64(entries[i].SizeU); endU < entries[i].StartU {
+			return nil, fmt.Errorf("frame %d U-range end overflows: StartU=%d SizeU=%d", i, entries[i].StartU, entries[i].SizeU)
+		}
+		if endC := entries[i].StartC + int64(entries[i].SizeC); endC < entries[i].StartC {
+			return nil, fmt.Errorf("frame %d C-range end overflows: StartC=%d SizeC=%d", i, entries[i].StartC, entries[i].SizeC)
 		}
 		if i > 0 && entries[i].StartU < entries[i-1].endU() {
 			return nil, fmt.Errorf("frame %d StartU %d < previous endU %d: U-entries not sorted", i, entries[i].StartU, entries[i-1].endU())

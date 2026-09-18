@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -231,5 +232,101 @@ func TestSerializeDeserializeFrameTable(t *testing.T) {
 		got, err := DeserializeFrameTable(&buf)
 		require.NoError(t, err)
 		require.Nil(t, got)
+	})
+}
+
+// TestDeserializeFrameTableRejectsUnknownCompressionType pins the guard for
+// headers whose compression-type word narrows to CompressionNone while the
+// frame count is non-zero. Accepting one used to build a table that owns
+// frames yet reports "no compression"; Serialize then wrote ct=0/n=0 for it
+// and the re-parse returned nil — the round trip lost every frame. Regression
+// for testdata/fuzz/FuzzDeserializeFrameTable/a8db7817e8b06081.
+func TestDeserializeFrameTableRejectsUnknownCompressionType(t *testing.T) {
+	t.Parallel()
+
+	// Header: LE uint32 0x30303000 (low byte = none) + frame count 1 + one
+	// 24-byte entry — the exact shape the fuzzer found.
+	buf := append(
+		[]byte{0x00, 0x30, 0x30, 0x30, 0x01, 0x00, 0x00, 0x00},
+		bytes.Repeat([]byte{0x30}, 24)...,
+	)
+
+	_, err := DeserializeFrameTable(bytes.NewReader(buf))
+	require.Error(t, err, "a narrowing compression type must be rejected")
+	require.Contains(t, err.Error(), "unknown compression type")
+
+	// A genuinely unknown codec is rejected the same way.
+	buf[0] = 0x7f
+	_, err = DeserializeFrameTable(bytes.NewReader(buf))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown compression type")
+}
+
+// TestDeserializeFrameTableRejectsInvalidFrameOffsets pins the boundary
+// checks for frame starts: StartU/StartC are absolute stream offsets and
+// must be non-negative, and Start+Size must not wrap int64. Both were
+// previously unvalidated for the first entry (the ordering checks ran only
+// for i > 0), so a crafted table with StartU=-1, StartC=-1, SizeU=1, SizeC=1
+// parsed cleanly and FrameAt(0) returned negative ranges (reviewer1's probe).
+func TestDeserializeFrameTableRejectsInvalidFrameOffsets(t *testing.T) {
+	t.Parallel()
+
+	const maxInt64 int64 = 1<<63 - 1
+
+	entry := func(startU, startC int64, sizeU, sizeC int32) []byte {
+		var b bytes.Buffer
+		require.NoError(t, binary.Write(&b, binary.LittleEndian, uint32(CompressionLZ4)))
+		require.NoError(t, binary.Write(&b, binary.LittleEndian, uint32(1)))
+		require.NoError(t, binary.Write(&b, binary.LittleEndian, startU))
+		require.NoError(t, binary.Write(&b, binary.LittleEndian, startC))
+		require.NoError(t, binary.Write(&b, binary.LittleEndian, sizeU))
+		require.NoError(t, binary.Write(&b, binary.LittleEndian, sizeC))
+
+		return b.Bytes()
+	}
+
+	t.Run("negative starts (reviewer case)", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := DeserializeFrameTable(bytes.NewReader(entry(-1, -1, 1, 1)))
+		require.Error(t, err, "negative StartU/StartC must be rejected")
+		require.Contains(t, err.Error(), "negative start")
+	})
+
+	t.Run("negative StartC only", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := DeserializeFrameTable(bytes.NewReader(entry(0, -1, 1, 1)))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "negative start")
+	})
+
+	t.Run("StartU end overflow", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := DeserializeFrameTable(bytes.NewReader(entry(maxInt64-1, 0, 2, 1)))
+		require.Error(t, err, "StartU+SizeU must not wrap")
+		require.Contains(t, err.Error(), "overflows")
+	})
+
+	t.Run("StartC end overflow", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := DeserializeFrameTable(bytes.NewReader(entry(0, maxInt64-1, 1, 2)))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "overflows")
+	})
+
+	t.Run("valid single frame still parses", func(t *testing.T) {
+		t.Parallel()
+
+		ft, err := DeserializeFrameTable(bytes.NewReader(entry(0, 0, 1, 1)))
+		require.NoError(t, err)
+		require.NotNil(t, ft)
+		startU, endU, startC, endC := ft.FrameAt(0)
+		require.Equal(t, int64(0), startU)
+		require.Equal(t, int64(1), endU)
+		require.Equal(t, int64(0), startC)
+		require.Equal(t, int64(1), endC)
 	})
 }

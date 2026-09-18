@@ -46,7 +46,8 @@ func TestMergeMappingsRemoveEmpty(t *testing.T) {
 		},
 	}
 
-	m := MergeMappings(simpleBase, diff)
+	m, mergeErr := MergeMappings(simpleBase, diff)
+	require.NoError(t, mergeErr)
 
 	require.True(t, Equal(m, simpleBase))
 
@@ -65,7 +66,8 @@ func TestMergeMappingsBaseBeforeDiffNoOverlap(t *testing.T) {
 		},
 	}
 
-	m := MergeMappings(simpleBase, diff)
+	m, mergeErr := MergeMappings(simpleBase, diff)
+	require.NoError(t, mergeErr)
 
 	require.True(t, Equal(m, []BuildMap{
 		{
@@ -105,7 +107,8 @@ func TestMergeMappingsDiffBeforeBaseNoOverlap(t *testing.T) {
 		},
 	}
 
-	m := MergeMappings(simpleBase, diff)
+	m, mergeErr := MergeMappings(simpleBase, diff)
+	require.NoError(t, mergeErr)
 
 	require.True(t, Equal(m, []BuildMap{
 		{
@@ -114,9 +117,10 @@ func TestMergeMappingsDiffBeforeBaseNoOverlap(t *testing.T) {
 			BuildId: diffID,
 		},
 		{
-			Offset:  1 * blockSize,
-			Length:  1 * blockSize,
-			BuildId: ignoreID,
+			Offset:             1 * blockSize,
+			Length:             1 * blockSize,
+			BuildId:            ignoreID,
+			BuildStorageOffset: 1 * blockSize,
 		},
 		{
 			Offset:  2 * blockSize,
@@ -145,7 +149,8 @@ func TestMergeMappingsBaseInsideDiff(t *testing.T) {
 		},
 	}
 
-	m := MergeMappings(simpleBase, diff)
+	m, mergeErr := MergeMappings(simpleBase, diff)
+	require.NoError(t, mergeErr)
 
 	require.True(t, Equal(m, []BuildMap{
 		{
@@ -180,7 +185,8 @@ func TestMergeMappingsDiffInsideBase(t *testing.T) {
 		},
 	}
 
-	m := MergeMappings(simpleBase, diff)
+	m, mergeErr := MergeMappings(simpleBase, diff)
+	require.NoError(t, mergeErr)
 
 	require.True(t, Equal(m, []BuildMap{
 		{
@@ -199,9 +205,10 @@ func TestMergeMappingsDiffInsideBase(t *testing.T) {
 			BuildId: diffID,
 		},
 		{
-			Offset:  4 * blockSize,
-			Length:  2 * blockSize,
-			BuildId: baseID,
+			Offset:             4 * blockSize,
+			Length:             2 * blockSize,
+			BuildId:            baseID,
+			BuildStorageOffset: 2 * blockSize,
 		},
 		{
 			Offset:  6 * blockSize,
@@ -225,7 +232,8 @@ func TestMergeMappingsBaseAfterDiffWithOverlap(t *testing.T) {
 		},
 	}
 
-	m := MergeMappings(simpleBase, diff)
+	m, mergeErr := MergeMappings(simpleBase, diff)
+	require.NoError(t, mergeErr)
 
 	require.True(t, Equal(m, []BuildMap{
 		{
@@ -239,9 +247,10 @@ func TestMergeMappingsBaseAfterDiffWithOverlap(t *testing.T) {
 			BuildId: diffID,
 		},
 		{
-			Offset:  5 * blockSize,
-			Length:  1 * blockSize,
-			BuildId: baseID,
+			Offset:             5 * blockSize,
+			Length:             1 * blockSize,
+			BuildId:            baseID,
+			BuildStorageOffset: 3 * blockSize,
 		},
 		{
 			Offset:  6 * blockSize,
@@ -265,7 +274,8 @@ func TestMergeMappingsDiffAfterBaseWithOverlap(t *testing.T) {
 		},
 	}
 
-	m := MergeMappings(simpleBase, diff)
+	m, mergeErr := MergeMappings(simpleBase, diff)
+	require.NoError(t, mergeErr)
 
 	require.True(t, Equal(m, []BuildMap{
 		{
@@ -284,9 +294,10 @@ func TestMergeMappingsDiffAfterBaseWithOverlap(t *testing.T) {
 			BuildId: diffID,
 		},
 		{
-			Offset:  7 * blockSize,
-			Length:  1 * blockSize,
-			BuildId: ignoreID,
+			Offset:             7 * blockSize,
+			Length:             1 * blockSize,
+			BuildId:            ignoreID,
+			BuildStorageOffset: 1 * blockSize,
 		},
 	}))
 
@@ -876,7 +887,8 @@ func TestMergeMappings_Splits(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			merged := MergeMappings(tc.base, tc.diff)
+			merged, mergeErr := MergeMappings(tc.base, tc.diff)
+			require.NoError(t, mergeErr)
 
 			tc.validate(t, merged)
 		})
