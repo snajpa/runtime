@@ -784,6 +784,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 			EgressProxy:   egressSetup.Proxy,
 			CgroupManager: cgroupManager,
 			StorageConfig: config.StorageConfig,
+			StageRoot:     config.OrchestratorBaseDir,
 		})
 		reclaimClean = !summary.HasFailures()
 	}

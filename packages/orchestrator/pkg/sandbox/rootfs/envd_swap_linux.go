@@ -25,6 +25,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
 // EnvdSwapTimeout bounds a SINGLE debugfs invocation — it is what RuntimeMaxSec is
@@ -737,7 +738,7 @@ func removeSwapStage(stage string) error {
 }
 
 func stageSwapDir(stageRoot string, gid int) (string, error) {
-	stage, err := os.MkdirTemp(stageRoot, ".envd-swap-")
+	stage, err := os.MkdirTemp(stageRoot, storage.EnvdSwapStagePrefix)
 	if err != nil {
 		return "", fmt.Errorf("create swap stage dir: %w", err)
 	}
@@ -746,6 +747,14 @@ func stageSwapDir(stageRoot string, gid int) (string, error) {
 		_ = os.RemoveAll(stage)
 
 		return "", fmt.Errorf("secure swap stage dir: %w", err)
+	}
+
+	// Record the owner so a later reclaim can tell an active swap (possibly
+	// another instance's, on a shared host) from an abandoned one.
+	if err := storage.RecordStageOwner(stage); err != nil {
+		_ = os.RemoveAll(stage)
+
+		return "", err
 	}
 
 	return stage, nil
