@@ -206,6 +206,13 @@ const (
 	// Prefault here, call Close() concurrently, and verify the closed flag is
 	// checked after the RLock is acquired.
 	faultPhaseBeforePrefaultRLock
+	// faultPhaseBeforeSourceRead fires in a MISSING-fault worker after the
+	// classification RLock has been released and before the source read
+	// starts — the window that must not hold settleRequests (S-28: a slow
+	// source must never block the REMOVE batch). Used by
+	// TestSourceReadDoesNotBlockRemove to park the worker there and drive a
+	// concurrent MADV_DONTNEED.
+	faultPhaseBeforeSourceRead
 )
 
 // faultOutcome is the terminal classification of a faultPage call.
@@ -589,17 +596,20 @@ func (u *Userfaultfd) Serve(
 					(*h)(addr, faultPhaseBeforeRLock)
 				}
 
-				// RLock spans the lookup→faultPage→setState sequence so a
-				// concurrent REMOVE batch (settleRequests.Lock) can't slip in
-				// between the state read and the install.
-				u.settleRequests.RLock()
-				defer u.settleRequests.RUnlock()
-
-				var source PageReader
-
 				idx := uint32(header.BlockIdx(offset, int64(u.pageSize)))
 
+				// Classify under a short RLock only: the source read below
+				// runs outside it (S-28). The REMOVE batch needs the write
+				// lock and must not wait behind up to ~2s of source-read
+				// backoff; the state is re-checked under the lock before the
+				// install, so a REMOVE that lands during the read still wins
+				// (the fetched content is dropped, never installed).
+				u.settleRequests.RLock()
 				state := u.pageTracker.Get(idx)
+				u.settleRequests.RUnlock()
+
+				var data []byte
+				var release func()
 				switch state {
 				case block.Dirty, block.Clean:
 					// Pages must not be swappable for this short-circuit to
@@ -619,7 +629,20 @@ func (u *Userfaultfd) Serve(
 					pclass = pageClassZero
 				case block.NotPresent:
 					pclass = pageClassNew
-					source = u.src
+
+					if h := u.testFaultHook.Load(); h != nil {
+						(*h)(addr, faultPhaseBeforeSourceRead)
+					}
+
+					var readErr error
+					data, release, readErr = u.readSourcePage(ctx, offset, fdExit.SignalExit)
+					defer release()
+
+					if readErr != nil {
+						result = faultResultError
+
+						return readErr
+					}
 				default:
 					result = faultResultError
 
@@ -633,6 +656,33 @@ func (u *Userfaultfd) Serve(
 					accessType = block.Write
 				}
 
+				// Install + tracker bookkeeping stay under the lock: the
+				// REMOVE batch cannot slip in between the re-check below and
+				// the copy. Only the source read was moved out (S-28).
+				u.settleRequests.RLock()
+				defer u.settleRequests.RUnlock()
+
+				if data != nil {
+					switch u.pageTracker.Get(idx) {
+					case block.NotPresent:
+						// State unchanged: install the fetched page.
+					case block.Zero, block.Removed:
+						// A REMOVE (or a zero install) won while the read ran
+						// outside the lock. The page must read back as zeros
+						// (UFFD REMOVE semantics), so drop the fetched content
+						// instead of resurrecting stale data — the same rule
+						// as classifying the page Removed/Zero above.
+						data = nil
+						pclass = pageClassZero
+					default:
+						// block.Dirty, block.Clean: a concurrent install won
+						// the race. The zero COPY below reports EEXIST and
+						// this serve is recorded present; the winner's state
+						// stands.
+						data = nil
+					}
+				}
+
 				if h := u.testFaultHook.Load(); h != nil {
 					(*h)(addr, faultPhaseBeforeFaultPage)
 				}
@@ -640,9 +690,8 @@ func (u *Userfaultfd) Serve(
 				outcome, err := u.faultPage(
 					ctx,
 					addr,
-					offset,
 					accessType,
-					source,
+					data,
 					fdExit.SignalExit,
 				)
 				if err != nil {
@@ -680,7 +729,7 @@ func (u *Userfaultfd) Serve(
 					switch {
 					case accessType == block.Write:
 						u.pageTracker.SetRange(idx, idx+1, block.Dirty)
-					case source != nil:
+					case data != nil:
 						u.pageTracker.MarkInstalled(idx, idx+1, block.Clean)
 					default:
 						u.pageTracker.MarkInstalled(idx, idx+1, block.Zero)
@@ -929,12 +978,108 @@ func (u *Userfaultfd) clearWPResolveFailure(alignedAddr uintptr) {
 	}
 }
 
+// readSourcePage fetches one page from the source at offset with the bounded
+// retry policy (sliceMaxRetries attempts, exponential backoff). It MUST be
+// called OUTSIDE settleRequests: up to ~2s of backoff must never block the
+// REMOVE batch, which needs the write lock to record removed pages and to
+// cancel a CoW window (S-28). On success the returned buffer is owned by the
+// caller, which must call release once the install is done; on failure the
+// buffer is released here and release is a no-op. A panic in the source is
+// converted to a fatal error, mirroring faultPage's install-path recovery.
+func (u *Userfaultfd) readSourcePage(ctx context.Context, offset int64, onFailure func() error) (data []byte, release func(), err error) {
+	release = func() {}
+
+	b := make([]byte, u.pageSize)
+	freeBuf := func() {}
+
+	if u.pageSize == header.HugepageSize {
+		bufPtr := pagePool.Get().(*[]byte)
+		b = (*bufPtr)[:u.pageSize]
+		freeBuf = func() { pagePool.Put(bufPtr) }
+	}
+
+	owned := true
+	defer func() {
+		if r := recover(); r != nil {
+			u.logger.Error(ctx, "UFFD source read panic", zap.Any("pagesize", u.pageSize), zap.Any("panic", r))
+			data, release, err = nil, func() {}, fmt.Errorf("uffd source read panic: %v", r)
+		}
+
+		if owned {
+			freeBuf()
+		}
+	}()
+
+	span := trace.SpanFromContext(ctx)
+
+	var dataErr error
+	var attempt int
+
+retryLoop:
+	for attempt = range sliceMaxRetries + 1 {
+		var n int
+		n, dataErr = u.src.ReadAt(ctx, b, offset)
+		if dataErr == nil && int64(n) != int64(u.pageSize) {
+			dataErr = fmt.Errorf("short read at %d: got %d, want %d", offset, n, u.pageSize)
+		}
+		if dataErr == nil {
+			break
+		}
+
+		if attempt >= sliceMaxRetries || ctx.Err() != nil {
+			break
+		}
+
+		u.logger.Warn(ctx, "UFFD serve read error, retrying",
+			zap.Int("attempt", attempt+1),
+			zap.Int("max_attempts", sliceMaxRetries+1),
+			zap.Error(dataErr),
+		)
+
+		delay := min(sliceRetryBaseDelay<<attempt, sliceRetryMaxDelay)
+		jitter := time.Duration(rand.Int63n(int64(delay) / 2))
+
+		backoff := time.NewTimer(delay + jitter)
+
+		select {
+		case <-ctx.Done():
+			backoff.Stop()
+
+			dataErr = errors.Join(dataErr, ctx.Err())
+
+			break retryLoop
+		case <-backoff.C:
+		}
+	}
+
+	if dataErr != nil {
+		var signalErr error
+		if onFailure != nil {
+			signalErr = onFailure()
+		}
+
+		joinedErr := errors.Join(dataErr, signalErr)
+
+		span.RecordError(joinedErr)
+		u.logger.Error(ctx, "UFFD serve data fetch error after retries",
+			zap.Int("attempts", attempt+1),
+			zap.Error(joinedErr),
+		)
+
+		return nil, release, fmt.Errorf("failed to read from source after %d attempts: %w", attempt+1, joinedErr)
+	}
+
+	owned = false
+	release = freeBuf
+
+	return b, release, nil
+}
+
 func (u *Userfaultfd) faultPage(
 	ctx context.Context,
 	addr uintptr,
-	offset int64,
 	accessType block.AccessType,
-	source PageReader,
+	data []byte,
 	onFailure func() error,
 ) (outcome faultOutcome, err error) {
 	span := trace.SpanFromContext(ctx)
@@ -957,14 +1102,14 @@ func (u *Userfaultfd) faultPage(
 		mode = UFFDIO_COPY_MODE_WP
 	}
 
-	// nil source = zero-fill.
+	// nil data = zero-fill.
 	switch {
-	case source == nil && u.pageSize == header.PageSize && accessType == block.Write:
+	case data == nil && u.pageSize == header.PageSize && accessType == block.Write:
 		// Write fault on a hole: plain zero-install, unprotected — the
 		// write that faulted lands immediately and the page is recorded
 		// Dirty.
 		writeErr = u.fd.zero(addr, u.pageSize, 0)
-	case source == nil:
+	case data == nil:
 		// Zero-fill via COPY of a zero buffer instead of UFFDIO_ZEROPAGE,
 		// so read faults get install+write-protect in ONE atomic ioctl
 		// (MODE_WP). The previous 4K sequence — ZEROPAGE(DONTWAKE) →
@@ -975,78 +1120,7 @@ func (u *Userfaultfd) faultPage(
 		// never retried because the deferred re-serve hits EEXIST.
 		writeErr = u.fd.copy(addr, u.pageSize, header.EmptyHugePage[:u.pageSize], mode)
 	default:
-		var b []byte
-		if u.pageSize == header.HugepageSize {
-			bufPtr := pagePool.Get().(*[]byte)
-			defer pagePool.Put(bufPtr)
-			b = (*bufPtr)[:u.pageSize]
-		} else {
-			b = make([]byte, u.pageSize)
-		}
-
-		// ReadAt retry holds settleRequests.RLock for up to ~2s of
-		// exponential backoff, blocking any concurrent REMOVE batch.
-		// Correctness holds (uffd FIFO drains the queued REMOVE before
-		// the next same-page fault); if the blocking latency ever shows
-		// up, move ReadAt outside the lock and re-check state before
-		// UFFDIO_COPY.
-		var dataErr error
-		var attempt int
-
-	retryLoop:
-		for attempt = range sliceMaxRetries + 1 {
-			var n int
-			n, dataErr = source.ReadAt(ctx, b, offset)
-			if dataErr == nil && int64(n) != int64(u.pageSize) {
-				dataErr = fmt.Errorf("short read at %d: got %d, want %d", offset, n, u.pageSize)
-			}
-			if dataErr == nil {
-				break
-			}
-
-			if attempt >= sliceMaxRetries || ctx.Err() != nil {
-				break
-			}
-
-			u.logger.Warn(ctx, "UFFD serve read error, retrying",
-				zap.Int("attempt", attempt+1),
-				zap.Int("max_attempts", sliceMaxRetries+1),
-				zap.Error(dataErr),
-			)
-
-			delay := min(sliceRetryBaseDelay<<attempt, sliceRetryMaxDelay)
-			jitter := time.Duration(rand.Int63n(int64(delay) / 2))
-
-			backoff := time.NewTimer(delay + jitter)
-
-			select {
-			case <-ctx.Done():
-				backoff.Stop()
-
-				dataErr = errors.Join(dataErr, ctx.Err())
-
-				break retryLoop
-			case <-backoff.C:
-			}
-		}
-
-		if dataErr != nil {
-			var signalErr error
-			if onFailure != nil {
-				signalErr = onFailure()
-			}
-
-			joinedErr := errors.Join(dataErr, signalErr)
-
-			span.RecordError(joinedErr)
-			u.logger.Error(ctx, "UFFD serve data fetch error after retries",
-				zap.Int("attempts", attempt+1),
-				zap.Error(joinedErr),
-			)
-
-			return faultDiscarded, fmt.Errorf("failed to read from source after %d attempts: %w", attempt+1, joinedErr)
-		}
-		writeErr = u.fd.copy(addr, u.pageSize, b, mode)
+		writeErr = u.fd.copy(addr, u.pageSize, data, mode)
 	}
 
 	// EEXIST: page already mapped. Wake in case the install used DONTWAKE.

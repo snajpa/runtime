@@ -92,9 +92,8 @@ func (u *Userfaultfd) Prefault(ctx context.Context, offset int64, data []byte) (
 	outcome, err := u.faultPage(
 		ctx,
 		addr,
-		offset,
 		block.Read,
-		directDataSource{data: data},
+		data,
 		nil,
 	)
 	if err != nil {
@@ -135,14 +134,4 @@ func (u *Userfaultfd) Prefault(ctx context.Context, offset int64, data []byte) (
 	}
 
 	return installed, nil
-}
-
-// directDataSource wraps a single page's bytes; off is ignored because the
-// caller hands us exactly the page contents.
-type directDataSource struct {
-	data []byte
-}
-
-func (d directDataSource) ReadAt(_ context.Context, p []byte, _ int64) (int, error) {
-	return copy(p, d.data), nil
 }
