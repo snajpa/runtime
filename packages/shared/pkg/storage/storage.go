@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/storageopts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/shared/pkg/storage")
@@ -42,8 +43,9 @@ var ErrMetadataUnsupported = errors.New("blob does not support reading custom me
 // ObjectMetadataSoftDeleted is the storage-index soft-delete tombstone key.
 const ObjectMetadataSoftDeleted = storageopts.ObjectMetadataSoftDeleted
 
-// MemoryChunkSize must always be bigger or equal to the block size.
-const MemoryChunkSize = 4 * 1024 * 1024 // 4 MB
+// MemoryChunkSize is the memory cache chunk size; the canonical value and its
+// block-size constraints live in packages/shared/pkg/units.
+const MemoryChunkSize = units.MemoryChunkSize
 
 type SeekableObjectType int
 

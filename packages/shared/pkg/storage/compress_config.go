@@ -3,6 +3,8 @@ package storage
 import (
 	"errors"
 	"fmt"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 )
 
 const (
@@ -18,7 +20,7 @@ const (
 	// This MUST be multiple of every block/page size:
 	//   - header.HugepageSize (2 MiB) — UFFD huge-page size, also used by prefetch
 	//   - header.RootfsBlockSize (4 KiB) — NBD / rootfs block size
-	DefaultCompressFrameSize = 2 * 1024 * 1024
+	DefaultCompressFrameSize = units.DefaultCompressFrameSize
 
 	// Use case identifiers for per-use-case compression targeting via LaunchDarkly.
 	UseCaseBuild = "build"
