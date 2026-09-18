@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -197,11 +198,15 @@ func (o *NBDProvider) SwapForBackgroundSeal(ctx context.Context) (*block.Cache, 
 	defer span.End()
 
 	if err := o.sync(ctx); err != nil {
+		recordSealSwap(ctx, err)
+
 		return nil, fmt.Errorf("flushing COW device failed: %w", err)
 	}
 
 	size, err := o.overlay.Size(ctx)
 	if err != nil {
+		recordSealSwap(ctx, err)
+
 		return nil, fmt.Errorf("getting overlay size: %w", err)
 	}
 
@@ -215,13 +220,19 @@ func (o *NBDProvider) SwapForBackgroundSeal(ctx context.Context) (*block.Cache, 
 	freshPath := fmt.Sprintf("%s-seal%d.cow", strings.TrimSuffix(o.cachePath, ".cow"), gen)
 	fresh, err := block.NewCache(size, o.blockSize, freshPath, false)
 	if err != nil {
+		recordSealSwap(ctx, err)
+
 		return nil, fmt.Errorf("creating fresh cache: %w", err)
 	}
 
 	old, err := o.overlay.SwapCache(fresh)
 	if err != nil {
+		recordSealSwap(ctx, err)
+
 		return nil, errors.Join(fmt.Errorf("swapping cache: %w", err), fresh.Close())
 	}
+
+	recordSealSwap(ctx, nil)
 
 	return old, nil
 }
@@ -231,9 +242,12 @@ func (o *NBDProvider) SwapForBackgroundSeal(ctx context.Context) (*block.Cache, 
 func (o *NBDProvider) FoldSealed(ctx context.Context) (*block.Cache, error) {
 	ctx, span := tracer.Start(ctx, "cow-fold-sealed")
 	defer span.End()
-	_ = ctx
 
-	return o.overlay.FoldSealing()
+	start := time.Now()
+	sealed, err := o.overlay.FoldSealing()
+	recordSealFold(ctx, time.Since(start), err)
+
+	return sealed, err
 }
 
 // signalFinishedOperations publishes the overlay-release signal without ever
