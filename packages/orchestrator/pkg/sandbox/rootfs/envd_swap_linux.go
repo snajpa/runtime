@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -56,6 +57,19 @@ const maxSwapOutput = 64 << 10 // 64 KiB
 // the inode is either our own staged binary or an original already under the bound,
 // so the later dumps need no separate check.
 const maxEnvdSize = 256 << 20 // 256 MiB
+
+// The swap stages tenant-controlled bytes in a host directory the jailed
+// debugfs reads and writes. Everything in it is owned by the orchestrator and
+// group-owned by the jail's group (jailGroup, jail_linux.go), with no world bit
+// at any point: another local user must never be able to rewrite the bytes the
+// swap classifies as evidence, and a dump of the tenant's own binary must not be
+// world-readable either. The group gets traversal only — enough to open the
+// pre-created files by name, not to list or create entries.
+const (
+	swapStageDirMode   os.FileMode = 0o710
+	swapStageReadMode  os.FileMode = 0o640
+	swapStageWriteMode os.FileMode = 0o660
+)
 
 // guestEnvdPath is the in-rootfs path the swap targets.
 const guestEnvdPath = "/usr/bin/envd"
@@ -169,24 +183,26 @@ func SwapEnvdBinary(ctx context.Context, devicePath, srcPath, stageRoot string) 
 	// Stage the new binary and the debugfs command/dump files in a private
 	// directory bound into the jail. The target's real home (/fc-envd) is a
 	// gcsfuse mount that need not propagate into the unit's private mount
-	// namespace, so copy it onto local disk first.
-	stage, err := os.MkdirTemp(stageRoot, ".envd-swap-")
+	// namespace, so copy it onto local disk first. The directory and every file
+	// in it stay owner/group only (see the swapStage* modes): the jail's group
+	// supplies the access its DynamicUser needs, and no local user outside that
+	// group can touch the staged bytes.
+	gid, err := swapStageGroup()
 	if err != nil {
-		return SwapResult{}, fmt.Errorf("create swap stage dir: %w", err)
+		return SwapResult{}, err
+	}
+
+	stage, err := stageSwapDir(stageRoot, gid)
+	if err != nil {
+		return SwapResult{}, err
 	}
 	defer os.RemoveAll(stage)
 
-	// The jail runs debugfs as a transient DynamicUser that must traverse this
-	// directory to read the staged binary/scripts and write its dumps; MkdirTemp
-	// creates it 0700 (owner-only), so widen it to 0755.
-	if err := os.Chmod(stage, 0o755); err != nil {
-		return SwapResult{}, fmt.Errorf("chmod swap stage dir: %w", err)
-	}
-
 	return swapEnvd(ctx, swapIO{
 		stageDir: stage,
+		gid:      gid,
 		run: func(ctx context.Context, phase, script string, writable bool) ([]byte, error) {
-			return runDebugfs(ctx, devicePath, stage, phase, script, writable)
+			return runDebugfs(ctx, devicePath, stage, phase, script, writable, gid)
 		},
 	}, srcPath)
 }
@@ -199,7 +215,11 @@ func SwapEnvdBinary(ctx context.Context, devicePath, srcPath, stageRoot string) 
 // is exercised by its own tests, not bypassed by this seam.
 type swapIO struct {
 	stageDir string
-	run      func(ctx context.Context, phase, script string, writable bool) ([]byte, error)
+	// gid is the jail's group: every file written into the staging directory is
+	// chowned to it so the jailed DynamicUser needs its group membership, not a
+	// world bit. Negative skips the chown (tests run without the jailed group).
+	gid int
+	run func(ctx context.Context, phase, script string, writable bool) ([]byte, error)
 }
 
 // swapEnvd is SwapEnvdBinary's body, minus the staging directory's lifecycle. See
@@ -207,7 +227,7 @@ type swapIO struct {
 func swapEnvd(ctx context.Context, dbg swapIO, srcPath string) (res SwapResult, err error) {
 	stage := dbg.stageDir
 	stagedNew := filepath.Join(stage, "envd.new")
-	if err := copyFile(srcPath, stagedNew, 0o755); err != nil {
+	if err := copyFile(srcPath, stagedNew, 0o600); err != nil {
 		// A missing SOURCE is named, so the caller can treat a retired binary as a
 		// deferral without also swallowing the host faults that raise ENOENT here.
 		// Keyed on the source's own stat rather than on the copy's error, because
@@ -220,10 +240,11 @@ func swapEnvd(ctx context.Context, dbg swapIO, srcPath string) (res SwapResult, 
 		return res, fmt.Errorf("stage target envd %q: %w", srcPath, err)
 	}
 	// The jailed debugfs runs as an unprivileged DynamicUser with no
-	// CAP_DAC_OVERRIDE, so it can only read the staged binary via its world bits.
-	// copyFile's mode is subject to the orchestrator umask, so set it explicitly.
-	if err := os.Chmod(stagedNew, 0o755); err != nil {
-		return res, fmt.Errorf("chmod staged envd: %w", err)
+	// CAP_DAC_OVERRIDE, so it reads the staged binary through the jail's group;
+	// copyFile's mode is subject to the orchestrator umask, so set it explicitly
+	// and never with a world bit.
+	if err := setStageFileAccess(stagedNew, swapStageReadMode, dbg.gid); err != nil {
+		return res, fmt.Errorf("secure staged envd: %w", err)
 	}
 	// An empty staged binary would make wantSHA the empty-file digest, which a failed
 	// (empty) read-back would then MATCH — the one way a broken swap could report
@@ -251,10 +272,11 @@ func swapEnvd(ctx context.Context, dbg swapIO, srcPath string) (res SwapResult, 
 
 	// 2. Back the original out to the host BEFORE touching it, so any later
 	// failure can be rolled back. debugfs `dump` reads the inode to a host file.
-	// Pre-create the target world-writable: the DynamicUser can't create files in
-	// the root-owned stage dir, but can write an already-existing 0666 file.
+	// Pre-create the target group-writable for the jail: the DynamicUser can't
+	// create files in the root-owned stage dir, but can write an
+	// already-existing file through its group.
 	origPath := filepath.Join(stage, "envd.orig")
-	if err := createJailWritable(origPath); err != nil {
+	if err := createJailWritable(origPath, dbg.gid); err != nil {
 		return res, fmt.Errorf("pre-create backup target: %w", err)
 	}
 	if _, derr := dbg.run(ctx, "backup",
@@ -266,11 +288,12 @@ func swapEnvd(ctx context.Context, dbg swapIO, srcPath string) (res SwapResult, 
 		// swap. (A well-formed rootfs always has /usr/bin/envd.)
 		return res, fmt.Errorf("refusing offline swap: could not read original %s to back up (dump produced nothing)", guestEnvdPath)
 	}
-	// createJailWritable left the backup 0666 so the jail could write the dump; the
-	// rollback later `write`s it back, so make it executable-moded now (belt-and-
-	// suspenders — the rollback also `sif`s it and verifyEnvd asserts the result).
-	if err := os.Chmod(origPath, 0o755); err != nil {
-		return res, fmt.Errorf("chmod original backup: %w", err)
+	// createJailWritable left the backup group-writable for the jail's dump; the
+	// rollback later `write`s it back, so keep it group-readable and drop the
+	// world bits. The host file's own mode does not travel into the image — the
+	// rollback's `sif` sets the inode's mode.
+	if err := setStageFileAccess(origPath, swapStageReadMode, dbg.gid); err != nil {
+		return res, fmt.Errorf("secure original backup: %w", err)
 	}
 	origSHA, err := fileSHA256(origPath)
 	if err != nil {
@@ -638,9 +661,9 @@ func envdExecutable(statOut string) bool {
 // same way the backup does: no bootable envd is zero bytes.
 func dumpSHA256(ctx context.Context, dbg swapIO, phase string) (string, error) {
 	out := filepath.Join(dbg.stageDir, "envd."+phase)
-	// Pre-create world-writable so the jailed DynamicUser can write the dump into
-	// the root-owned stage dir (see createJailWritable).
-	if err := createJailWritable(out); err != nil {
+	// Pre-create group-writable for the jail so the DynamicUser can write the
+	// dump into the root-owned stage dir (see createJailWritable).
+	if err := createJailWritable(out, dbg.gid); err != nil {
 		return "", fmt.Errorf("pre-create dump target: %w", err)
 	}
 	if _, err := dbg.run(ctx, phase,
@@ -658,13 +681,13 @@ func dumpSHA256(ctx context.Context, dbg swapIO, phase string) (string, error) {
 	return fileSHA256(out)
 }
 
-// createJailWritable creates (or truncates) path as an empty world-writable file
-// so the jailed debugfs DynamicUser can open it as a `dump` target: it cannot
-// create files in the root-owned 0755 stage dir, but opening an already-existing
-// 0666 file for writing needs no directory write. The explicit chmod defeats the
-// process umask.
-func createJailWritable(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o666)
+// createJailWritable creates (or truncates) path as an empty file the jail's
+// group can write, so the jailed debugfs DynamicUser can open it as a `dump`
+// target: it cannot create files in the root-owned stage dir, but opening an
+// already-existing file for writing needs no directory write. The explicit
+// chmod defeats the process umask, and no world bit is ever set.
+func createJailWritable(path string, gid int) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -672,7 +695,69 @@ func createJailWritable(path string) error {
 		return err
 	}
 
-	return os.Chmod(path, 0o666)
+	return setStageFileAccess(path, swapStageWriteMode, gid)
+}
+
+// swapStageGroup resolves the gid of the group the jailed tool runs with (see
+// jailGroup), so staged files can be group-owned by it.
+func swapStageGroup() (int, error) {
+	group, err := user.LookupGroup(jailGroup)
+	if err != nil {
+		return 0, fmt.Errorf("resolve jail group %q: %w", jailGroup, err)
+	}
+
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		return 0, fmt.Errorf("parse %q gid %q: %w", jailGroup, group.Gid, err)
+	}
+
+	return gid, nil
+}
+
+// stageSwapDir creates the staging directory for one swap: owner-only, plus
+// traversal for the jail's group. gid < 0 skips the group ownership (tests that
+// run without the jailed group); production passes the resolved group.
+func stageSwapDir(stageRoot string, gid int) (string, error) {
+	stage, err := os.MkdirTemp(stageRoot, ".envd-swap-")
+	if err != nil {
+		return "", fmt.Errorf("create swap stage dir: %w", err)
+	}
+
+	if err := setStageFileAccess(stage, swapStageDirMode, gid); err != nil {
+		_ = os.RemoveAll(stage)
+
+		return "", fmt.Errorf("secure swap stage dir: %w", err)
+	}
+
+	return stage, nil
+}
+
+// setStageFileAccess applies a staging mode and, when the jail's group is in
+// play, transfers the file's group to it. The explicit chmod defeats the
+// process umask — the reason these files carried world bits before.
+func setStageFileAccess(path string, mode os.FileMode, gid int) error {
+	if gid >= 0 {
+		if err := os.Chown(path, os.Getuid(), gid); err != nil {
+			return fmt.Errorf("chown %s to group %d: %w", path, gid, err)
+		}
+	}
+
+	if err := os.Chmod(path, mode); err != nil {
+		return fmt.Errorf("chmod %s to %#o: %w", path, mode, err)
+	}
+
+	return nil
+}
+
+// writeStageScript writes a debugfs command file for the jailed tool: readable
+// by the jail's group, never by other local users (the script embeds the paths
+// of the tenant's staging files).
+func writeStageScript(path, script string, gid int) error {
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		return err
+	}
+
+	return setStageFileAccess(path, swapStageReadMode, gid)
 }
 
 func fileSHA256(path string) (string, error) {
@@ -726,19 +811,14 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // parsed locally by callers for the swap's decisions, but no caller folds them
 // into a propagated error: the error already carries the diagnosis by
 // construction, which is why appending the raw output is neither needed nor done.
-func runDebugfs(ctx context.Context, devicePath, stageDir, phase, script string, writable bool) ([]byte, error) {
+func runDebugfs(ctx context.Context, devicePath, stageDir, phase, script string, writable bool, gid int) ([]byte, error) {
 	if !nbdDevicePath.MatchString(devicePath) {
 		return nil, fmt.Errorf("refusing to run debugfs on unexpected device path %q", devicePath)
 	}
 
 	scriptPath := filepath.Join(stageDir, "cmds-"+phase)
-	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+	if err := writeStageScript(scriptPath, script, gid); err != nil {
 		return nil, fmt.Errorf("write debugfs script: %w", err)
-	}
-	// WriteFile's mode is subject to umask; the jailed DynamicUser reads the script
-	// via its world bits, so set it explicitly.
-	if err := os.Chmod(scriptPath, 0o644); err != nil {
-		return nil, fmt.Errorf("chmod debugfs script: %w", err)
 	}
 
 	unit := "envd-swap-" + phase + "-" + filepath.Base(devicePath)
