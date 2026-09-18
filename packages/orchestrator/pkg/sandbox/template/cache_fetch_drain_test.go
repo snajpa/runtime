@@ -38,7 +38,7 @@ func TestCacheFetchDrain(t *testing.T) {
 	<-started
 	require.True(t, ran.Load())
 
-	require.NoError(t, c.stopFetches(), "a ctx-aware fetch must drain on cancel")
+	require.NoError(t, c.stopFetches(t.Context()), "a ctx-aware fetch must drain on cancel")
 
 	// A stopped cache must not start new background work.
 	require.False(t, c.startFetch(t.Context(), func(context.Context) {}))
@@ -63,7 +63,7 @@ func TestCacheFetchDrainBounded(t *testing.T) {
 	}))
 
 	start := time.Now()
-	err := c.stopFetches()
+	err := c.stopFetches(t.Context())
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Less(t, time.Since(start), time.Second, "the drain must be bounded")
 }

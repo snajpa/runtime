@@ -152,7 +152,7 @@ func (c *Cache) startFetch(parent context.Context, fn func(ctx context.Context))
 // stopFetches cancels in-flight template fetches and waits for them within
 // templateFetchDrainTimeout: shutdown must not hang on a stuck fetch (S-19,
 // INV-5). Returns the drain error, if any, for the caller to log.
-func (c *Cache) stopFetches() error {
+func (c *Cache) stopFetches(ctx context.Context) error {
 	c.fetchMu.Lock()
 	c.fetchStopping = true
 
@@ -166,7 +166,7 @@ func (c *Cache) stopFetches() error {
 		cancel()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), templateFetchDrainTimeout)
+	ctx, cancel := context.WithTimeout(ctx, templateFetchDrainTimeout)
 	defer cancel()
 
 	return waitGroupBounded(ctx, &c.fetchWG)
@@ -232,11 +232,12 @@ func (c *Cache) Start(ctx context.Context) {
 	go c.cache.Start()
 }
 
-func (c *Cache) Stop() {
+func (c *Cache) Stop(ctx context.Context) {
 	// Cancel and drain in-flight fetches first: they write into the build store
-	// that Close tears down (S-19, INV-5).
-	if err := c.stopFetches(); err != nil {
-		logger.L().Warn(context.Background(), "template fetch drain did not finish before shutdown", zap.Error(err))
+	// that Close tears down (S-19, INV-5). The drain inherits the caller's
+	// shutdown budget instead of a detached background context.
+	if err := c.stopFetches(ctx); err != nil {
+		logger.L().Warn(ctx, "template fetch drain did not finish before shutdown", zap.Error(err))
 	}
 
 	c.buildStore.Close()
