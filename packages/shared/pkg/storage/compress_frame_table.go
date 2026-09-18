@@ -304,6 +304,12 @@ func DeserializeFrameTable(r io.Reader) (*FrameTable, error) {
 		return nil, nil
 	}
 
+	// Reject types that do not survive the uint32->byte narrowing: accepting
+	// one would build a table whose compression contradicts its frame count.
+	if ct >= uint32(numCompressionTypes) {
+		return nil, fmt.Errorf("unknown compression type %d: corrupted header", ct)
+	}
+
 	if n > maxDeserializedFrames {
 		return nil, fmt.Errorf("frame count %d exceeds maximum %d", n, maxDeserializedFrames)
 	}

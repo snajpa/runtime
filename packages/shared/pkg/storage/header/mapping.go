@@ -2,7 +2,6 @@ package header
 
 import (
 	"fmt"
-	"os"
 	"slices"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -74,13 +73,15 @@ func createIdentityMapping(
 // The mapping are stored in a sorted order.
 // The baseMapping must cover the whole size.
 //
-// It returns a new set of mappings that covers the whole size.
+// It returns a new set of mappings that covers the whole size, or an error when
+// the inputs violate the ordering invariant: the invariant is load-bearing, so
+// a violated case is reported instead of printing and spinning.
 func MergeMappings(
 	baseMapping []BuildMap,
 	diffMapping []BuildMap,
-) []BuildMap {
+) ([]BuildMap, error) {
 	if len(diffMapping) == 0 {
-		return baseMapping
+		return baseMapping, nil
 	}
 
 	baseMappingCopy := make([]BuildMap, len(baseMapping))
@@ -221,13 +222,13 @@ func MergeMappings(
 			continue
 		}
 
-		fmt.Fprintf(os.Stderr, "invalid case during merge mappings: %+v %+v\n", base, diff)
+		return nil, fmt.Errorf("invalid case during merge mappings: base %+v and diff %+v overlap without a defined merge", *base, diff)
 	}
 
 	mappings = append(mappings, baseMapping[baseIdx:]...)
 	mappings = append(mappings, diffMapping[diffIdx:]...)
 
-	return mappings
+	return mappings, nil
 }
 
 // NormalizeMappings joins adjacent mappings that have the same buildId.

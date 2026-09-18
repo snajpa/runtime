@@ -93,21 +93,24 @@ func main() {
 
 	if *visualize {
 		bottomLayers := header.Layers(baseMapping)
-		delete(*bottomLayers, baseHeader.Metadata.BaseBuildId)
+		delete(bottomLayers, baseHeader.Metadata.BaseBuildId)
+
+		view, err := header.Visualize(
+			baseMapping,
+			baseHeader.Metadata.Size,
+			baseHeader.Metadata.BlockSize,
+			128,
+			bottomLayers,
+			map[uuid.UUID]struct{}{
+				baseHeader.Metadata.BuildId: {},
+			},
+		)
+		if err != nil {
+			log.Fatalf("failed to visualize base mappings: %s", err)
+		}
 
 		fmt.Println("")
-		fmt.Println(
-			header.Visualize(
-				baseMapping,
-				baseHeader.Metadata.Size,
-				baseHeader.Metadata.BlockSize,
-				128,
-				bottomLayers,
-				&map[uuid.UUID]struct{}{
-					baseHeader.Metadata.BuildId: {},
-				},
-			),
-		)
+		fmt.Println(view)
 	}
 
 	if err := header.ValidateMappings(baseMapping, baseHeader.Metadata.Size, baseHeader.Metadata.BlockSize); err != nil {
@@ -131,20 +134,26 @@ func main() {
 	}
 
 	if *visualize {
-		fmt.Println("")
-		fmt.Println(
-			header.Visualize(
-				onlyDiffMappings,
-				baseHeader.Metadata.Size,
-				baseHeader.Metadata.BlockSize,
-				128,
-				nil,
-				header.Layers(onlyDiffMappings),
-			),
+		view, err := header.Visualize(
+			onlyDiffMappings,
+			baseHeader.Metadata.Size,
+			baseHeader.Metadata.BlockSize,
+			128,
+			nil,
+			header.Layers(onlyDiffMappings),
 		)
+		if err != nil {
+			log.Fatalf("failed to visualize diff mappings: %s", err)
+		}
+
+		fmt.Println("")
+		fmt.Println(view)
 	}
 
-	mergedHeader := header.MergeMappings(baseMapping, onlyDiffMappings)
+	mergedHeader, err := header.MergeMappings(baseMapping, onlyDiffMappings)
+	if err != nil {
+		log.Fatalf("failed to merge mappings: %s", err)
+	}
 
 	fmt.Printf("\n\nMERGED METADATA\n")
 	fmt.Printf("========\n")
@@ -155,19 +164,22 @@ func main() {
 
 	if *visualize {
 		bottomLayers := header.Layers(baseMapping)
-		delete(*bottomLayers, baseHeader.Metadata.BaseBuildId)
+		delete(bottomLayers, baseHeader.Metadata.BaseBuildId)
+
+		view, err := header.Visualize(
+			mergedHeader,
+			baseHeader.Metadata.Size,
+			baseHeader.Metadata.BlockSize,
+			128,
+			bottomLayers,
+			header.Layers(onlyDiffMappings),
+		)
+		if err != nil {
+			log.Fatalf("failed to visualize merged mappings: %s", err)
+		}
 
 		fmt.Println("")
-		fmt.Println(
-			header.Visualize(
-				mergedHeader,
-				baseHeader.Metadata.Size,
-				baseHeader.Metadata.BlockSize,
-				128,
-				bottomLayers,
-				header.Layers(onlyDiffMappings),
-			),
-		)
+		fmt.Println(view)
 	}
 
 	if err := header.ValidateMappings(mergedHeader, baseHeader.Metadata.Size, baseHeader.Metadata.BlockSize); err != nil {

@@ -233,3 +233,30 @@ func TestSerializeDeserializeFrameTable(t *testing.T) {
 		require.Nil(t, got)
 	})
 }
+
+// TestDeserializeFrameTableRejectsUnknownCompressionType pins the guard for
+// headers whose compression-type word narrows to CompressionNone while the
+// frame count is non-zero. Accepting one used to build a table that owns
+// frames yet reports "no compression"; Serialize then wrote ct=0/n=0 for it
+// and the re-parse returned nil — the round trip lost every frame. Regression
+// for testdata/fuzz/FuzzDeserializeFrameTable/a8db7817e8b06081.
+func TestDeserializeFrameTableRejectsUnknownCompressionType(t *testing.T) {
+	t.Parallel()
+
+	// Header: LE uint32 0x30303000 (low byte = none) + frame count 1 + one
+	// 24-byte entry — the exact shape the fuzzer found.
+	buf := append(
+		[]byte{0x00, 0x30, 0x30, 0x30, 0x01, 0x00, 0x00, 0x00},
+		bytes.Repeat([]byte{0x30}, 24)...,
+	)
+
+	_, err := DeserializeFrameTable(bytes.NewReader(buf))
+	require.Error(t, err, "a narrowing compression type must be rejected")
+	require.Contains(t, err.Error(), "unknown compression type")
+
+	// A genuinely unknown codec is rejected the same way.
+	buf[0] = 0x7f
+	_, err = DeserializeFrameTable(bytes.NewReader(buf))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown compression type")
+}

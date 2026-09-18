@@ -115,9 +115,18 @@ func (d *DiffMetadata) ToProvisionalDiffHeader(
 
 	dirtyMappings := createIdentityMapping(&buildID, d.Dirty, d.BlockSize)
 	emptyMappings := CreateMapping(&ignoreBuildID, d.Empty, d.BlockSize)
-	diffMapping := MergeMappings(dirtyMappings, emptyMappings)
 
-	m := NormalizeMappings(MergeMappings(originalHeader.Mapping.Slice(), diffMapping))
+	diffMapping, err := MergeMappings(dirtyMappings, emptyMappings)
+	if err != nil {
+		return nil, fmt.Errorf("merge empty mappings: %w", err)
+	}
+
+	merged, err := MergeMappings(originalHeader.Mapping.Slice(), diffMapping)
+	if err != nil {
+		return nil, fmt.Errorf("merge original mappings: %w", err)
+	}
+
+	m := NormalizeMappings(merged)
 	metadata := originalHeader.Metadata.NextGeneration(buildID)
 
 	h, err := newDiffHeader(metadata, m, originalHeader.Builds)
@@ -134,7 +143,7 @@ func (d *DiffMetadata) ToProvisionalDiffHeader(
 func (d *DiffMetadata) toDiffMapping(
 	ctx context.Context,
 	buildID uuid.UUID,
-) (mapping []BuildMap) {
+) ([]BuildMap, error) {
 	dirtyMappings := CreateMapping(
 		&buildID,
 		d.Dirty,
@@ -150,10 +159,13 @@ func (d *DiffMetadata) toDiffMapping(
 	)
 	telemetry.ReportEvent(ctx, "created empty mapping")
 
-	mappings := MergeMappings(dirtyMappings, emptyMappings)
+	mappings, err := MergeMappings(dirtyMappings, emptyMappings)
+	if err != nil {
+		return nil, fmt.Errorf("merge diff mappings: %w", err)
+	}
 	telemetry.ReportEvent(ctx, "merge mappings")
 
-	return mappings
+	return mappings, nil
 }
 
 func (d *DiffMetadata) ToDiffHeader(
@@ -170,20 +182,26 @@ func (d *DiffMetadata) ToDiffHeader(
 		}
 	}()
 
-	diffMapping := d.toDiffMapping(ctx, buildID)
+	diffMapping, err := d.toDiffMapping(ctx, buildID)
+	if err != nil {
+		return nil, err
+	}
 
 	// MergeMappings/NormalizeMappings operate on []BuildMap (transient).
 	// originalHeader.Mapping is the compact cached form; materialize it once
 	// here. The intermediate slice is short-lived (released after the new
 	// compact header is built below).
-	m := MergeMappings(
+	merged, err := MergeMappings(
 		originalHeader.Mapping.Slice(),
 		diffMapping,
 	)
+	if err != nil {
+		return nil, fmt.Errorf("merge original mappings: %w", err)
+	}
 	telemetry.ReportEvent(ctx, "merged mappings")
 
 	// TODO: We can run normalization only when empty mappings are not empty for this snapshot
-	m = NormalizeMappings(m)
+	m := NormalizeMappings(merged)
 	telemetry.ReportEvent(ctx, "normalized mappings")
 
 	metadata := originalHeader.Metadata.NextGeneration(buildID)
