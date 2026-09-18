@@ -256,7 +256,7 @@ func BenchmarkConcurrentResume(b *testing.B) {
 	templateCache, err := template.NewCache(config, featureFlags, persistence, blockMetrics, peerclient.NopResolver())
 	require.NoError(b, err)
 	templateCache.Start(b.Context())
-	b.Cleanup(templateCache.Stop)
+	b.Cleanup(func() { templateCache.Stop(b.Context()) })
 
 	cgroupManager, err := cgroup.NewManager()
 	require.NoError(b, err, "cgroups v2 not available - running as root?")

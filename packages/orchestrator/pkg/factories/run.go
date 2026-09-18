@@ -645,7 +645,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 	}
 	templateCache.Start(ctx)
 	closers = append(closers, closer{"template cache", func(context.Context) error {
-		templateCache.Stop()
+		templateCache.Stop(ctx)
 
 		return nil
 	}})
