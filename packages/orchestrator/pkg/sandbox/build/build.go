@@ -183,12 +183,38 @@ func (b *File) ReadAt(ctx context.Context, p []byte, off int64) (n int, err erro
 	return n, err
 }
 
+// maxCacheClosedRetries bounds the re-plan loop in readAt: a Diff evicted
+// between planning and reading is normal, but an eviction storm must not spin a
+// guest fault forever (S-19, INV-5).
+const maxCacheClosedRetries = 3
+
+// cacheClosedRetryDelay is the bounded backoff between re-plans; a var so tests
+// can shorten it.
+var cacheClosedRetryDelay = 25 * time.Millisecond
+
+// canRetryCacheClosed reports whether another re-plan is allowed after a
+// CacheClosedError, waiting the bounded backoff or ctx cancellation. A nil
+// error means "retry"; anything else must be surfaced (S-19, INV-5).
+func canRetryCacheClosed(ctx context.Context, attempt int) error {
+	if attempt >= maxCacheClosedRetries {
+		return fmt.Errorf("gave up after %d cache-closed retries", attempt+1)
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(cacheClosedRetryDelay):
+	}
+
+	return nil
+}
+
 // readAt fills p from the mapped build segments, optionally in parallel.
 // Cache eviction or a peer transition re-resolves and retries.
 func (b *File) readAt(ctx context.Context, p []byte, off int64) (int, error) {
 	maxParallel := b.store.flags.IntFlag(ctx, featureflags.MaxParallelBuildReadSegments)
 
-	for {
+	for attempt := 0; ; attempt++ {
 		segments, n, distinctBuilds, err := b.planRead(ctx, p, off)
 		if err == nil {
 			err = b.readSegments(ctx, p, segments, maxParallel)
@@ -209,8 +235,13 @@ func (b *File) readAt(ctx context.Context, p []byte, off int64) (int, error) {
 
 		// A Diff can be evicted and closed between planning and reading. Re-plan
 		// the whole read; reads are idempotent, so re-filling already-written
-		// regions is safe and getBuild re-resolves the closed Diff.
+		// regions is safe and getBuild re-resolves the closed Diff. Bounded: an
+		// eviction storm must not spin this read forever (S-19, INV-5).
 		if _, ok := errors.AsType[*block.CacheClosedError](err); ok {
+			if retryErr := canRetryCacheClosed(ctx, attempt); retryErr != nil {
+				return 0, errors.Join(err, retryErr)
+			}
+
 			continue
 		}
 

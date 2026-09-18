@@ -63,6 +63,113 @@ type Cache struct {
 	rootCachePath string
 	peers         peerclient.Resolver
 	extendMu      sync.Mutex
+
+	// fetch lifecycle: template fetches are detached from the request context
+	// (another template may wait on the same fetch), so each runs on its own
+	// cancelable ctx tracked here: Stop cancels them all and drains with a
+	// bound instead of leaving them running into shutdown (S-19, INV-5).
+	fetchMu       sync.Mutex
+	fetchStopping bool
+	fetchWG       sync.WaitGroup
+	fetchCancels  map[uint64]context.CancelFunc
+	nextFetchID   uint64
+}
+
+// templateFetchDrainTimeout bounds Stop's drain of in-flight template fetches:
+// shutdown must not hang on a stuck fetch (S-19, INV-5). A var so tests can
+// shorten it.
+var templateFetchDrainTimeout = 30 * time.Second
+
+// templateAccessorWaitTimeout bounds the waits of storage-template accessors
+// whose signature has no context (Rootfs/Snapfile/UpdateMetadata): an
+// unresolved fetch must not hang the caller forever (S-19, INV-5). A var so
+// tests can shorten it.
+var templateAccessorWaitTimeout = 2 * time.Minute
+
+// waitBounded waits for p with a bound, for accessors that cannot take a
+// caller context (S-19, INV-5).
+func waitBounded[T any](p *utils.SetOnce[T]) (T, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), templateAccessorWaitTimeout)
+	defer cancel()
+
+	return p.WaitWithContext(ctx)
+}
+
+// waitGroupBounded waits for wg within ctx.
+func waitGroupBounded(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// startFetch runs fn on a cancelable context derived from the caller's via
+// WithoutCancel: detached from the request's cancellation by design (another
+// template may be waiting on the same fetch), but tracked so Stop can cancel
+// and drain it with a bound (S-19, INV-5). Returns false once the cache is
+// stopping: no new background work.
+func (c *Cache) startFetch(parent context.Context, fn func(ctx context.Context)) bool {
+	c.fetchMu.Lock()
+	defer c.fetchMu.Unlock()
+
+	if c.fetchStopping {
+		return false
+	}
+
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	id := c.nextFetchID
+	c.nextFetchID++
+	if c.fetchCancels == nil {
+		c.fetchCancels = make(map[uint64]context.CancelFunc)
+	}
+	c.fetchCancels[id] = cancel
+
+	c.fetchWG.Go(func() {
+		defer func() {
+			cancel()
+
+			c.fetchMu.Lock()
+			delete(c.fetchCancels, id)
+			c.fetchMu.Unlock()
+		}()
+
+		fn(ctx)
+	})
+
+	return true
+}
+
+// stopFetches cancels in-flight template fetches and waits for them within
+// templateFetchDrainTimeout: shutdown must not hang on a stuck fetch (S-19,
+// INV-5). Returns the drain error, if any, for the caller to log.
+func (c *Cache) stopFetches() error {
+	c.fetchMu.Lock()
+	c.fetchStopping = true
+
+	cancels := make([]context.CancelFunc, 0, len(c.fetchCancels))
+	for _, cancel := range c.fetchCancels {
+		cancels = append(cancels, cancel)
+	}
+	c.fetchMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), templateFetchDrainTimeout)
+	defer cancel()
+
+	return waitGroupBounded(ctx, &c.fetchWG)
 }
 
 // NewCache initializes a template new cache.
@@ -126,6 +233,12 @@ func (c *Cache) Start(ctx context.Context) {
 }
 
 func (c *Cache) Stop() {
+	// Cancel and drain in-flight fetches first: they write into the build store
+	// that Close tears down (S-19, INV-5).
+	if err := c.stopFetches(); err != nil {
+		logger.L().Warn(context.Background(), "template fetch drain did not finish before shutdown", zap.Error(err))
+	}
+
 	c.buildStore.Close()
 	c.cache.Stop()
 	c.peers.Close()
@@ -493,9 +606,12 @@ func (c *Cache) getTemplateWithFetch(ctx context.Context, tmpl *storageTemplate,
 
 	if !found {
 		missesMetric.Add(ctx, 1)
-		// We don't want to cancel the request if the request was canceled, because it can be used by other templates
-		// It's a little bit problematic, because shutdown won't cancel the fetch
-		go tmpl.Fetch(context.WithoutCancel(ctx), c.buildStore)
+		// The fetch is detached from the request context (another template may
+		// be waiting on the same fetch), but it is tracked on the cache's own
+		// fetch context so Stop can cancel and drain it with a bound (S-19).
+		c.startFetch(ctx, func(fetchCtx context.Context) {
+			tmpl.Fetch(fetchCtx, c.buildStore)
+		})
 	} else {
 		hitsMetric.Add(ctx, 1)
 	}

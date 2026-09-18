@@ -344,19 +344,19 @@ func (t *storageTemplate) Memfile(ctx context.Context) (block.ReadonlyDevice, er
 	_, span := tracer.Start(ctx, "storage-template-memfile")
 	defer span.End()
 
-	return t.memfile.Wait()
+	return t.memfile.WaitWithContext(ctx)
 }
 
 func (t *storageTemplate) Rootfs() (block.ReadonlyDevice, error) {
-	return t.rootfs.Wait()
+	return waitBounded(t.rootfs)
 }
 
 func (t *storageTemplate) Snapfile() (File, error) {
-	return t.snapfile.Wait()
+	return waitBounded(t.snapfile)
 }
 
 func (t *storageTemplate) Metadata() (metadata.Template, error) {
-	metafile, err := t.metafile.Wait()
+	metafile, err := waitBounded(t.metafile)
 	if err != nil {
 		return metadata.Template{}, fmt.Errorf("failed to get metafile: %w", err)
 	}
@@ -365,7 +365,7 @@ func (t *storageTemplate) Metadata() (metadata.Template, error) {
 }
 
 func (t *storageTemplate) UpdateMetadata(meta metadata.Template) error {
-	metafile, err := t.metafile.Wait()
+	metafile, err := waitBounded(t.metafile)
 	if err != nil {
 		return fmt.Errorf("failed to get metafile: %w", err)
 	}

@@ -236,6 +236,17 @@ func (o *NBDProvider) FoldSealed(ctx context.Context) (*block.Cache, error) {
 	return o.overlay.FoldSealing()
 }
 
+// signalFinishedOperations publishes the overlay-release signal without ever
+// blocking: Close may run twice (or race the eject waiter), and a second
+// blocking send on the buffer-1 channel would hang teardown forever (S-19,
+// INV-5).
+func (o *NBDProvider) signalFinishedOperations() {
+	select {
+	case o.finishedOperations <- struct{}{}:
+	default:
+	}
+}
+
 func (o *NBDProvider) Close(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "cow-close")
 	defer span.End()
@@ -252,7 +263,7 @@ func (o *NBDProvider) Close(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("error closing overlay mount: %w", err))
 	}
 
-	o.finishedOperations <- struct{}{}
+	o.signalFinishedOperations()
 
 	err = o.overlay.Close()
 	if err != nil {
