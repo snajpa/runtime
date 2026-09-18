@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+// jailGroup is the supplementary group every jailed tool runs with, and the
+// group that owns the files staged for it. Ownership is transferred explicitly
+// because a DynamicUser has no id to own them ahead of time, and a group the
+// jail already belongs to is what lets the staged files carry no world bit.
+const jailGroup = "disk"
+
 // jailProperties returns the systemd-run confinement properties shared by every
 // jailed tool that parses tenant-controlled filesystem bytes on the host
 // (debugfs for the envd swap, e2fsck for pre-boot recovery). It is the single
@@ -26,7 +32,7 @@ func jailProperties(unit string, runtimeMax time.Duration, devicePath string, ex
 		"--property=KillSignal=SIGKILL",
 		"--property=TimeoutStopSec=10s",
 		"--property=DynamicUser=yes",
-		"--property=SupplementaryGroups=disk",
+		"--property=SupplementaryGroups=" + jailGroup,
 		"--property=ProtectProc=invisible",
 		"--property=ProcSubset=pid",
 		"--property=PrivateNetwork=yes",

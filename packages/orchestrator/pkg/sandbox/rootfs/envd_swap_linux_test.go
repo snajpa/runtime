@@ -3,6 +3,9 @@
 package rootfs
 
 import (
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,10 +35,66 @@ func TestNBDDevicePath(t *testing.T) {
 func TestRunDebugfsRejectsNonNBDDevice(t *testing.T) {
 	t.Parallel()
 
-	out, err := runDebugfs(t.Context(), "/dev/sda", t.TempDir(), "swap", "rm /usr/bin/envd\n", true)
+	out, err := runDebugfs(t.Context(), "/dev/sda", t.TempDir(), "swap", "rm /usr/bin/envd\n", true, -1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing to run debugfs on unexpected device path")
 	assert.Empty(t, out)
+}
+
+// TestSwapStageModesHaveNoWorldBits pins the staging modes directly: the stage
+// directory, the debugfs script, and the dump targets are owner/group only, so
+// another local user can neither read the tenant's dumped binary nor rewrite the
+// bytes the swap classifies as evidence.
+func TestSwapStageModesHaveNoWorldBits(t *testing.T) {
+	t.Parallel()
+
+	stage, err := stageSwapDir(t.TempDir(), -1)
+	require.NoError(t, err)
+
+	dirInfo, err := os.Stat(stage)
+	require.NoError(t, err)
+	assert.Equal(t, swapStageDirMode, dirInfo.Mode().Perm())
+	assert.Zero(t, dirInfo.Mode().Perm()&0o007)
+
+	script := filepath.Join(stage, "cmds-state")
+	require.NoError(t, writeStageScript(script, "stat /usr/bin/envd\n", -1))
+	scriptInfo, err := os.Stat(script)
+	require.NoError(t, err)
+	assert.Equal(t, swapStageReadMode, scriptInfo.Mode().Perm())
+
+	target := filepath.Join(stage, "envd.state")
+	require.NoError(t, createJailWritable(target, -1))
+	targetInfo, err := os.Stat(target)
+	require.NoError(t, err)
+	assert.Equal(t, swapStageWriteMode, targetInfo.Mode().Perm())
+	assert.Zero(t, targetInfo.Mode().Perm()&0o007)
+}
+
+// TestSwapStageGroupMatchesJail pins that staged files are group-owned by the
+// same group the jail runs with: that membership — not a world bit — is what
+// lets the DynamicUser read inputs and write dumps. Root-only, since
+// transferring a file to another group needs root or membership.
+func TestSwapStageGroupMatchesJail(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() != 0 {
+		t.Skip("group ownership requires root")
+	}
+
+	gid, err := swapStageGroup()
+	require.NoError(t, err)
+
+	stage, err := stageSwapDir(t.TempDir(), gid)
+	require.NoError(t, err)
+
+	info, err := os.Stat(stage)
+	require.NoError(t, err)
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	assert.Equal(t, gid, int(stat.Gid))
+	assert.Equal(t, swapStageDirMode, info.Mode().Perm())
+	assert.Zero(t, info.Mode().Perm()&0o007)
 }
 
 func TestSwapEnvdBinaryRejectsRelativeStageRoot(t *testing.T) {
