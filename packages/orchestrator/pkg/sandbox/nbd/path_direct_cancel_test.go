@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -31,21 +32,57 @@ func withAfterConnect(f func(deviceIndex uint32)) MountOption {
 // takes a fresh slot per attempt - a pool seeded with exactly one slot deadlocks in GetDevice
 // the first time a concurrent test connects the device this one was handed.
 //
-// It stops on its own after maxAttempts so a machine with nothing free fails the test in
-// seconds instead of hanging until the go test timeout: closing done makes GetDevice return
-// ErrClosed, which surfaces as an Open error the assertions below report.
-func feedSlotsUntil(pool *DevicePool, stop <-chan struct{}) {
-	const maxAttempts = 16
+// Device acquisition scans host-global /dev/nbd* and is transiently contended (S-56), so a
+// failed getFreeDeviceSlot is retried with the Populate backoff (S-32) instead of stopping
+// the feeder. Previously the first failure closed done, and that close races Open's
+// post-connect window, so the assertions below compared ErrClosed ("cannot read from a closed
+// pool") against context.Canceled. A machine with no free device still fails loudly: the
+// feeder gives up after starvationBudget and closes done, and GetDevice reports ErrClosed.
+// The budget stays far below the go test timeout so the failure names the starved
+// acquisition instead of hanging.
+func feedSlotsUntil(t *testing.T, pool *DevicePool, stop <-chan struct{}) {
+	t.Helper()
+
+	const (
+		maxSlots = 16
+
+		// starvationBudget must ride a full parallel wave of device tests
+		// (the suite lock runs one binary at a time and a wave member holds
+		// its devices for about ten seconds), while still failing a
+		// device-less machine within a minute rather than at the test
+		// timeout.
+		starvationBudget = time.Minute
+	)
 
 	go func() {
-		for range maxAttempts {
+		deadline := time.Now().Add(starvationBudget)
+		supplied, failed := 0, 0
+
+		for supplied < maxSlots {
 			slot, err := pool.getFreeDeviceSlot()
 			if err != nil {
-				break
+				if time.Now().After(deadline) {
+					t.Logf("feedSlotsUntil: no free NBD device for %s (%d failed acquisitions); closing the pool", starvationBudget, failed+1)
+
+					break
+				}
+
+				select {
+				case <-time.After(poolPopulateBackoff(failed)):
+				case <-stop:
+					return
+				}
+
+				failed++
+
+				continue
 			}
+
+			failed = 0
 
 			select {
 			case pool.slots <- *slot:
+				supplied++
 			case <-stop:
 				return
 			}
@@ -91,7 +128,7 @@ func TestPathDirect_OpenCancelledAfterConnect(t *testing.T) {
 	stop := make(chan struct{})
 	stopFeeder := sync.OnceFunc(func() { close(stop) })
 	t.Cleanup(stopFeeder)
-	feedSlotsUntil(pool, stop)
+	feedSlotsUntil(t, pool, stop)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()

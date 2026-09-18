@@ -268,11 +268,19 @@ func setupNBDDevice(t *testing.T, featureFlags *featureflags.Client, size int64,
 		overlay.Close()
 	})
 
-	devicePath, deviceCleanup, err := GetNBDDevice(t.Context(), overlay, featureFlags)
+	acquireCtx, stopAcquireBudget := acquisitionCtx(t, 2*time.Minute)
+
+	devicePath, deviceCleanup, err := GetNBDDevice(acquireCtx, overlay, featureFlags)
 	t.Cleanup(func() {
-		deviceCleanup.Run(t.Context(), 30*time.Second)
+		deviceCleanup.Run(t.Context(), 2*time.Minute)
 	})
-	require.NoError(t, err, "failed to get nbd device")
+	if err != nil {
+		t.Fatalf("failed to get an nbd device within 2m (device states: %s): %v", nbdDeviceStates(), err)
+	}
+
+	if !stopAcquireBudget() {
+		t.Fatalf("the acquisition budget expired as the device arrived (device states: %s)", nbdDeviceStates())
+	}
 
 	t.Logf("NBD device path: %s", devicePath)
 

@@ -107,7 +107,7 @@ func TestSlowBackend_ShortTimeout(t *testing.T) {
 		WithIOTimeout(5*time.Second),
 		WithDeadconnTimeout(5*time.Second),
 	)
-	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
+	t.Cleanup(func() { cleanup.Run(t.Context(), 2*time.Minute) })
 	require.NoError(t, err)
 
 	deviceFile, err := os.OpenFile(devicePath, os.O_RDONLY, 0)
@@ -158,7 +158,7 @@ func TestSlowBackend_SufficientTimeout(t *testing.T) {
 		WithIOTimeout(30*time.Second),
 		WithDeadconnTimeout(30*time.Second),
 	)
-	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
+	t.Cleanup(func() { cleanup.Run(t.Context(), 2*time.Minute) })
 	require.NoError(t, err)
 
 	deviceFile, err := os.OpenFile(devicePath, os.O_RDONLY, 0)
