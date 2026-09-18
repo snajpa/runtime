@@ -56,14 +56,9 @@ func startAzuriteBackend(t *testing.T) string {
 		}
 	})
 
-	host, err := container.Host(t.Context())
-	require.NoError(t, err)
-	port, err := container.MappedPort(t.Context(), "10000")
-	require.NoError(t, err)
-
 	return fmt.Sprintf(
-		"DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=%s;BlobEndpoint=http://%s:%s/devstoreaccount1;",
-		azuriteAccountKey, host, port.Port(),
+		"DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=%s;BlobEndpoint=http://%s/devstoreaccount1;",
+		azuriteAccountKey, containerHTTPEndpoint(t, container, "10000"),
 	)
 }
 
