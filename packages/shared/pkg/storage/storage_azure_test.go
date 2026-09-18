@@ -393,3 +393,13 @@ func TestAzureUploadSignedURLSignsWithUserDelegation(t *testing.T) {
 	assert.Equal(t, "https", params.Get("spr"))
 	assert.NotEmpty(t, params.Get("sig"))
 }
+
+// A failed Azure upload cannot release its staged blocks: no abort exists, so
+// the shared layer counts the residue and the service collects it (REQ-A3).
+func TestAzurePartUploaderResidueContract(t *testing.T) {
+	t.Parallel()
+
+	uploader := &azurePartUploader{}
+	require.False(t, uploader.Abortable())
+	require.Equal(t, "azure", uploader.ProviderName())
+}
