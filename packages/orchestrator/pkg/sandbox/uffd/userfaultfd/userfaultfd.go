@@ -54,6 +54,7 @@ const wpResolveRetryDelay = 250 * time.Microsecond
 const wpResolveErrEscalation = 8
 
 const (
+	// These bounds are pinned by TestSourceReadRetryPolicyBounds.
 	// sliceMaxRetries is the number of times to retry source.Slice() after the initial attempt.
 	// Total attempts = sliceMaxRetries + 1.
 	sliceMaxRetries = 3

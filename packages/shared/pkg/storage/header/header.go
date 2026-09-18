@@ -38,9 +38,15 @@ type Header struct {
 
 	// IncompletePendingUpload is set on diff headers produced by ToDiffHeader and
 	// cleared on the finalized headers swapped in by the upload pipeline. It
-	// is in-memory only (never serialized), and signals that the build's data
-	// has not yet reached object storage — readers must serve from the local
-	// cache and skip FrameTable lookups for the still-missing self entry.
+	// signals that the build's data has not yet reached object storage — readers
+	// must serve from the local cache and skip FrameTable lookups for the
+	// still-missing self entry.
+	//
+	// It is part of the V4/V5 wire format (bit 0 of the flags byte) and is
+	// restored on load, so a header read back from storage carries the same
+	// state. StoreHeader refuses to persist a header while the flag is set, so
+	// producers clear it before persisting; the round-trip is pinned by the
+	// compatibility fixtures and TestIncompletePendingUploadRoundTripV4V5.
 	IncompletePendingUpload bool
 }
 
