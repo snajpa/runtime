@@ -59,8 +59,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prevent path traversal
-	if !filepath.IsLocal(path) {
+	// Prevent path traversal with the storage boundary's own validator: it
+	// refuses the same empty, absolute, NUL/backslash and ".."-bearing names
+	// the providers refuse, so the upload endpoint cannot write where the
+	// providers would not read.
+	if err := storage.ValidateRelativePath(path); err != nil {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 
 		return

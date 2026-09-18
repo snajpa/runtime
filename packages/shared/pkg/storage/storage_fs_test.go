@@ -87,6 +87,55 @@ func TestDelete(t *testing.T) {
 	assert.False(t, exists)
 }
 
+// TestDeleteObjectsWithPrefixRefusesUnsafePrefix: an empty prefix used to
+// resolve to the base directory itself and RemoveAll it, and a ".."-bearing
+// prefix used to resolve outside the base. Both must fail and leave the tree
+// intact.
+func TestDeleteObjectsWithPrefixRefusesUnsafePrefix(t *testing.T) {
+	t.Parallel()
+
+	base := filepath.Join(t.TempDir(), "base")
+	require.NoError(t, os.MkdirAll(filepath.Join(base, "build-id"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(base, "build-id", "memfile"), []byte("data"), 0o644))
+
+	outside := filepath.Join(filepath.Dir(base), "outside")
+	require.NoError(t, os.MkdirAll(outside, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "keep"), []byte("keep"), 0o644))
+
+	p := newFileSystemStorage(base, "", nil)
+
+	for _, prefix := range []string{"", "..", "../outside", "build-id/../../outside"} {
+		require.ErrorIsf(t, p.DeleteObjectsWithPrefix(t.Context(), prefix), ErrInvalidStoragePath, "prefix %q", prefix)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(base, "build-id"))
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "the base tree must be intact after the refusals")
+
+	_, err = os.Stat(filepath.Join(outside, "keep"))
+	assert.NoError(t, err, "nothing outside the base may be deleted")
+}
+
+// TestOpenRefusesEscapingPath: a traversal-shaped object path fails before any
+// directory or file is created outside the base.
+func TestOpenRefusesEscapingPath(t *testing.T) {
+	t.Parallel()
+
+	base := filepath.Join(t.TempDir(), "base")
+	require.NoError(t, os.MkdirAll(base, 0o755))
+
+	p := newFileSystemStorage(base, "", nil)
+
+	_, err := p.OpenBlob(t.Context(), "../evil")
+	require.ErrorIs(t, err, ErrInvalidStoragePath)
+
+	_, err = p.OpenSeekable(t.Context(), "a/../../evil")
+	require.ErrorIs(t, err, ErrInvalidStoragePath)
+
+	_, statErr := os.Stat(filepath.Join(filepath.Dir(base), "evil"))
+	assert.ErrorIs(t, statErr, os.ErrNotExist, "no path outside the base may be created")
+}
+
 func TestDeleteObjectsWithPrefix(t *testing.T) {
 	t.Parallel()
 	p := newTempProvider(t)

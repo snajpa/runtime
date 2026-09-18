@@ -49,7 +49,10 @@ func newFileSystemStorage(basePath, uploadBaseURL string, hmacKey []byte) *fsSto
 }
 
 func (s *fsStorage) DeleteObjectsWithPrefix(_ context.Context, prefix string) error {
-	filePath := s.getPath(prefix)
+	filePath, err := s.getPath(prefix)
+	if err != nil {
+		return err
+	}
 
 	return os.RemoveAll(filePath)
 }
@@ -86,7 +89,12 @@ func (s *fsStorage) UploadSignedURL(_ context.Context, path string, ttl time.Dur
 }
 
 func (s *fsStorage) OpenSeekable(_ context.Context, path string) (Seekable, error) {
-	dir := filepath.Dir(s.getPath(path))
+	fullPath, err := s.getPath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -94,24 +102,32 @@ func (s *fsStorage) OpenSeekable(_ context.Context, path string) (Seekable, erro
 	objType, _ := seekableObjectType(path)
 
 	return &fsObject{
-		path:    s.getPath(path),
+		path:    fullPath,
 		objType: objType,
 	}, nil
 }
 
 func (s *fsStorage) OpenBlob(_ context.Context, path string) (Blob, error) {
-	dir := filepath.Dir(s.getPath(path))
+	fullPath, err := s.getPath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
 	return &fsObject{
-		path: s.getPath(path),
+		path: fullPath,
 	}, nil
 }
 
-func (s *fsStorage) getPath(path string) string {
-	return filepath.Join(s.basePath, path)
+// getPath resolves an object path against the provider's base directory. Every
+// call site runs the shared containment check, so a traversal-shaped or empty
+// name never reaches the filesystem (the prefix delete is irreversible).
+func (s *fsStorage) getPath(path string) (string, error) {
+	return ContainedPath(s.basePath, path)
 }
 
 func (o *fsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err error) {

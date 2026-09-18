@@ -85,8 +85,10 @@ func newAWSStorage(ctx context.Context, spec Spec, limiter *limit.Limiter) (*aws
 }
 
 func (s *awsStorage) DeleteObjectsWithPrefix(ctx context.Context, prefix string) error {
-	if prefix == "" {
-		return errors.New("refusing to delete objects with an empty prefix")
+	// One guard for every provider: empty, absolute, backslash and ".."-bearing
+	// prefixes are refused before any listing call (see ValidateRelativePath).
+	if err := ValidateRelativePath(prefix); err != nil {
+		return err
 	}
 
 	// A large prefix spans many pages, so scope the timeout per round-trip

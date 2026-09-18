@@ -691,9 +691,7 @@ func TestAWSDeleteObjectsWithPrefixRejectsEmptyPrefix(t *testing.T) {
 
 	s := &awsStorage{bucketName: "test-bucket"}
 
-	err := s.DeleteObjectsWithPrefix(t.Context(), "")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "empty prefix")
+	require.ErrorIs(t, s.DeleteObjectsWithPrefix(t.Context(), ""), ErrInvalidStoragePath)
 }
 
 // An Azure-shaped header map leaking into the S3/GCS response would break any upload that echoed it into the presigned signature.
