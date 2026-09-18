@@ -562,7 +562,7 @@ func TestMemfdIdentitySource_ServesThenReleases(t *testing.T) {
 	require.Equal(t, data[2*ps:3*ps], sl)
 	require.True(t, src.IsCached(t.Context(), 0, ps*4))
 
-	require.NoError(t, d.releaseMemfd())
+	require.NoError(t, d.releaseMemfd(t.Context()))
 
 	var bna BytesNotAvailableError
 	_, err = src.ReadAt(make([]byte, ps), 0)
