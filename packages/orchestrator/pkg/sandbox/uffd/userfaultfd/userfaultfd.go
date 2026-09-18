@@ -120,6 +120,14 @@ type Userfaultfd struct {
 	// worker. See TestNoMadviseDeadlockWithInflightCopy.
 	readSerial sync.Mutex
 
+	// readBuf is the single uffd message buffer readEvents reuses. readEvents
+	// has one caller (the serve loop, under readSerial), and every parsed
+	// event is copied into the returned value slices before the next read, so
+	// no event aliases it. Reusing it removes the per-poll buffer allocation;
+	// returning values instead of pointers removes the per-event heap copy
+	// (S-29).
+	readBuf []byte
+
 	prefetchTracker *block.PrefetchTracker
 
 	// defaultCopyMode overrides UFFDIO_COPY mode for all faults when non-zero.
@@ -298,14 +306,16 @@ func (u *Userfaultfd) ExportPageStates() (dirty, empty *roaring.Bitmap) {
 	return u.pageTracker.Export()
 }
 
-func (u *Userfaultfd) readEvents(ctx context.Context) ([]*UffdRemove, []*UffdPagefault, error) {
-	buf := make([]byte, unsafe.Sizeof(UffdMsg{}))
+func (u *Userfaultfd) readEvents(ctx context.Context) ([]UffdRemove, []UffdPagefault, error) {
+	if u.readBuf == nil {
+		u.readBuf = make([]byte, unsafe.Sizeof(UffdMsg{}))
+	}
 
-	var removes []*UffdRemove
-	var pagefaults []*UffdPagefault
+	var removes []UffdRemove
+	var pagefaults []UffdPagefault
 
 	for {
-		n, err := syscall.Read(int(u.fd), buf)
+		n, err := syscall.Read(int(u.fd), u.readBuf)
 		if errors.Is(err, syscall.EINTR) {
 			u.logger.Debug(ctx, "uffd: interrupted read. Reading again")
 
@@ -324,24 +334,36 @@ func (u *Userfaultfd) readEvents(ctx context.Context) ([]*UffdRemove, []*UffdPag
 			break
 		}
 
-		msg := (*UffdMsg)(unsafe.Pointer(&buf[0]))
+		var parseErr error
 
-		event := getMsgEvent(msg)
-		arg := getMsgArg(msg)
-
-		switch event {
-		case UFFD_EVENT_PAGEFAULT:
-			v := *(*UffdPagefault)(unsafe.Pointer(&arg[0]))
-			pagefaults = append(pagefaults, &v)
-		case UFFD_EVENT_REMOVE:
-			v := *(*UffdRemove)(unsafe.Pointer(&arg[0]))
-			removes = append(removes, &v)
-		default:
-			return nil, nil, ErrUnexpectedEventType
+		removes, pagefaults, parseErr = appendUffdMsg(removes, pagefaults, u.readBuf)
+		if parseErr != nil {
+			return nil, nil, parseErr
 		}
 	}
 
 	return removes, pagefaults, nil
+}
+
+// appendUffdMsg decodes one raw uffd message (buf must hold at least
+// unsafe.Sizeof(UffdMsg{}) bytes, as the kernel writes one full struct per
+// read) and appends it to the value slices. Value slices keep a whole batch
+// in one growing backing array instead of one heap allocation per event
+// (S-29); the buffer may be overwritten as soon as this returns.
+func appendUffdMsg(removes []UffdRemove, pagefaults []UffdPagefault, buf []byte) ([]UffdRemove, []UffdPagefault, error) {
+	msg := (*UffdMsg)(unsafe.Pointer(&buf[0]))
+
+	event := getMsgEvent(msg)
+	arg := getMsgArg(msg)
+
+	switch event {
+	case UFFD_EVENT_PAGEFAULT:
+		return removes, append(pagefaults, *(*UffdPagefault)(unsafe.Pointer(&arg[0]))), nil
+	case UFFD_EVENT_REMOVE:
+		return append(removes, *(*UffdRemove)(unsafe.Pointer(&arg[0]))), pagefaults, nil
+	default:
+		return nil, nil, ErrUnexpectedEventType
+	}
 }
 
 func (u *Userfaultfd) Serve(
@@ -443,8 +465,8 @@ func (u *Userfaultfd) Serve(
 			}
 		}
 
-		var removes []*UffdRemove
-		var pagefaults []*UffdPagefault
+		var removes []UffdRemove
+		var pagefaults []UffdPagefault
 
 		if hasEvent(uffdFd.Revents, unix.POLLIN) {
 			// readSerial keeps Export from interleaving between read and

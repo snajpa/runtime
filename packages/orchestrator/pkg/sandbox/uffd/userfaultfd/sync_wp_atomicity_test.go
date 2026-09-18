@@ -98,7 +98,7 @@ func syncUffdOverHugepage(t *testing.T) ([]byte, uintptr, Fd, chan pfEvent) {
 			arg := getMsgArg(msg)
 			pf := (*UffdPagefault)(unsafe.Pointer(&arg[0]))
 			events <- pfEvent{
-				addr: getPagefaultAddress(pf),
+				addr: getPagefaultAddress(*pf),
 				wp:   uint64(pf.flags)&uint64(UFFD_PAGEFAULT_FLAG_WP) != 0,
 			}
 		}

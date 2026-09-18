@@ -106,7 +106,7 @@ func TestSyncWPResolveDirectFault(t *testing.T) {
 		arg := getMsgArg(msg)
 		pf := (*UffdPagefault)(unsafe.Pointer(&arg[0]))
 		require.NotZero(t, uint64(pf.flags)&uint64(UFFD_PAGEFAULT_FLAG_WP), "expected a WP fault")
-		addr = getPagefaultAddress(pf)
+		addr = getPagefaultAddress(*pf)
 
 		break
 	}
