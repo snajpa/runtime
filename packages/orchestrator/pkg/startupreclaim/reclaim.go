@@ -25,6 +25,7 @@ const (
 	resourceNetwork     = "network"
 	resourceCgroup      = "cgroup"
 	resourceFile        = "file"
+	resourceStaged      = "staged"
 
 	procDir = "/proc"
 )
@@ -48,6 +49,7 @@ type Config struct {
 	CgroupManager cgroup.Manager
 	StorageConfig storage.Config
 	TempDir       string
+	StageRoot     string
 	ProcDir       string
 	NetnsDir      string
 	CgroupRoot    string
@@ -99,6 +101,10 @@ func Run(ctx context.Context, config Config) Summary {
 		config.EgressProxy = network.NewNoopEgressProxy()
 	}
 
+	if config.StageRoot == "" {
+		logger.L().Warn(ctx, "startup reclaim: no stage root configured; envd swap staging directories are not reclaimed")
+	}
+
 	summary := Summary{Reclaimed: map[string]int{}, Failed: map[string]int{}}
 
 	// Order matters: firecracker runs first so the VMMs are killed before the
@@ -116,6 +122,9 @@ func Run(ctx context.Context, config Config) Summary {
 		}},
 		{resourceFile, func(context.Context) (int, []error) {
 			return storage.ReclaimSandboxFiles(config.TempDir, config.StorageConfig.SandboxCacheDir)
+		}},
+		{resourceStaged, func(ctx context.Context) (int, []error) {
+			return storage.ReclaimStagedDirs(ctx, config.StageRoot, config.ProcDir)
 		}},
 	}
 
