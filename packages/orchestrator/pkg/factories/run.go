@@ -650,6 +650,10 @@ func run(config cfg.Config, opts Options) (success bool) {
 		return nil
 	}})
 
+	// Cache fills are best-effort background work; drain the bounded writeback
+	// queue so a clean shutdown flushes the fills already admitted.
+	closers = append(closers, closer{"storage writebacks", storage.DrainWritebacks})
+
 	// clickhouse delivery endpoints
 	clickhouseEndpoints, clickhouseClosers := openClickhouseEndpoints(ctx, config)
 	closers = append(closers, clickhouseClosers...)

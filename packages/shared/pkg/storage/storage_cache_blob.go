@@ -120,9 +120,9 @@ func (b *cachedBlob) Put(ctx context.Context, data []byte, opts ...PutOption) (e
 }
 
 func (b *cachedBlob) goCtxWithoutCancel(ctx context.Context, fn func(context.Context)) {
-	b.wg.Go(func() {
-		fn(context.WithoutCancel(ctx))
-	})
+	// The fill is bounded by the process writeback queue; b.wg keeps it
+	// awaitable by tests.
+	writebacks.submit(ctx, &b.wg, fn)
 }
 
 func (b *cachedBlob) fullFilename() string {
@@ -157,7 +157,9 @@ func (b *cachedBlob) copyFullFileFromCache(ctx context.Context, dst io.Writer) (
 func (b *cachedBlob) writeFileToCache(ctx context.Context, input io.Reader) (int64, error) {
 	path := b.fullFilename()
 
-	output, err := lock.OpenFile(ctx, path)
+	output, err := retryContendedLock(ctx, writebackMaxAttempts, writebackRetryBackoff, func() (*lock.AtomicImmutableFile, error) {
+		return lock.OpenFile(ctx, path)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("failed to acquire lock on file %s: %w", path, err)
 	}
