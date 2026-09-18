@@ -317,17 +317,10 @@ func (c *cachedSeekable) writeToCache(ctx context.Context, offset int64, finalPa
 
 	tempPath := c.makeTempFilename(finalPath)
 
-	if err := os.WriteFile(tempPath, bytes, CacheFilePerm); err != nil {
+	if err := writeCacheFileSynced(tempPath, bytes); err != nil {
 		go safelyRemoveFile(ctx, tempPath)
 
 		return fmt.Errorf("failed to write temp cache file: %w", err)
-	}
-
-	// The create mode is filtered by the umask; set the policy mode explicitly.
-	if err := os.Chmod(tempPath, CacheFilePerm); err != nil {
-		go safelyRemoveFile(ctx, tempPath)
-
-		return fmt.Errorf("failed to set temp cache file permissions: %w", err)
 	}
 
 	if err := utils.RenameOrDeleteFile(ctx, tempPath, finalPath); err != nil {
@@ -361,17 +354,10 @@ func (c *cachedSeekable) writeLocalSize(ctx context.Context, size int64) error {
 
 	tempFilename := filepath.Join(c.path, fmt.Sprintf(".size.bin.%s", uuid.NewString()))
 
-	if err := os.WriteFile(tempFilename, fmt.Appendf(nil, "%d", size), CacheFilePerm); err != nil {
+	if err := writeCacheFileSynced(tempFilename, fmt.Appendf(nil, "%d", size)); err != nil {
 		go safelyRemoveFile(ctx, tempFilename)
 
 		return fmt.Errorf("failed to write temp local size file: %w", err)
-	}
-
-	// The create mode is filtered by the umask; set the policy mode explicitly.
-	if err := os.Chmod(tempFilename, CacheFilePerm); err != nil {
-		go safelyRemoveFile(ctx, tempFilename)
-
-		return fmt.Errorf("failed to set temp local size file permissions: %w", err)
 	}
 
 	if err := utils.RenameOrDeleteFile(ctx, tempFilename, finalFilename); err != nil {
@@ -478,4 +464,36 @@ func ignoreFileMissingError(err error) error {
 	}
 
 	return err
+}
+
+// writeCacheFileSynced writes data with the cache file policy and fsyncs it
+// before closing. Callers publish the file with a rename; the fsync makes sure
+// a crash cannot leave a visible cache file whose contents were never flushed
+// (REQ-C2). An fsync failure is returned so the caller drops the temp file
+// instead of publishing it.
+func writeCacheFileSynced(path string, data []byte) (err error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, CacheFilePerm)
+	if err != nil {
+		return fmt.Errorf("failed to create cache file: %w", err)
+	}
+
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close cache file: %w", closeErr)
+		}
+	}()
+
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("failed to write cache file: %w", err)
+	}
+
+	if err := file.Chmod(CacheFilePerm); err != nil {
+		return fmt.Errorf("failed to set cache file permissions: %w", err)
+	}
+
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync cache file: %w", err)
+	}
+
+	return nil
 }
