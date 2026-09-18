@@ -2606,6 +2606,20 @@ func (s *Sandbox) processMemorySnapshot(ctx context.Context, buildID uuid.UUID, 
 // applyInPlaceExportUnion folds the cumulative in-place export baseline into a
 // pause-time dirty readout (see the comment at the call site for why the union
 // exists), and advances the baseline when this export starts a new interval.
+//
+// The S-42 chain model is specified by these invariants and pinned by the
+// ApplyInPlaceExportUnion tests:
+//
+//	P1 self-sufficiency: template + this diff (+ Empty) reproduces live
+//	   memory; the exported set is (baseline \ Empty) ∪ readout, because a
+//	   baseline page is unchanged unless rewritten (and then it is dirty).
+//	P2 advance: only the in-place path advances the baseline, at pause time,
+//	   before the capture runs; a destroy-path export unions but never
+//	   advances.
+//	P3 loss isolation: a failed or lost capture loses only its own artifact —
+//	   the advanced baseline makes the next pause re-export its pages.
+//	P4 empties: freed pages stay Empty and drop out of the advanced baseline.
+//
 // Pages the baseline holds but the CURRENT readout reports empty are excluded:
 // a previously-exported page the guest has since freed (FPR/balloon REMOVE →
 // tracker Removed / pagemap non-present) owes ZEROS, which Empty already

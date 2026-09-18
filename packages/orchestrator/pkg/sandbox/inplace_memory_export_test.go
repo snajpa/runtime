@@ -239,6 +239,95 @@ func TestApplyInPlaceExportUnion_ExcludesFreedPages(t *testing.T) {
 		"the advanced baseline drops the freed page")
 }
 
+// pageSet builds a page bitmap from indices.
+func pageSet(pages ...uint32) *roaring.Bitmap {
+	set := roaring.New()
+	set.AddMany(pages)
+
+	return set
+}
+
+// TestApplyInPlaceExportUnion_AccumulatesAcrossIntervals pins P1/P2 across
+// repeated in-place checkpoints (S-42): a page dirtied in an earlier interval
+// and not rewritten since is re-exported by every later checkpoint of the FC
+// lifetime — the diffs are cumulative, not chain-minimal — while a rewrite
+// merges into the same set and the baseline advances to the exported set.
+func TestApplyInPlaceExportUnion_AccumulatesAcrossIntervals(t *testing.T) {
+	t.Parallel()
+
+	s := &Sandbox{}
+	ps := int64(header.PageSize)
+
+	// Interval 1: pages 0 and 1 are dirtied and exported.
+	first := header.NewDiffMetadata(ps, pageSet(0, 1), roaring.New())
+	s.applyInPlaceExportUnion(first, true)
+	require.ElementsMatch(t, []uint32{0, 1}, first.Dirty.ToArray())
+
+	// Interval 2: page 1 is rewritten and page 2 is newly dirty. Page 0 was
+	// rebaselined by interval 1 (reads clean now) but must be exported again.
+	second := header.NewDiffMetadata(ps, pageSet(1, 2), roaring.New())
+	s.applyInPlaceExportUnion(second, true)
+	require.ElementsMatch(t, []uint32{0, 1, 2}, second.Dirty.ToArray(),
+		"a rebaselined page is re-exported; a rewrite merges into the same set")
+
+	s.memSealMu.Lock()
+	advanced := s.inPlaceExportedDirty.ToArray()
+	s.memSealMu.Unlock()
+	require.ElementsMatch(t, []uint32{0, 1, 2}, advanced,
+		"the baseline advances to the exported set")
+}
+
+// TestApplyInPlaceExportUnion_DestroyPathUnionsWithoutAdvancing pins P2: a
+// destroy-path export (keepMemfdOpen false) of a sandbox that has in-place
+// checkpoints still unions the baseline — otherwise the final snapshot would
+// silently drop every page those checkpoints rebaselined — but must NOT
+// advance the baseline: a destroyed sandbox has no next interval.
+func TestApplyInPlaceExportUnion_DestroyPathUnionsWithoutAdvancing(t *testing.T) {
+	t.Parallel()
+
+	s := &Sandbox{}
+	ps := int64(header.PageSize)
+
+	s.memSealMu.Lock()
+	s.inPlaceExportedDirty = pageSet(0, 1)
+	s.memSealMu.Unlock()
+
+	final := header.NewDiffMetadata(ps, pageSet(2), roaring.New())
+	s.applyInPlaceExportUnion(final, false)
+	require.ElementsMatch(t, []uint32{0, 1, 2}, final.Dirty.ToArray(),
+		"the final export still covers everything earlier checkpoints exported")
+
+	s.memSealMu.Lock()
+	unchanged := s.inPlaceExportedDirty.ToArray()
+	s.memSealMu.Unlock()
+	require.ElementsMatch(t, []uint32{0, 1}, unchanged,
+		"a destroy-path export must not rebaseline a dead sandbox")
+}
+
+// TestApplyInPlaceExportUnion_LostCheckpointIsReexported pins P3: the
+// baseline advances at pause time, before the capture runs, so a checkpoint
+// whose artifact is lost (failed or cancelled capture) still leaves every
+// page it rebaselined to be re-exported by the next pause — the loss is
+// confined to that one artifact.
+func TestApplyInPlaceExportUnion_LostCheckpointIsReexported(t *testing.T) {
+	t.Parallel()
+
+	s := &Sandbox{}
+	ps := int64(header.PageSize)
+
+	// This interval advanced the baseline, but its capture was lost.
+	lost := header.NewDiffMetadata(ps, pageSet(0, 1), roaring.New())
+	s.applyInPlaceExportUnion(lost, true)
+
+	// The next pause's own readout reports nothing (the lost checkpoint
+	// rebaselined the tracker); the union must recover the pages from the
+	// advanced baseline.
+	next := header.NewDiffMetadata(ps, roaring.New(), roaring.New())
+	s.applyInPlaceExportUnion(next, true)
+	require.ElementsMatch(t, []uint32{0, 1}, next.Dirty.ToArray(),
+		"pages rebaselined by a lost capture are re-exported by the next pause")
+}
+
 // TestRunFPRResume pins the resume retry/fence choreography without a live
 // FC process (deps-injected, like pollFphDone): the inline attempt, the
 // detached retry, the generation fence that makes a stale retry abandon
