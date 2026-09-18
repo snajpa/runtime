@@ -111,3 +111,29 @@ func TestOpenFile(t *testing.T) {
 		assert.ErrorIs(t, err, fs.ErrNotExist)
 	})
 }
+
+// TestOpenFileCommitPublishesAndRemovesTemp pins the synced publish path: the
+// commit leaves the final file with the written bytes and no temp file behind.
+func TestOpenFileCommitPublishesAndRemovesTemp(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	filename := filepath.Join(tempDir, "test.bin")
+
+	f, err := OpenFile(t.Context(), filename)
+	require.NoError(t, err)
+
+	_, err = f.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	tempName := f.tempFile.Name()
+
+	require.NoError(t, f.Commit(t.Context()))
+
+	data, err := os.ReadFile(filename)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("hello"), data)
+
+	_, err = os.Stat(tempName)
+	assert.True(t, os.IsNotExist(err), "commit must remove the temp file")
+}
