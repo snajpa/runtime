@@ -31,9 +31,15 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-// Matches the template cache TTL so entries live as long as the
-// templates they refer to and are cleaned up automatically.
-const uploadedBuildsTTL = 1 * time.Hour
+// uploadedBuildsTTL is how long the node-local "build is fully uploaded" hint
+// lives. It matches the template cache window so the hint does not expire while
+// the cached template it refers to is still around (long-running sandboxes can
+// extend a template entry beyond that window).
+//
+// The hint is best-effort and never load-bearing: when it is absent, chunk
+// requests fall through to peer serving and object storage (REQ-G4), so only
+// avoidable peer work depends on it.
+const uploadedBuildsTTL = template.CacheExpiration
 
 // startingSandboxesLimitRefreshInterval is how often we re-read the
 // MaxStartingInstancesPerNode feature flag and resize the semaphore.

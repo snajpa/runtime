@@ -21,7 +21,7 @@ func newTestCache(defaultTTL time.Duration) *Cache {
 // simulateGetTemplate mimics getTemplateWithFetch's lock-protected TTL logic
 // without needing a full storageTemplate (which requires disk paths).
 func simulateGetTemplate(c *Cache, key string, maxSandboxLengthHours int64) {
-	ttl := templateExpiration
+	ttl := CacheExpiration
 	if maxSandboxLengthHours > 0 {
 		ttl = max(ttl, time.Duration(maxSandboxLengthHours)*time.Hour+templateExpirationBuffer)
 	}
@@ -86,7 +86,7 @@ func TestGetTemplate_DefaultTTLForZero(t *testing.T) {
 
 	item := c.cache.Get(key)
 	require.NotNil(t, item)
-	assert.Equal(t, templateExpiration, item.TTL())
+	assert.Equal(t, CacheExpiration, item.TTL())
 }
 
 func TestGetTemplate_SetDoesNotTriggerOnEviction(t *testing.T) {

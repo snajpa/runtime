@@ -206,7 +206,7 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 
 			logger.L().Warn(ctx, "caching template with failed memfile resolution; reused until cache eviction",
 				logger.WithBuildID(t.paths.BuildID),
-				zap.Duration("min_cache_ttl", templateExpiration),
+				zap.Duration("min_cache_ttl", CacheExpiration),
 				zap.Error(memfileErr),
 			)
 
@@ -257,7 +257,7 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 
 			logger.L().Warn(ctx, "caching template with failed rootfs resolution; reused until cache eviction",
 				logger.WithBuildID(t.paths.BuildID),
-				zap.Duration("min_cache_ttl", templateExpiration),
+				zap.Duration("min_cache_ttl", CacheExpiration),
 				zap.Error(rootfsErr),
 			)
 
