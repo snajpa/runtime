@@ -168,11 +168,21 @@ func setupNBDMount(t *testing.T, featureFlags *featureflags.Client, backend bloc
 
 	mnt := NewDirectPathMount(backend, devicePool, featureFlags, mountOpts...)
 
-	deviceIndex, err := mnt.Open(t.Context())
-	require.NoError(t, err, "failed to open nbd mount")
+	acquireCtx, stopAcquireBudget := acquisitionCtx(t, 2*time.Minute)
+
+	deviceIndex, err := mnt.Open(acquireCtx)
+	if err != nil {
+		t.Fatalf("failed to open nbd mount within 2m (device states: %s): %v", nbdDeviceStates(), err)
+	}
+
+	if !stopAcquireBudget() {
+		t.Fatalf("the acquisition budget expired as the mount opened (device states: %s)", nbdDeviceStates())
+	}
 
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		// Bounded but load-tolerant: under concurrent gate runs a device
+		// release can take well over the old 30 s budget (S-56).
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Minute)
 		defer cancel()
 
 		if err := mnt.Close(ctx); err != nil {

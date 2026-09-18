@@ -88,23 +88,36 @@ func TestPathDirect_CloseReturnsWhileTheBackendStalls(t *testing.T) {
 	require.NoError(t, err)
 	deviceIndex := uint32(idx64)
 
-	// A buffered write acknowledged from the page cache; its writeback is the
-	// hostage. The writer descriptor closes again so the mount's descriptor
-	// stays the device's last opener.
+	// The dirtying write must land INSIDE the close window: the kernel's
+	// periodic writeback can flush a page dirtied during setup through the
+	// hostage before Close runs, leaving the flush nothing to stall on and
+	// the watchdog nothing to fire on (S-56 residual). So the writer opens
+	// here -- the setup traffic below then runs while the device is clean --
+	// and the write -- with the writer's own close right behind it -- lands
+	// immediately before Close.
 	writer, err := os.OpenFile(devicePath, os.O_RDWR, 0)
 	require.NoError(t, err)
 
+	// systemd-udevd re-probes a block device when a writable descriptor
+	// closes, and a probe descriptor still open across Close would absorb
+	// the kernel-side last-close work. Settle drains the probe event, the
+	// poll waits out its descriptor; without udev both return at once.
+	_ = exec.CommandContext(t.Context(), "udevadm", "settle", "--timeout=10").Run()
+	waitForForeignHolders(t, devicePath)
+
+	// A buffered write acknowledged from the page cache; its writeback is the
+	// hostage. Written last so the periodic writeback cannot beat Close to it,
+	// and the writer closes immediately: the mount releases the device inside
+	// Close, and that release's retry loop cannot complete while another
+	// descriptor holds the device open (S-56 validation caught the writer held
+	// across Close as a six-minute deadlock). Keeping write-and-close adjacent
+	// keeps the dirty-to-Close window microseconds wide; the close probe that
+	// follows is transient and costs only the last-close coverage, which the
+	// assertions below do not need -- they all hang off the mount's own Sync
+	// flush.
 	_, err = writer.WriteAt(newPattern(2*header.RootfsBlockSize), 0)
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
-
-	// systemd-udevd re-probes a block device when a writable descriptor
-	// closes, and a probe descriptor still open across Close would absorb
-	// the kernel-side last-close work this test also exercises. Settle
-	// drains the probe event, the poll waits out its descriptor; without
-	// udev both return at once.
-	_ = exec.CommandContext(t.Context(), "udevadm", "settle", "--timeout=10").Run()
-	waitForForeignHolders(t, devicePath)
 
 	// The counter is process-wide, so the assertion below diffs it around this
 	// close, filtered on the stage the hostage stalls: the writeback sync.
