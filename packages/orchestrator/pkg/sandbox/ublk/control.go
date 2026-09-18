@@ -81,8 +81,12 @@ func (c *controlPlane) close() {
 }
 
 // command submits one control command and waits for its completion. Control
-// commands are synchronous, and the ring serves one caller at a time. op is
-// the encoded cmd_op.
+// commands are synchronous and unbounded: the kernel completes one when the
+// operation it drives finishes, so a device wedged inside the driver blocks its
+// command, and because the ring serves one caller at a time the whole manager
+// with it. The paths that could wait on a device node that is still open use
+// the asynchronous delete instead (see docs/ublk-transport.md). op is the
+// encoded cmd_op.
 func (c *controlPlane) command(op uint32, cmd ctrlCmd) error {
 	sqe := c.ring.getSQE()
 	sqe[sqeOffOpcode] = ioUringOpURingCmd

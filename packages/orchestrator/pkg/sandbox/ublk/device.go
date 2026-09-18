@@ -550,6 +550,10 @@ func (d *Device) teardown(ctx context.Context, barrier bool) error {
 		}
 	}
 
+	// The device context belongs to the data path; releasing it here keeps its
+	// registration from outliving the device.
+	d.cancel()
+
 	for _, owner := range d.owners {
 		owner.ring.close()
 	}
@@ -590,7 +594,9 @@ func (d *Device) claim() bool {
 
 // delete removes the device from the kernel. The asynchronous command is used
 // first: the synchronous one waits for the last opener of the device node to
-// go away, which would make teardown unbounded while the node is still open.
+// go away, which would make teardown unbounded while the node is still open. A
+// device that is already gone is not an error either way, since this runs on
+// teardown paths that can race each other.
 func (d *Device) delete() error {
 	if !d.added.Load() {
 		return nil
@@ -599,7 +605,7 @@ func (d *Device) delete() error {
 	cmd := ctrlCmd{devID: d.id, queueID: queueIDNone}
 
 	err := d.mgr.commandOp(controlOpRO(true, ublkCmdDelDevAsync), cmd)
-	if err == nil {
+	if err == nil || errors.Is(err, unix.ENODEV) {
 		return nil
 	}
 
@@ -609,7 +615,7 @@ func (d *Device) delete() error {
 
 	// Kernels without DEL_DEV_ASYNC: the synchronous command only returns once
 	// every opener has released the node.
-	if err := d.mgr.command(ublkCmdDelDev, cmd); err != nil {
+	if err := d.mgr.command(ublkCmdDelDev, cmd); err != nil && !errors.Is(err, unix.ENODEV) {
 		return fmt.Errorf("ublk: deleting device %d: %w", d.id, err)
 	}
 
@@ -649,6 +655,8 @@ func (d *Device) closeCdev() error {
 func (d *Device) waitOwners(timeout time.Duration) bool {
 	done := make(chan struct{})
 
+	// The watcher exits with the queue tasks; if a task never unwinds, this
+	// goroutine stays behind with it.
 	go func() {
 		d.ownersDone.Wait()
 		close(done)
