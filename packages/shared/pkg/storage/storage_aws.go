@@ -45,6 +45,10 @@ type awsObject struct {
 	path       string
 	bucketName string
 	limiter    *limit.Limiter
+
+	// readIdleTimeout is the inactivity budget for streaming blob reads; zero
+	// (objects built in tests) falls back to awsReadTimeout.
+	readIdleTimeout time.Duration
 }
 
 var (
@@ -218,8 +222,13 @@ func (o *awsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err er
 	start := time.Now()
 	defer func() { RecordReadBlob(ctx, time.Since(start), n, o.path, SourceAWS, err) }()
 
-	ctx, cancel := context.WithTimeout(ctx, awsReadTimeout)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// The idle deadline also covers the initial GetObject: a stalled open
+	// fails after the same inactivity window as a stalled body (REQ-B2).
+	openTimer := time.AfterFunc(o.readIdle(), cancel)
+	defer openTimer.Stop()
 
 	resp, err := o.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &o.bucketName, Key: &o.path})
 	if err != nil {
@@ -232,9 +241,23 @@ func (o *awsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err er
 
 	defer resp.Body.Close()
 
-	n, err = io.Copy(dst, resp.Body)
+	openTimer.Stop()
+	body := newIdleDeadlineReader(resp.Body, o.readIdle(), cancel)
+	defer body.stop()
+
+	n, err = io.Copy(dst, body)
 
 	return n, err
+}
+
+// readIdle is the streaming read inactivity budget; objects without an
+// explicit override use the declared default.
+func (o *awsObject) readIdle() time.Duration {
+	if o.readIdleTimeout > 0 {
+		return o.readIdleTimeout
+	}
+
+	return awsReadTimeout
 }
 
 func (o *awsObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (*FullFrameTable, [32]byte, error) {

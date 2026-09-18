@@ -729,3 +729,58 @@ func TestS3UploadSignedURLNeedsNoRequestHeaders(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, body, read.Bytes())
 }
+
+// Blob reads use a progress-based idle deadline: a stalled body fails without
+// a whole-transfer cap, while a progressing copy completes (REQ-B2).
+func TestAWSWriteToIdleDeadline(t *testing.T) {
+	t.Parallel()
+
+	const idle = 80 * time.Millisecond
+
+	t.Run("stalled body fails", func(t *testing.T) {
+		t.Parallel()
+
+		client := newTestS3Client(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "64")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+
+			<-r.Context().Done()
+		})
+
+		obj := &awsObject{client: client, bucketName: "b", path: "k", readIdleTimeout: idle}
+
+		_, err := obj.WriteTo(t.Context(), io.Discard)
+		require.Error(t, err)
+	})
+
+	t.Run("progressing body succeeds", func(t *testing.T) {
+		t.Parallel()
+
+		const chunks = 5
+
+		client := newTestS3Client(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(chunks))
+			w.WriteHeader(http.StatusOK)
+
+			f, _ := w.(http.Flusher)
+			for range chunks {
+				_, _ = w.Write([]byte("x"))
+				if f != nil {
+					f.Flush()
+				}
+				time.Sleep(idle / 3)
+			}
+		})
+
+		obj := &awsObject{client: client, bucketName: "b", path: "k", readIdleTimeout: idle}
+
+		var buf bytes.Buffer
+		n, err := obj.WriteTo(t.Context(), &buf)
+		require.NoError(t, err)
+		require.Equal(t, int64(chunks), n)
+		require.Equal(t, "xxxxx", buf.String())
+	})
+}
