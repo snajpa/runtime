@@ -333,6 +333,9 @@ func (o *azureObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err 
 
 func (o *azureObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (*FullFrameTable, [32]byte, error) {
 	p := ApplyPutOptions(opts)
+	if err := p.Metadata.Validate(); err != nil {
+		return nil, [32]byte{}, fmt.Errorf("invalid object metadata for %s: %w", o.path, err)
+	}
 
 	release, err := o.limiter.AcquireUploadSlot(ctx)
 	if err != nil {
@@ -389,10 +392,15 @@ func (o *azureObject) StoreFile(ctx context.Context, path string, opts ...PutOpt
 }
 
 func (o *azureObject) Put(ctx context.Context, data []byte, opts ...PutOption) error {
+	applied := ApplyPutOptions(opts)
+	if err := applied.Metadata.Validate(); err != nil {
+		return fmt.Errorf("invalid object metadata for %s: %w", o.path, err)
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, azureWriteTimeout)
 	defer cancel()
 
-	putMetadata, err := encodeAzureMetadata(ApplyPutOptions(opts).Metadata)
+	putMetadata, err := encodeAzureMetadata(applied.Metadata)
 	if err != nil {
 		return err
 	}

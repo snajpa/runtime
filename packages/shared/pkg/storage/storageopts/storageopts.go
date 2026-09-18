@@ -4,8 +4,11 @@ package storageopts
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"maps"
 	"strconv"
+	"unicode/utf8"
 )
 
 type ObjectMetadata map[string]string
@@ -109,4 +112,55 @@ func Apply(opts []PutOption) PutOptions {
 	}
 
 	return p
+}
+
+// Shared metadata bounds (REQ-H1): every backend must be able to store and
+// return metadata within these limits. Providers with stricter native
+// constraints (Azure key encoding, provider header limits) keep their own
+// checks on top.
+const (
+	MaxMetadataKeyBytes   = 128
+	MaxMetadataValueBytes = 2048
+	MaxMetadataBytes      = 8192
+)
+
+// Validate enforces the shared object-metadata contract: bounded, printable
+// keys and values that every backend can store unambiguously. It is checked
+// before any provider call so all providers reject the same metadata.
+func (m ObjectMetadata) Validate() error {
+	total := 0
+	for key, value := range m {
+		if key == "" {
+			return errors.New("object metadata key must not be empty")
+		}
+		if len(key) > MaxMetadataKeyBytes {
+			return fmt.Errorf("object metadata key %q exceeds %d bytes", key, MaxMetadataKeyBytes)
+		}
+		if len(value) > MaxMetadataValueBytes {
+			return fmt.Errorf("object metadata value for %q exceeds %d bytes", key, MaxMetadataValueBytes)
+		}
+		if !utf8.ValidString(key) || !utf8.ValidString(value) {
+			return fmt.Errorf("object metadata for %q is not valid UTF-8", key)
+		}
+		if hasControlBytes(key) || hasControlBytes(value) {
+			return fmt.Errorf("object metadata for %q contains control bytes", key)
+		}
+
+		total += len(key) + len(value)
+		if total > MaxMetadataBytes {
+			return fmt.Errorf("object metadata exceeds %d bytes in total", MaxMetadataBytes)
+		}
+	}
+
+	return nil
+}
+
+func hasControlBytes(s string) bool {
+	for i := range len(s) {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+
+	return false
 }
