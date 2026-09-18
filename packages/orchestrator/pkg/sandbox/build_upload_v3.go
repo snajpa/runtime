@@ -14,49 +14,67 @@ import (
 	headers "github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
+// runV3 commits a legacy snapshot (uncompressed, no V4-for-uncompressed
+// header). It follows the same commit protocol as runV4: data objects first,
+// finalized headers second, local publish last (REQ-A1, INV-1/INV-2). Headers
+// and bodies used to run in a single errgroup, so a reader could observe a
+// finalized header before the body it references existed (audit §8.5).
 func (u *Upload) runV3(ctx context.Context) error {
 	memfilePath, err := u.snap.MemorySnapshot.Diff.CachePath(ctx)
 	if err != nil {
 		return fmt.Errorf("error getting memfile diff path: %w", err)
 	}
 
+	if err := u.uploadV3Data(ctx, memfilePath); err != nil {
+		return err
+	}
+
+	if err := u.uploadV3Headers(ctx); err != nil {
+		return err
+	}
+
+	// Body uploads done; headers must be ready by now (the per-file Goroutines
+	// above already Wait-ed). Wait() is a fast lookup here.
+	memfileDiffHeader, err := u.snap.MemorySnapshot.DiffHeader.WaitWithContext(ctx)
+	if err != nil {
+		return fmt.Errorf("wait memfile diff header: %w", err)
+	}
+	rootfsDiffHeader, err := u.snap.RootfsDiffHeader.WaitWithContext(ctx)
+	if err != nil {
+		return fmt.Errorf("wait rootfs diff header: %w", err)
+	}
+
+	if memfileDiffHeader != nil {
+		if err := u.appendAncestorBuilds(ctx, nil, memfileDiffHeader.Mapping, build.Memfile); err != nil {
+			return err
+		}
+	}
+	if h := finalizeV3(memfileDiffHeader); h != nil {
+		if err := u.publish(ctx, build.Memfile, h); err != nil {
+			return err
+		}
+	}
+
+	if rootfsDiffHeader != nil {
+		if err := u.appendAncestorBuilds(ctx, nil, rootfsDiffHeader.Mapping, build.Rootfs); err != nil {
+			return err
+		}
+	}
+	if h := finalizeV3(rootfsDiffHeader); h != nil {
+		if err := u.publish(ctx, build.Rootfs, h); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// uploadV3Data uploads every data object of a legacy snapshot: the memfile and
+// rootfs bodies, the snapfile, and the metadata. Finalized headers are stored
+// only after this returns nil, so no reader can observe a header before the
+// bytes it references exist (REQ-A1, INV-1/INV-2).
+func (u *Upload) uploadV3Data(ctx context.Context, memfilePath string) error {
 	eg, egCtx := errgroup.WithContext(ctx)
-
-	eg.Go(func() error {
-		h, err := u.snap.MemorySnapshot.DiffHeader.WaitWithContext(egCtx)
-		if err != nil {
-			return fmt.Errorf("wait memfile diff header: %w", err)
-		}
-		if h == nil {
-			return nil
-		}
-
-		return storeHeaderWithMetrics(egCtx, u.store, u.paths.MemfileHeader(), uploadFileMemfileHeader, finalizeV3(h), storage.WithMetadata(u.objectMetadata))
-	})
-
-	eg.Go(func() error {
-		h, err := u.snap.RootfsDiffHeader.WaitWithContext(egCtx)
-		if err != nil {
-			return fmt.Errorf("wait rootfs diff header: %w", err)
-		}
-		if h == nil {
-			return nil
-		}
-
-		// Gate the header publish on the rootfs seal (deferred export): the rootfs
-		// header resolves synchronously at pause time, so without this it could be
-		// finalized to storage while the background seal is still running — and if
-		// the seal then fails (it does not retry) storage would keep a completed
-		// header with no body. The body goroutine below waits on the same seal, so
-		// both rootfs uploads are gated on it while memfile/snapfile/metadata still
-		// overlap it. No-op on the synchronous path (CachePath returns immediately).
-		if _, err := u.snap.RootfsDiff.CachePath(egCtx); err != nil {
-			return fmt.Errorf("error getting rootfs diff path: %w", err)
-		}
-
-		return storeHeaderWithMetrics(egCtx, u.store, u.paths.RootfsHeader(), uploadFileRootfsHeader, finalizeV3(h), storage.WithMetadata(u.objectMetadata))
-	})
-
 	meta := storage.WithMetadata(u.objectMetadata)
 
 	eg.Go(func() error {
@@ -127,44 +145,52 @@ func (u *Upload) runV3(ctx context.Context) error {
 		return uploadBlobWithMetrics(egCtx, u.store, u.paths.Metadata(), u.snap.Metafile.Path(), uploadFileMeta, meta)
 	})
 
-	if err := eg.Wait(); err != nil {
-		return err
-	}
+	return eg.Wait()
+}
 
-	// Body uploads done; headers must be ready by now (the per-file Goroutines
-	// above already Wait-ed). Wait() is a fast lookup here.
-	memfileDiffHeader, err := u.snap.MemorySnapshot.DiffHeader.WaitWithContext(ctx)
-	if err != nil {
-		return fmt.Errorf("wait memfile diff header: %w", err)
-	}
-	rootfsDiffHeader, err := u.snap.RootfsDiffHeader.WaitWithContext(ctx)
-	if err != nil {
-		return fmt.Errorf("wait rootfs diff header: %w", err)
-	}
+// uploadV3Headers stores the finalized memfile and rootfs headers. Callers
+// must have completed uploadV3Data: a header may not become visible before the
+// data objects it references (REQ-A1, INV-1/INV-2).
+func (u *Upload) uploadV3Headers(ctx context.Context) error {
+	eg, egCtx := errgroup.WithContext(ctx)
 
-	if memfileDiffHeader != nil {
-		if err := u.appendAncestorBuilds(ctx, nil, memfileDiffHeader.Mapping, build.Memfile); err != nil {
-			return err
+	eg.Go(func() error {
+		h, err := u.snap.MemorySnapshot.DiffHeader.WaitWithContext(egCtx)
+		if err != nil {
+			return fmt.Errorf("wait memfile diff header: %w", err)
 		}
-	}
-	if h := finalizeV3(memfileDiffHeader); h != nil {
-		if err := u.publish(ctx, build.Memfile, h); err != nil {
-			return err
+		if h == nil {
+			return nil
 		}
-	}
 
-	if rootfsDiffHeader != nil {
-		if err := u.appendAncestorBuilds(ctx, nil, rootfsDiffHeader.Mapping, build.Rootfs); err != nil {
-			return err
-		}
-	}
-	if h := finalizeV3(rootfsDiffHeader); h != nil {
-		if err := u.publish(ctx, build.Rootfs, h); err != nil {
-			return err
-		}
-	}
+		return storeHeaderWithMetrics(egCtx, u.store, u.paths.MemfileHeader(), uploadFileMemfileHeader, finalizeV3(h), storage.WithMetadata(u.objectMetadata))
+	})
 
-	return nil
+	eg.Go(func() error {
+		h, err := u.snap.RootfsDiffHeader.WaitWithContext(egCtx)
+		if err != nil {
+			return fmt.Errorf("wait rootfs diff header: %w", err)
+		}
+		if h == nil {
+			return nil
+		}
+
+		// Gate the header publish on the rootfs seal (deferred export): the rootfs
+		// header resolves synchronously at pause time, so without this it could be
+		// finalized to storage while the background seal is still running — and if
+		// the seal then fails (it does not retry) storage would keep a completed
+		// header with no body. The body goroutine in uploadV3Data waits on the same
+		// seal, so both rootfs uploads are gated on it while memfile/snapfile/
+		// metadata still overlap it. No-op on the synchronous path (CachePath
+		// returns immediately).
+		if _, err := u.snap.RootfsDiff.CachePath(egCtx); err != nil {
+			return fmt.Errorf("error getting rootfs diff path: %w", err)
+		}
+
+		return storeHeaderWithMetrics(egCtx, u.store, u.paths.RootfsHeader(), uploadFileRootfsHeader, finalizeV3(h), storage.WithMetadata(u.objectMetadata))
+	})
+
+	return eg.Wait()
 }
 
 // finalizeV3 returns a shallow copy of src with IncompletePendingUpload cleared,
