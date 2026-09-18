@@ -105,7 +105,7 @@ func (o *fsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err err
 	start := time.Now()
 	defer func() { RecordReadBlob(ctx, time.Since(start), n, o.path, SourceFS, err) }()
 
-	handle, err := o.getHandle(true)
+	handle, err := o.openRead()
 	if err != nil {
 		return 0, err
 	}
@@ -118,15 +118,11 @@ func (o *fsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err err
 }
 
 func (o *fsObject) Put(_ context.Context, data []byte, _ ...PutOption) error {
-	handle, err := o.getHandle(false)
-	if err != nil {
+	return o.atomicWriteFile(0o644, func(w io.Writer) error {
+		_, err := io.Copy(w, bytes.NewReader(data))
+
 		return err
-	}
-	defer handle.Close()
-
-	_, err = io.Copy(handle, bytes.NewReader(data))
-
-	return err
+	})
 }
 
 func (o *fsObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (*FullFrameTable, [32]byte, error) {
@@ -155,13 +151,13 @@ func (o *fsObject) StoreFile(ctx context.Context, path string, opts ...PutOption
 	}
 	defer r.Close()
 
-	handle, err := o.getHandle(false)
-	if err != nil {
-		return nil, [32]byte{}, err
-	}
-	defer handle.Close()
+	var n int64
+	err = o.atomicWriteFile(0o644, func(w io.Writer) error {
+		var copyErr error
+		n, copyErr = io.Copy(w, r)
 
-	n, err := io.Copy(handle, r)
+		return copyErr
+	})
 	if err == nil {
 		logger.L().Debug(ctx, "Stored file to filesystem",
 			zap.String("object", o.path),
@@ -198,7 +194,11 @@ func (o *fsObject) storeFileCompressed(ctx context.Context, localPath string, cf
 	// partial read, compress error) doesn't leave Size() reporting the new size
 	// against the unchanged data file.
 	sidecarPath := SizeSidecar(o.path)
-	if writeErr := os.WriteFile(sidecarPath, []byte(strconv.FormatInt(fi.Size(), 10)), 0o644); writeErr != nil {
+	if writeErr := writeFileAtomic(sidecarPath, 0o644, func(w io.Writer) error {
+		_, err := w.Write([]byte(strconv.FormatInt(fi.Size(), 10)))
+
+		return err
+	}); writeErr != nil {
 		return nil, [32]byte{}, fmt.Errorf("failed to write uncompressed-size sidecar for %s: %w", o.path, writeErr)
 	}
 
@@ -206,7 +206,7 @@ func (o *fsObject) storeFileCompressed(ctx context.Context, localPath string, cf
 }
 
 func (o *fsObject) openRangeReader(_ context.Context, off, length int64) (RangeReader, error) {
-	f, err := o.getHandle(true)
+	f, err := o.openRead()
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +227,7 @@ func (o *fsObject) Size(ctx context.Context) (_ int64, err error) {
 	start := time.Now()
 	defer func() { RecordReadSize(ctx, time.Since(start), o.objType, SourceFS, err) }()
 
-	handle, err := o.getHandle(true)
+	handle, err := o.openRead()
 	if err != nil {
 		return 0, err
 	}
@@ -274,28 +274,86 @@ func ValidateUploadToken(key []byte, path string, expires int64, token string) b
 	return hmac.Equal([]byte(expected), []byte(token))
 }
 
-func (o *fsObject) getHandle(checkExistence bool) (*os.File, error) {
-	if checkExistence {
-		info, err := os.Stat(o.path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil, ErrObjectNotExist
-			}
-
-			return nil, err
-		}
-
-		if info.IsDir() {
-			return nil, fmt.Errorf("path %s is a directory", o.path)
-		}
-	}
-
-	handle, err := os.OpenFile(o.path, os.O_RDWR|os.O_CREATE, 0o644)
+// openRead opens the object read-only. Reads never create files and never
+// require write permission on the object or its directory.
+func (o *fsObject) openRead() (*os.File, error) {
+	handle, err := os.Open(o.path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrObjectNotExist
+		}
+
 		return nil, err
 	}
 
+	info, err := handle.Stat()
+	if err != nil {
+		handle.Close()
+
+		return nil, err
+	}
+	if info.IsDir() {
+		handle.Close()
+
+		return nil, fmt.Errorf("path %s is a directory", o.path)
+	}
+
 	return handle, nil
+}
+
+// writeFileAtomic writes path through a same-directory temp file and renames
+// it into place, so readers never observe a partial object and a rewrite
+// always replaces the previous content (no stale tail). The file is fsynced
+// before the rename; the parent directory entry is not fsynced.
+func writeFileAtomic(path string, perm os.FileMode, write func(io.Writer) error) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file for %s: %w", path, err)
+	}
+	tmpName := tmp.Name()
+
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+
+	if err := write(tmp); err != nil {
+		cleanup()
+
+		return fmt.Errorf("failed to write %s: %w", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+
+		return fmt.Errorf("failed to sync %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+
+		return fmt.Errorf("failed to close %s: %w", path, err)
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		_ = os.Remove(tmpName)
+
+		return fmt.Errorf("failed to chmod %s: %w", path, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+
+		return fmt.Errorf("failed to rename temp file into %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// atomicWriteFile writes this object atomically with the given permissions.
+func (o *fsObject) atomicWriteFile(perm os.FileMode, write func(io.Writer) error) error {
+	return writeFileAtomic(o.path, perm, write)
 }
 
 // fsPartUploader implements partUploader for local filesystem.
@@ -308,11 +366,13 @@ type fsPartUploader struct {
 }
 
 func (u *fsPartUploader) Complete(_ context.Context) error {
-	if err := os.MkdirAll(filepath.Dir(u.fullPath), 0o755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
+	data := u.Assemble()
 
-	return os.WriteFile(u.fullPath, u.Assemble(), 0o644)
+	return writeFileAtomic(u.fullPath, 0o644, func(w io.Writer) error {
+		_, err := w.Write(data)
+
+		return err
+	})
 }
 
 func (o *fsObject) OpenRangeReader(ctx context.Context, offsetU int64, length int64, frameTable *FrameTable) (_ RangeReader, _ Source, err error) {
