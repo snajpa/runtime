@@ -29,6 +29,10 @@ const (
 	// releaseRetryDelay is how long ReleaseDevice waits before retrying a device
 	// that is still in use.
 	releaseRetryDelay = 500 * time.Millisecond
+	// poolPopulateBackoffMax caps the Populate retry backoff: a starved pool
+	// probes at most once a second, and a released slot wakes it immediately
+	// (see wake), so the cap does not delay a device that becomes free (S-32).
+	poolPopulateBackoffMax = time.Second
 )
 
 var (
@@ -44,6 +48,10 @@ var (
 	released = utils.Must(meter.Int64Counter("orchestrator.nbd.slots_pool.released",
 		metric.WithDescription("Number of nbd slots released."),
 		metric.WithUnit("{slot}"),
+	))
+	poolStarvedCounter = utils.Must(meter.Int64Counter("orchestrator.nbd.slots_pool.starved",
+		metric.WithDescription("Device-pool starvation windows: 100 consecutive failed populate attempts despite the backoff. Each count means sandbox creation waited through at least one window in which no device could be made ready."),
+		metric.WithUnit("{window}"),
 	))
 )
 
@@ -88,6 +96,11 @@ type DevicePool struct {
 	// sysBlockDir is where device state is read from; the /sys/block default
 	// is overridden only by tests.
 	sysBlockDir string
+
+	// wake is signalled (never blocking) whenever a slot is released, so a
+	// Populate loop sitting in its backoff retries immediately instead of
+	// sleeping out the interval.
+	wake chan struct{}
 }
 
 func NewDevicePool(maxSlotsReady int) (*DevicePool, error) {
@@ -109,6 +122,7 @@ func NewDevicePool(maxSlotsReady int) (*DevicePool, error) {
 		usedSlots:   bitset.New(maxDevices),
 		slots:       make(chan DeviceSlot, int(math.Min(float64(maxSlotsReady), float64(maxDevices)))),
 		sysBlockDir: sysBlockDir,
+		wake:        make(chan struct{}, 1),
 	}
 
 	return pool, nil
@@ -168,6 +182,24 @@ func isDeviceConnectedIn(blockDir string, slot DeviceSlot) (bool, error) {
 	return false, nil
 }
 
+// poolPopulateBackoff paces the Populate retry loop: the first failure waits
+// waitOnNBDError, each further failure doubles that, and the wait is capped at
+// poolPopulateBackoffMax. A starved pool therefore stops hammering the device
+// path (and sysfs) while it waits; a released slot wakes the loop directly, so
+// the cap costs no latency (S-32).
+func poolPopulateBackoff(failedAttempts int) time.Duration {
+	wait := waitOnNBDError
+	for range failedAttempts {
+		if wait >= poolPopulateBackoffMax {
+			break
+		}
+
+		wait *= 2
+	}
+
+	return min(wait, poolPopulateBackoffMax)
+}
+
 func (d *DevicePool) Populate(ctx context.Context) {
 	defer close(d.slots)
 
@@ -183,15 +215,34 @@ func (d *DevicePool) Populate(ctx context.Context) {
 
 		device, err := d.getFreeDeviceSlot()
 		if err != nil {
-			if failedCount%100 == 0 {
+			// Report the first failure and then one line per window: the
+			// backoff below stretches the attempts out, so a starved pool no
+			// longer logs every few seconds (S-32).
+			switch {
+			case failedCount == 0:
 				logger.L().Warn(ctx, "[nbd pool]: failed to create network",
 					zap.Error(err),
 					zap.Int("failed_count", failedCount),
 				)
+			case failedCount%100 == 0:
+				logger.L().Warn(ctx, "[nbd pool]: still failing to create network",
+					zap.Error(err),
+					zap.Int("failed_count", failedCount),
+				)
+				poolStarvedCounter.Add(ctx, 1)
 			}
 
+			// Sleep interruptibly: a released slot (wake) or a shutdown must
+			// not sit behind the longest backoff step.
+			select {
+			case <-ctx.Done():
+				return
+			case <-d.done:
+				return
+			case <-d.wake:
+			case <-time.After(poolPopulateBackoff(failedCount)):
+			}
 			failedCount++
-			time.Sleep(waitOnNBDError)
 
 			continue
 		}
@@ -345,6 +396,13 @@ func (d *DevicePool) release(ctx context.Context, idx DeviceSlot) error {
 	d.mu.Lock()
 	d.usedSlots.Clear(uint(idx))
 	d.mu.Unlock()
+
+	// A freed slot is the signal a starved Populate loop is waiting for; the
+	// send never blocks, and several releases collapse into one wakeup (S-32).
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
 
 	released.Add(ctx, 1)
 

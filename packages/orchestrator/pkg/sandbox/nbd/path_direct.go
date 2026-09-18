@@ -59,7 +59,31 @@ const (
 	// ceiling means the backend is not answering -- alert on the slow-close
 	// counter.
 	deviceCloseWarnThreshold = 5 * time.Second
+
+	// statusPollInitial and statusPollMax pace the kernel-status poll loops
+	// below: the first probes stay fast (a transition usually completes in
+	// microseconds) while a stuck transition backs off to at most
+	// statusPollMax instead of spinning at 100 us (S-32).
+	statusPollInitial = 100 * time.Microsecond
+	statusPollMax     = 10 * time.Millisecond
 )
+
+// statusPollBackoff returns how long the nth kernel-status probe waits before
+// the next one: starting at statusPollInitial and doubling up to at most
+// statusPollMax. One loop serves one device transition, so there is no herd to
+// jitter away; the bound is the point.
+func statusPollBackoff(attempt int) time.Duration {
+	wait := statusPollInitial
+	for range attempt {
+		if wait >= statusPollMax {
+			break
+		}
+
+		wait *= 2
+	}
+
+	return min(wait, statusPollMax)
+}
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd")
 
@@ -297,7 +321,7 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 	}
 
 	// Wait until it's connected...
-	for {
+	for attempt := 0; ; attempt++ {
 		select {
 		case <-ctx.Done():
 			closeErr := d.closeConnected(ctx, deviceIndex, "wait_connected")
@@ -313,7 +337,7 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 			break
 		}
 
-		time.Sleep(100 * time.Microsecond)
+		time.Sleep(statusPollBackoff(attempt))
 	}
 
 	telemetry.ReportEvent(ctx, "connected to NBD")
@@ -586,7 +610,7 @@ func disconnectNBDWithTimeout(ctx context.Context, deviceIndex uint32, timeout t
 	telemetry.ReportEvent(ctx, "waiting for complete disconnection")
 	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	for {
+	for attempt := 0; ; attempt++ {
 		select {
 		case <-ctxTimeout.Done():
 			return ctxTimeout.Err()
@@ -597,7 +621,7 @@ func disconnectNBDWithTimeout(ctx context.Context, deviceIndex uint32, timeout t
 		if err == nil && !s.Connected {
 			break
 		}
-		time.Sleep(100 * time.Microsecond)
+		time.Sleep(statusPollBackoff(attempt))
 	}
 
 	return nil
