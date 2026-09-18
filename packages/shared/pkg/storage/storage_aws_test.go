@@ -278,10 +278,12 @@ func s3MetadataFromHeaders(h http.Header) map[string]string {
 // Tests below exercise awsObject and awsPartUploader against a real S3 server
 // (TestS3*), unlike the fake-httptest tests above.
 //
-// By default each test starts its own MinIO container via testcontainers
-// (same pattern as pkg/redis: Docker is required, teardown via t.Cleanup so
-// it works with TESTCONTAINERS_RYUK_DISABLED=true in CI). These run with the
-// regular unit test suite.
+// By default each test starts its own S3-compatible container via
+// testcontainers (Silo, the maintained MinIO fork, unless
+// E2B_STORAGE_TEST_BACKEND selects minio; same pattern as pkg/redis: Docker
+// is required, teardown via t.Cleanup so it works with
+// TESTCONTAINERS_RYUK_DISABLED=true in CI). These run with the regular unit
+// test suite.
 //
 // Setting E2B_LIVE_S3_BUCKET switches the same tests to a real AWS bucket
 // (credentials from the standard SDK chain: AWS_PROFILE, env vars, SSO, ...):
@@ -289,16 +291,17 @@ func s3MetadataFromHeaders(h http.Header) map[string]string {
 //	AWS_PROFILE=<profile> E2B_LIVE_S3_BUCKET=<bucket> \
 //	  go test ./pkg/storage -run TestS3 -v -timeout 30m
 //
-// MinIO reimplements S3 semantics (5 MiB part minimum, multipart lifecycle,
-// CRC32 checksums) with high fidelity, but it is not AWS: real-S3 quirks like
-// metadata-key normalization and checksum-trailer validation should still be
-// verified against a real bucket before relying on them.
+// Silo and MinIO reimplement S3 semantics (5 MiB part minimum, multipart
+// lifecycle, CRC32 checksums) with high fidelity, but they are not AWS:
+// real-S3 quirks like metadata-key normalization and checksum-trailer
+// validation should still be verified against a real bucket before relying on
+// them.
 // ---------------------------------------------------------------------------
 
 const liveBucketEnv = "E2B_LIVE_S3_BUCKET"
 
 // testBackend returns the S3 backend for a test: the real AWS bucket from
-// E2B_LIVE_S3_BUCKET if set, otherwise a per-test MinIO container.
+// E2B_LIVE_S3_BUCKET if set, otherwise a per-test S3-compatible container.
 func testBackend(t *testing.T) *s3TestBackend {
 	t.Helper()
 
@@ -306,7 +309,7 @@ func testBackend(t *testing.T) *s3TestBackend {
 		return &s3TestBackend{bucket: bucket}
 	}
 
-	return startMinioBackend(t)
+	return startObjectStoreBackend(t)
 }
 
 // object wraps an awsObject on the backend and deletes it on cleanup.
