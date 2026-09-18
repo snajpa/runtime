@@ -175,12 +175,81 @@ func TestWriteToNonExistentObject(t *testing.T) {
 	require.ErrorIs(t, err, ErrObjectNotExist)
 }
 
-// The filesystem uploader stages parts in memory and writes the object
-// atomically on Complete, so a failed upload leaves no file behind.
+// The filesystem uploader streams parts into a same-directory temp file and
+// commits it atomically on Complete, so a failed upload leaves no file behind
+// and memory stays O(part) (REQ-B4).
 func TestFSPartUploaderResidueContract(t *testing.T) {
 	t.Parallel()
 
 	uploader := &fsPartUploader{}
 	require.True(t, uploader.Abortable())
 	require.Equal(t, "fs", uploader.ProviderName())
+}
+
+// Parts must be assembled in part order even when they arrive out of order,
+// and no temp file may survive a completed upload.
+func TestFSPartUploaderStreamsPartsInOrder(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "object.bin")
+	u := &fsPartUploader{fullPath: target}
+
+	require.NoError(t, u.Start(t.Context()))
+	require.NoError(t, u.UploadPart(t.Context(), 2, []byte("two")))
+	require.NoError(t, u.UploadPart(t.Context(), 1, []byte("one"), []byte("-split")))
+	require.NoError(t, u.Complete(t.Context()))
+
+	content, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "one-splittwo", string(content))
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "only the committed object may remain")
+}
+
+// Close discards the staged temp file and leaves the target untouched.
+func TestFSPartUploaderAbortRemovesTemp(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "object.bin")
+	u := &fsPartUploader{fullPath: target}
+
+	require.NoError(t, u.Start(t.Context()))
+	require.NoError(t, u.UploadPart(t.Context(), 1, []byte("partial")))
+	require.NoError(t, u.Close())
+
+	_, err := os.Stat(target)
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "the temp file must be removed on abort")
+}
+
+// A compressed filesystem store must round-trip through the streaming
+// uploader without assembling the object in memory.
+func TestFSCompressedStoreFileRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	p := newTempProvider(t)
+
+	data := generateSemiRandomData(3 * megabyte)
+	inputPath := filepath.Join(t.TempDir(), "input.bin")
+	require.NoError(t, os.WriteFile(inputPath, data, 0o600))
+
+	obj, err := p.OpenSeekable(t.Context(), "layer/data.bin")
+	require.NoError(t, err)
+
+	ft, _, err := obj.StoreFile(t.Context(), inputPath, WithCompressConfig(defaultCfg(CompressionZstd, 2, 512*1024)))
+	require.NoError(t, err)
+
+	raw, err := os.ReadFile(filepath.Join(p.basePath, "layer", "data.bin"))
+	require.NoError(t, err)
+
+	got, err := decompressAll(ft.Table(), raw)
+	require.NoError(t, err)
+	require.Equal(t, data, got)
 }
