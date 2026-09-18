@@ -4,6 +4,7 @@ package build
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -25,9 +26,15 @@ func NewLocalDiffFile(
 ) (*LocalDiffFile, error) {
 	cachePath := GenerateDiffCachePath(basePath, buildId, diffType)
 
-	f, err := os.OpenFile(cachePath, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(cachePath, os.O_RDWR|os.O_CREATE, storage.CacheFilePerm)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+
+	// The create mode is filtered by the umask and ignored for an existing
+	// file; enforce the cache file policy explicitly.
+	if err := f.Chmod(storage.CacheFilePerm); err != nil {
+		return nil, errors.Join(fmt.Errorf("failed to set file permissions: %w", err), f.Close())
 	}
 
 	return &LocalDiffFile{

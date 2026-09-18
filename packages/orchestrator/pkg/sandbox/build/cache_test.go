@@ -17,6 +17,8 @@ package build
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -32,6 +34,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	blockmetrics "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -82,7 +85,11 @@ func newDiffWithAsserts(t *testing.T, cachePath, buildId string, diffType DiffTy
 
 func TestNewDiffStore(t *testing.T) {
 	t.Parallel()
-	cachePath := t.TempDir()
+
+	cachePath := filepath.Join(t.TempDir(), "diff-cache")
+	// Simulate a cache root left world-readable by an older release.
+	require.NoError(t, os.MkdirAll(cachePath, 0o755))
+	require.NoError(t, os.Chmod(cachePath, 0o755))
 
 	c, err := cfg.Parse()
 	require.NoError(t, err)
@@ -98,6 +105,10 @@ func TestNewDiffStore(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.NotNil(t, store)
+
+	info, err := os.Stat(cachePath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(storage.CacheDirPerm), info.Mode().Perm(), "diff cache root must be owner-only")
 }
 
 func TestDiffStoreTTLEviction(t *testing.T) {

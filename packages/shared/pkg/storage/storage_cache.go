@@ -17,9 +17,14 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
+// CacheDirPerm and CacheFilePerm are the permissions policy for the local
+// object caches: cache directories and files are private to the orchestrator
+// user. Cache creation applies them explicitly (create + chmod) rather than
+// relying on the create mode, which the umask filters and which existing
+// files and directories ignore.
 const (
-	cacheFilePermissions = 0o600
-	cacheDirPermissions  = 0o700
+	CacheDirPerm  = 0o700
+	CacheFilePerm = 0o600
 )
 
 // skipCacheWritebackKeyType is the context key type for skipping NFS cache writeback.
@@ -92,8 +97,14 @@ func (c cache) OpenBlob(ctx context.Context, path string) (Blob, error) {
 	}
 
 	localPath := filepath.Join(c.rootPath, path)
-	if err = os.MkdirAll(localPath, cacheDirPermissions); err != nil {
+	if err = os.MkdirAll(localPath, CacheDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
+	// MkdirAll leaves an existing directory untouched and always filters the
+	// create mode through the umask, so enforce the cache policy explicitly.
+	if err = os.Chmod(localPath, CacheDirPerm); err != nil {
+		return nil, fmt.Errorf("failed to set cache directory permissions: %w", err)
 	}
 
 	return &cachedBlob{
@@ -112,8 +123,14 @@ func (c cache) OpenSeekable(ctx context.Context, path string) (Seekable, error) 
 	}
 
 	localPath := filepath.Join(c.rootPath, path)
-	if err = os.MkdirAll(localPath, cacheDirPermissions); err != nil {
+	if err = os.MkdirAll(localPath, CacheDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
+	// MkdirAll leaves an existing directory untouched and always filters the
+	// create mode through the umask, so enforce the cache policy explicitly.
+	if err = os.Chmod(localPath, CacheDirPerm); err != nil {
+		return nil, fmt.Errorf("failed to set cache directory permissions: %w", err)
 	}
 
 	objType, _ := seekableObjectType(path)

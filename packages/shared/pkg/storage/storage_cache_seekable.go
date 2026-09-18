@@ -315,10 +315,17 @@ func (c *cachedSeekable) writeToCache(ctx context.Context, offset int64, finalPa
 
 	tempPath := c.makeTempFilename(finalPath)
 
-	if err := os.WriteFile(tempPath, bytes, cacheFilePermissions); err != nil {
+	if err := os.WriteFile(tempPath, bytes, CacheFilePerm); err != nil {
 		go safelyRemoveFile(ctx, tempPath)
 
 		return fmt.Errorf("failed to write temp cache file: %w", err)
+	}
+
+	// The create mode is filtered by the umask; set the policy mode explicitly.
+	if err := os.Chmod(tempPath, CacheFilePerm); err != nil {
+		go safelyRemoveFile(ctx, tempPath)
+
+		return fmt.Errorf("failed to set temp cache file permissions: %w", err)
 	}
 
 	if err := utils.RenameOrDeleteFile(ctx, tempPath, finalPath); err != nil {
@@ -350,10 +357,17 @@ func (c *cachedSeekable) writeLocalSize(ctx context.Context, size int64) error {
 
 	tempFilename := filepath.Join(c.path, fmt.Sprintf(".size.bin.%s", uuid.NewString()))
 
-	if err := os.WriteFile(tempFilename, fmt.Appendf(nil, "%d", size), cacheFilePermissions); err != nil {
+	if err := os.WriteFile(tempFilename, fmt.Appendf(nil, "%d", size), CacheFilePerm); err != nil {
 		go safelyRemoveFile(ctx, tempFilename)
 
 		return fmt.Errorf("failed to write temp local size file: %w", err)
+	}
+
+	// The create mode is filtered by the umask; set the policy mode explicitly.
+	if err := os.Chmod(tempFilename, CacheFilePerm); err != nil {
+		go safelyRemoveFile(ctx, tempFilename)
+
+		return fmt.Errorf("failed to set temp local size file permissions: %w", err)
 	}
 
 	if err := utils.RenameOrDeleteFile(ctx, tempFilename, finalFilename); err != nil {
@@ -424,11 +438,17 @@ func (c *cachedSeekable) writeChunkFromFile(ctx context.Context, offset int64, i
 	chunkPath := c.makeChunkFilename(offset)
 	span.SetAttributes(attribute.String("chunk_path", chunkPath))
 
-	output, err := os.OpenFile(chunkPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, cacheFilePermissions)
+	output, err := os.OpenFile(chunkPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, CacheFilePerm)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", chunkPath, err)
 	}
 	defer utils.Cleanup(ctx, "failed to close file", output.Close)
+
+	// An existing chunk file keeps its own mode (the create mode only applies
+	// to new files), so set the cache file policy explicitly.
+	if err := output.Chmod(CacheFilePerm); err != nil {
+		return fmt.Errorf("failed to set cache file permissions %s: %w", chunkPath, err)
+	}
 
 	count, err = io.Copy(output, io.NewSectionReader(input, offset, c.chunkSize))
 	if err != nil {
