@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage/lock"
 )
 
 // mustClose closes a RangeReader and asserts no error.
@@ -824,4 +826,59 @@ func TestCachedSeekable_CacheFilePermissions(t *testing.T) {
 	sizeInfo, err := os.Stat(c.sizeFilename())
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(CacheFilePerm), sizeInfo.Mode().Perm(), "size sidecars must be owner-only")
+}
+
+// TestEvictCachedEntryRespectsWriterLock pins the ownership rule for
+// reader-side eviction: while a cache fill holds the entry's lock, an eviction
+// must leave the entry alone — the lock holder is publishing a fresh copy — and
+// once the lock is free the same call removes it.
+func TestEvictCachedEntryRespectsWriterLock(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	entry := filepath.Join(t.TempDir(), "entry")
+	require.NoError(t, os.WriteFile(entry, []byte("stale"), CacheFilePerm))
+
+	lockFile, err := lock.TryAcquireLock(ctx, entry)
+	require.NoError(t, err)
+
+	evictCachedEntry(ctx, entry, nil)
+
+	_, err = os.Stat(entry)
+	require.NoError(t, err, "an eviction that cannot take the cache lock must leave the entry alone")
+
+	require.NoError(t, lock.ReleaseLock(ctx, lockFile))
+
+	evictCachedEntry(ctx, entry, nil)
+
+	_, err = os.Stat(entry)
+	require.True(t, os.IsNotExist(err), "the entry must be evicted once the cache lock is free")
+}
+
+// TestEvictCachedEntryKeepsRepublishedEntry pins the re-check under the lock: an
+// entry a concurrent fill replaced while the reader was validating the stale one
+// must survive that reader's eviction — deleting it would throw away the fresh
+// copy the eviction was trying to force.
+func TestEvictCachedEntryKeepsRepublishedEntry(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	dir := t.TempDir()
+	entry := filepath.Join(dir, "entry")
+	require.NoError(t, os.WriteFile(entry, []byte("stale"), CacheFilePerm))
+
+	stale, err := os.Stat(entry)
+	require.NoError(t, err)
+
+	// A concurrent fill publishes a fresh copy at the same path (temp + rename,
+	// the way writeToCache publishes).
+	fresh := filepath.Join(dir, "entry.tmp")
+	require.NoError(t, os.WriteFile(fresh, []byte("fresh"), CacheFilePerm))
+	require.NoError(t, os.Rename(fresh, entry))
+
+	evictCachedEntry(ctx, entry, stale)
+
+	got, err := os.ReadFile(entry)
+	require.NoError(t, err, "the republished entry must survive the stale reader's eviction")
+	require.Equal(t, []byte("fresh"), got)
 }

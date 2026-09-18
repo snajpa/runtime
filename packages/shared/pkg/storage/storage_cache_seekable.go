@@ -88,10 +88,12 @@ func (c *cachedSeekable) openReaderUncompressed(ctx context.Context, off, length
 
 	fp, err := os.Open(chunkPath)
 
-	var size int64
+	var (
+		size int64
+		info os.FileInfo
+	)
 
 	if err == nil {
-		var info os.FileInfo
 		if info, err = fp.Stat(); err == nil {
 			size = info.Size()
 		}
@@ -105,7 +107,7 @@ func (c *cachedSeekable) openReaderUncompressed(ctx context.Context, off, length
 		// evict it and refetch instead of serving short data (REQ-C1).
 		if c.truncatedChunk(ctx, off, size) {
 			_ = fp.Close()
-			_ = os.Remove(chunkPath)
+			evictCachedEntry(ctx, chunkPath, info)
 
 			err = fmt.Errorf("cached chunk %s is torn: %d bytes end before the object end", chunkPath, size)
 		}
@@ -499,9 +501,66 @@ func (c *cachedSeekable) writeChunkFromFile(ctx context.Context, offset int64, i
 	return nil
 }
 
+// safelyRemoveFile removes a file this process just created (a temp file on its
+// way into the cache). Temp names are unique to their writer, so no lock is
+// involved; removing a published cache entry instead goes through
+// evictCachedEntry.
 func safelyRemoveFile(ctx context.Context, path string) {
 	if err := os.Remove(path); ignoreFileMissingError(err) != nil {
 		logger.L().Warn(ctx, "failed to remove file",
+			zap.String("path", path),
+			zap.Error(err))
+	}
+}
+
+// evictCachedEntry removes a cache entry that a reader found invalid (wrong
+// size, torn content, failed decompression) while holding the same per-path
+// cache lock that cache fills take (writeToCache). That is the ownership rule
+// for shared cache entries: publishes and removals serialize on the entry's
+// lock, readers validate without it — so an eviction can never delete a fresh
+// copy a concurrent fill just published onto the shared cache (REQ-C2, INV-9).
+//
+// stale is the file the caller validated. It is re-checked under the lock, so
+// an entry that was replaced in the meantime is left alone: the fresh copy is
+// exactly what the eviction was trying to force. A nil stale means "remove
+// whatever is at path".
+//
+// Contention is not an error: the lock holder is filling this very entry, and
+// skipping the eviction is safe because the next read re-validates the entry
+// and tries again. Retries share the writeback contention budget.
+func evictCachedEntry(ctx context.Context, path string, stale os.FileInfo) {
+	lockFile, err := retryContendedLock(ctx, writebackMaxAttempts, writebackRetryBackoff, func() (*os.File, error) {
+		return lock.TryAcquireLock(ctx, path)
+	})
+	if err != nil {
+		if !errors.Is(err, lock.ErrLockAlreadyHeld) {
+			logger.L().Warn(ctx, "skipped stale cache entry eviction, cache lock unavailable",
+				zap.String("path", path),
+				zap.Error(err))
+		}
+
+		return
+	}
+
+	defer func() {
+		if err := lock.ReleaseLock(ctx, lockFile); err != nil {
+			logger.L().Warn(ctx, "failed to release cache entry lock after eviction",
+				zap.String("path", path),
+				zap.Error(err))
+		}
+	}()
+
+	if stale != nil {
+		current, err := os.Stat(path)
+		if err == nil && !os.SameFile(stale, current) {
+			// A concurrent fill replaced the entry while this reader was
+			// validating the stale copy: leave the fresh one in place.
+			return
+		}
+	}
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		logger.L().Warn(ctx, "failed to evict stale cache entry",
 			zap.String("path", path),
 			zap.Error(err))
 	}

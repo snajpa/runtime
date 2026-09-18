@@ -261,3 +261,95 @@ func TestTruncatedFetchNotCached(t *testing.T) {
 	require.NoError(t, readErr2, "read must recover after upstream heals")
 	require.Equal(t, data, got.Bytes())
 }
+
+// TestCachedCorruptFrameEvictedAndRecovered plants a cached frame with the
+// expected length that no longer decodes (bit rot / torn write): the hit path
+// must surface the decode error and evict the entry, and the next read must
+// refetch from the upstream instead of failing forever.
+func TestCachedCorruptFrameEvictedAndRecovered(t *testing.T) {
+	t.Parallel()
+
+	data := generateSemiRandomData(1 * megabyte)
+	up := &memPartUploader{}
+	fullFT, _, err := compressStream(t.Context(), bytes.NewReader(data), defaultCfg(CompressionZstd, 2, 2*megabyte), up, 2, nil)
+	require.NoError(t, err)
+	blob := up.Assemble()
+
+	corrupt := bytes.Clone(blob)
+	corrupt[len(corrupt)/2] ^= 0xFF
+
+	inner := NewMockSeekable(t)
+	inner.EXPECT().OpenRangeReader(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, off, length int64, _ *FrameTable) (RangeReader, Source, error) {
+			return bytesRangeReader(blob[off : off+length]), SourceAWS, nil
+		}).Maybe()
+
+	c := cachedSeekable{path: t.TempDir(), inner: inner, tracer: noopTracer, chunkSize: 1024}
+	ft := fullFT.Table()
+
+	framePath := makeFrameFilename(c.path, Range{Offset: 0, Length: int(ft.CompressedSize())})
+	require.NoError(t, os.WriteFile(framePath, corrupt, CacheFilePerm))
+
+	rr, _, err := c.OpenRangeReader(t.Context(), 0, 0, ft)
+	require.NoError(t, err)
+	_, readErr := io.Copy(io.Discard, rr)
+	rr.Close(t.Context())
+	require.Error(t, readErr, "a cached frame that fails its checksum must not be served")
+
+	_, statErr := os.Stat(framePath)
+	require.True(t, os.IsNotExist(statErr), "the corrupt entry must be evicted")
+
+	rr2, _, err := c.OpenRangeReader(t.Context(), 0, 0, ft)
+	require.NoError(t, err)
+
+	var got bytes.Buffer
+	_, readErr2 := got.ReadFrom(rr2)
+	rr2.Close(t.Context())
+	c.wg.Wait()
+	require.NoError(t, readErr2, "the read must recover after the corrupt entry is evicted")
+	require.Equal(t, data, got.Bytes())
+
+	republished, err := os.Stat(framePath)
+	require.NoError(t, err, "the refetched frame must be republished")
+	require.Equal(t, int64(len(blob)), republished.Size())
+}
+
+// TestCachedShortFrameEvictedAndRefetched plants a torn frame (right name,
+// short content): the hit path must not serve it, and the read must
+// transparently refetch and republish the complete frame.
+func TestCachedShortFrameEvictedAndRefetched(t *testing.T) {
+	t.Parallel()
+
+	data := generateSemiRandomData(1 * megabyte)
+	up := &memPartUploader{}
+	fullFT, _, err := compressStream(t.Context(), bytes.NewReader(data), defaultCfg(CompressionZstd, 2, 2*megabyte), up, 2, nil)
+	require.NoError(t, err)
+	blob := up.Assemble()
+
+	inner := NewMockSeekable(t)
+	inner.EXPECT().OpenRangeReader(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, off, length int64, _ *FrameTable) (RangeReader, Source, error) {
+			return bytesRangeReader(blob[off : off+length]), SourceAWS, nil
+		}).Maybe()
+
+	c := cachedSeekable{path: t.TempDir(), inner: inner, tracer: noopTracer, chunkSize: 1024}
+	ft := fullFT.Table()
+
+	framePath := makeFrameFilename(c.path, Range{Offset: 0, Length: int(ft.CompressedSize())})
+	require.NoError(t, os.WriteFile(framePath, blob[:len(blob)/2], CacheFilePerm))
+
+	rr, _, err := c.OpenRangeReader(t.Context(), 0, 0, ft)
+	require.NoError(t, err)
+
+	var got bytes.Buffer
+	_, readErr := got.ReadFrom(rr)
+	_, closeErr := rr.Close(t.Context())
+	c.wg.Wait()
+	require.NoError(t, readErr, "a torn cached frame must be refetched, not served")
+	require.NoError(t, closeErr)
+	require.Equal(t, data, got.Bytes())
+
+	republished, err := os.Stat(framePath)
+	require.NoError(t, err, "the refetched frame must be republished")
+	require.Equal(t, int64(len(blob)), republished.Size(), "the republished frame must be complete")
+}
