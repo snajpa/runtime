@@ -32,15 +32,18 @@ func isRetryableUploadErr(err error) bool {
 	switch {
 	case errors.Is(err, build.NoDiffError{}):
 		return false // nothing to upload
-	case errors.Is(err, storage.ErrObjectNotExist):
+	case storage.ClassifyError(err) == storage.ClassNotFound:
 		return false // source vanished; retry cannot recover it
 	case errors.Is(err, context.Canceled):
 		return false // parent cancelled (shutdown)
 	case errors.Is(err, build.ErrDeferredSealFailed):
 		return false // deferred rootfs seal ran once and failed; it never re-runs
 	default:
-		// Includes per-attempt context.DeadlineExceeded, GCS 401/503, rate
-		// limiting, and unknown errors — all worth retrying within the budget.
+		// Includes per-attempt context.DeadlineExceeded (ClassTransient), GCS
+		// 401/503, rate limiting, and unknown errors — all worth retrying
+		// within the budget. The shared taxonomy (storage.ClassifyError)
+		// supplies the storage-level classes; this policy deliberately stays
+		// default-retryable.
 		return true
 	}
 }
