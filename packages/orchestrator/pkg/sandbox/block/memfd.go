@@ -173,6 +173,12 @@ func copyFromMemfd(ctx context.Context, cache *Cache, memfd *Memfd, dirty *roari
 // goroutine. Reads block on the copy via Wait. Once it finishes, runCopy
 // closes the memfd (releasing the hugetlb pages — potentially tens of GB)
 // and reads delegate to the embedded Cache.
+// memfdWaitTimeout bounds the memfd-cache waits that cannot take a caller
+// context (ReadAt/Slice serve io.ReaderAt-shaped interfaces): a stuck
+// background copy must fail the read instead of hanging the caller forever
+// (S-19, INV-5). A var so tests can shorten it.
+var memfdWaitTimeout = 2 * time.Minute
+
 type MemfdCache struct {
 	cache  *Cache
 	cancel context.CancelFunc
@@ -236,7 +242,7 @@ func (m *MemfdCache) Wait(ctx context.Context) error {
 }
 
 func (m *MemfdCache) ReadAt(b []byte, off int64) (int, error) {
-	if err := m.Wait(context.Background()); err != nil {
+	if err := m.waitBounded(); err != nil {
 		return 0, err
 	}
 
@@ -244,11 +250,25 @@ func (m *MemfdCache) ReadAt(b []byte, off int64) (int, error) {
 }
 
 func (m *MemfdCache) Slice(off, length int64) ([]byte, error) {
-	if err := m.Wait(context.Background()); err != nil {
+	if err := m.waitBounded(); err != nil {
 		return nil, err
 	}
 
 	return m.cache.Slice(off, length)
+}
+
+// waitBounded waits for the background copy with a bound: ReadAt/Slice serve
+// interfaces without a context, so a caller cancel cannot reach this wait —
+// the timeout keeps a stuck copy from hanging the caller (S-19, INV-5).
+func (m *MemfdCache) waitBounded() error {
+	ctx, cancel := context.WithTimeout(context.Background(), memfdWaitTimeout)
+	defer cancel()
+
+	if err := m.Wait(ctx); err != nil {
+		return fmt.Errorf("memfd cache copy wait: %w", err)
+	}
+
+	return nil
 }
 
 func (m *MemfdCache) Close() error {
@@ -578,7 +598,7 @@ func (d *DedupedMemfdCache) ReadAt(b []byte, off int64) (int, error) {
 		return n, nil
 	}
 
-	c, err := d.Wait(context.Background())
+	c, err := d.waitBounded()
 	if err != nil {
 		return 0, err
 	}
@@ -594,12 +614,26 @@ func (d *DedupedMemfdCache) Slice(off, length int64) ([]byte, error) {
 		}
 	}
 
-	c, err := d.Wait(context.Background())
+	c, err := d.waitBounded()
 	if err != nil {
 		return nil, err
 	}
 
 	return c.Slice(off, length)
+}
+
+// waitBounded waits for the drain with a bound, for the io.ReaderAt-shaped
+// reads whose interfaces cannot carry a caller context (S-19, INV-5).
+func (d *DedupedMemfdCache) waitBounded() (*Cache, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), memfdWaitTimeout)
+	defer cancel()
+
+	c, err := d.Wait(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("deduped memfd cache drain wait: %w", err)
+	}
+
+	return c, nil
 }
 
 // releaseMemfd closes the memfd exactly once, under the write lock so it can't
@@ -639,13 +673,21 @@ func (d *DedupedMemfdCache) ServeMemfd(b []byte, off int64) (int, error) {
 
 func (d *DedupedMemfdCache) Close() error {
 	d.cancel()
-	c, _ := d.done.Wait()
-	if c != nil {
-		return c.Close()
-	}
-	_ = os.Remove(d.outPath)
 
-	return nil
+	c, waitErr := d.done.Wait()
+	if c != nil {
+		return errors.Join(waitErr, c.Close())
+	}
+
+	// The drain failed (or was cancelled before it produced a cache): surface
+	// the wait error instead of discarding it, so the caller learns the export
+	// did not complete (S-19). Removing the partial output is best-effort.
+	removeErr := os.Remove(d.outPath)
+	if removeErr != nil && !os.IsNotExist(removeErr) {
+		waitErr = errors.Join(waitErr, fmt.Errorf("remove partial memfd cache %q: %w", d.outPath, removeErr))
+	}
+
+	return waitErr
 }
 
 // MemfdIdentitySource is the provisional local diff source: it serves dirty
@@ -720,7 +762,7 @@ func (d *DedupedMemfdCache) FileSize(ctx context.Context) (int64, error) {
 
 func (d *DedupedMemfdCache) BlockSize() int64 { return header.PageSize }
 func (d *DedupedMemfdCache) Size() (int64, error) {
-	c, err := d.Wait(context.Background())
+	c, err := d.waitBounded()
 	if err != nil {
 		return 0, err
 	}

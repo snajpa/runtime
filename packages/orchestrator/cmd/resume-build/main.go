@@ -1280,7 +1280,7 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 		return fmt.Errorf("template cache: %w", err)
 	}
 	cache.Start(ctx)
-	defer cache.Stop()
+	defer cache.Stop(ctx)
 
 	// In gdb mode the launch must run the gdb-enabled Firecracker, but the factory
 	// resolves the FC binary from FirecrackerVersionsDir, which on cluster nodes is a

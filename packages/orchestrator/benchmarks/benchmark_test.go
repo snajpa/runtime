@@ -184,7 +184,7 @@ func BenchmarkBaseImageLaunch(b *testing.B) {
 	templateCache, err := template.NewCache(c, featureFlags, persistence, blockMetrics, peerclient.NopResolver())
 	require.NoError(b, err)
 	templateCache.Start(b.Context())
-	b.Cleanup(templateCache.Stop)
+	b.Cleanup(func() { templateCache.Stop(b.Context()) })
 
 	sandboxes := sandbox.NewSandboxesMap()
 	sandboxFactory := sandbox.NewFactory(b.Context(), config.BuilderConfig, networkPool, devicePool, featureFlags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)

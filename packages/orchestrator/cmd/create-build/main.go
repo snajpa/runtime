@@ -347,7 +347,7 @@ func doBuild(
 		return fmt.Errorf("template cache: %w", err)
 	}
 	templateCache.Start(ctx)
-	defer templateCache.Stop()
+	defer templateCache.Stop(ctx)
 
 	buildMetrics, _ := metrics.NewBuildMetrics(noop.MeterProvider{})
 	sandboxFactory := sandbox.NewFactory(ctx, c.BuilderConfig, networkPool, devicePool, featureFlags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)

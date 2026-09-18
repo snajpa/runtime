@@ -5,6 +5,7 @@ package build
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -16,6 +17,11 @@ import (
 // such as the pause-upload retry loop match on it to stop retrying a diff that
 // can never materialize (rather than burning the whole retry budget on it).
 var ErrDeferredSealFailed = errors.New("deferred rootfs seal failed")
+
+// deferredDiffCloseTimeout bounds Close's wait for the seal promise: a producer
+// that never resolves must not hang teardown (S-19, INV-5). A var so tests can
+// shorten it.
+var deferredDiffCloseTimeout = 30 * time.Second
 
 // deferredDiff is a Diff whose backing data is produced asynchronously. It is
 // returned synchronously from a pause that seals the rootfs in the background:
@@ -113,11 +119,32 @@ func (d *deferredDiff) FileSize(ctx context.Context) (int64, error) {
 
 // Close waits for the seal to resolve and closes the materialized diff. If the
 // seal failed there is nothing to close (the producer cleans up the partial file
-// on error), so only close when the diff actually materialized.
+// on error), so only close when the diff actually materialized. The wait is
+// bounded (S-19, INV-5): a producer that never resolves the seal must not hang
+// teardown — nothing is closed then, same as on a failed seal. The bound is a
+// plain timer rather than a context: Close has no caller context to inherit.
 func (d *deferredDiff) Close() error {
-	if inner, err := d.inner.Wait(); err == nil {
-		return inner.Close()
-	}
+	done := make(chan struct{})
 
-	return nil
+	var (
+		inner Diff
+		err   error
+	)
+
+	go func() {
+		defer close(done)
+
+		inner, err = d.inner.Wait()
+	}()
+
+	select {
+	case <-done:
+		if err == nil {
+			return inner.Close()
+		}
+
+		return nil
+	case <-time.After(deferredDiffCloseTimeout):
+		return nil
+	}
 }
