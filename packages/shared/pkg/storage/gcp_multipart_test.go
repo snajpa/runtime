@@ -340,6 +340,46 @@ func TestMultipartUploader_UploadFileInParallel_Success(t *testing.T) {
 	require.Equal(t, testContent, reconstructed.String())
 }
 
+// Streamed file parts must carry an explicit Content-Length (not chunked) and
+// the exact body; the part is never buffered whole (REQ-B4).
+func TestMultipartUploader_UploadFileInParallelStreamsParts(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("streamed part content ", 512)
+	path := filepath.Join(t.TempDir(), "stream.bin")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	gotLength := int64(-1)
+	gotBody := ""
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.RawQuery == uploadsPath:
+			response := InitiateMultipartUploadResult{Bucket: testBucketName, Key: testObjectName, UploadID: "stream-upload-id"}
+			xmlData, _ := xml.Marshal(response)
+			w.WriteHeader(http.StatusOK)
+			w.Write(xmlData)
+
+		case strings.Contains(r.URL.RawQuery, "partNumber"):
+			gotLength = r.ContentLength
+			body, _ := io.ReadAll(r.Body)
+			gotBody = string(body)
+			w.Header().Set("ETag", `"streamed-etag"`)
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.RawQuery, "uploadId"):
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	uploader := createTestMultipartUploader(t, handler)
+
+	_, err := uploader.UploadFileInParallel(t.Context(), path, 2, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(content)), gotLength, "streamed parts must set Content-Length")
+	require.Equal(t, content, gotBody)
+}
+
 func TestMultipartUploader_UploadFileInParallel_Checksum(t *testing.T) {
 	t.Parallel()
 

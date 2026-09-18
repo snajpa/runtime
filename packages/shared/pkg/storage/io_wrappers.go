@@ -246,3 +246,25 @@ func newMultiSliceReader(slices [][]byte) *multiSliceReader {
 
 	return &multiSliceReader{io.NewSectionReader(sliceReaderAt{slices: slices}, 0, size)}
 }
+
+// fileSectionReader streams a section of a file as a seekable request body
+// without buffering it. The multipart file-upload path recreates it per retry
+// via ReaderFunc; Len gives retryablehttp the Content-Length so parts are not
+// sent chunked (S3-compatible XML backends reject chunked PUTs with 411).
+type fileSectionReader struct {
+	*io.SectionReader
+}
+
+func newFileSectionReader(f *os.File, off, length int64) *fileSectionReader {
+	return &fileSectionReader{io.NewSectionReader(f, off, length)}
+}
+
+// Len returns the number of unread bytes, mirroring bytes.Reader.Len.
+func (r *fileSectionReader) Len() int {
+	cur, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0
+	}
+
+	return int(r.Size() - cur)
+}
