@@ -53,6 +53,9 @@ type Cache struct {
 	filePath  string
 	size      int64
 	blockSize int64
+	// mmap is the mapping of the cache file. It is non-nil only while the
+	// cache is open: Close unmaps it and nils it under mu, so any accessor
+	// holding mu sees either a valid mapping or a closed cache.
 	mmap      *mmap.MMap
 	mu        sync.RWMutex
 	tracker   *Tracker // Dirty: payload in mmap; Zero: punched, emitted as Empty in the diff
@@ -423,15 +426,15 @@ func (c *Cache) ReadAt(b []byte, off int64) (int, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.mmap == nil {
-		return 0, nil
-	}
-
 	if c.isClosed() {
 		return 0, NewErrCacheClosed(c.filePath)
 	}
 
-	slice, err := c.Slice(off, int64(len(b)))
+	if c.mmap == nil {
+		return 0, nil
+	}
+
+	slice, err := c.sliceLocked(off, int64(len(b)))
 	if err != nil {
 		return 0, fmt.Errorf("error slicing mmap: %w", err)
 	}
@@ -443,33 +446,36 @@ func (c *Cache) WriteAt(b []byte, off int64) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.mmap == nil {
-		return 0, nil
-	}
-
 	if c.isClosed() {
 		return 0, NewErrCacheClosed(c.filePath)
 	}
 
-	return c.WriteAtWithoutLock(b, off)
+	if c.mmap == nil {
+		return 0, nil
+	}
+
+	return c.writeAtWithoutLock(b, off)
 }
 
 func (c *Cache) Close() (e error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.mmap == nil {
-		return os.RemoveAll(c.filePath)
-	}
-
-	succ := c.closed.CompareAndSwap(false, true)
-	if !succ {
+	if c.isClosed() {
 		return NewErrCacheClosed(c.filePath)
 	}
 
-	err := c.mmap.Unmap()
-	if err != nil {
-		e = errors.Join(e, fmt.Errorf("error unmapping mmap: %w", err))
+	c.closed.Store(true)
+
+	if c.mmap != nil {
+		if err := c.mmap.Unmap(); err != nil {
+			e = errors.Join(e, fmt.Errorf("error unmapping mmap: %w", err))
+		}
+
+		// Nil the mapping under the lock that guards every accessor: after
+		// this point nothing can dereference the unmapped region, and every
+		// accessor reports the close instead of silently no-oping.
+		c.mmap = nil
 	}
 
 	// TODO: Move to to the scope of the caller
@@ -486,13 +492,29 @@ func (c *Cache) Size() (int64, error) {
 	return c.size, nil
 }
 
-// Slice returns a slice of the mmap.
-// When using Slice you must ensure thread safety, ideally by only writing to the same block once and the exposing the slice.
+// Slice returns an owned copy of the requested range of the cache. The caller
+// owns the returned buffer, so reading it stays safe after the cache is closed
+// and its mapping is unmapped — no lock or lifetime contract crosses the
+// package boundary.
 func (c *Cache) Slice(off, length int64) ([]byte, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	if c.isClosed() {
 		return nil, NewErrCacheClosed(c.filePath)
 	}
 
+	slice, err := c.sliceLocked(off, length)
+	if err != nil {
+		return nil, err
+	}
+
+	return append([]byte(nil), slice...), nil
+}
+
+// sliceLocked returns the requested range of the mapping; the caller must
+// hold c.mu (read or write) for as long as it uses the alias.
+func (c *Cache) sliceLocked(off, length int64) ([]byte, error) {
 	if c.mmap == nil {
 		return nil, nil
 	}
@@ -506,9 +528,13 @@ func (c *Cache) Slice(off, length int64) ([]byte, error) {
 	return nil, BytesNotAvailableError{}
 }
 
-// sliceDirect returns a slice of the mmap without checking isCached.
-// Used by the streaming chunker after the waiter mechanism has confirmed data availability.
+// sliceDirect returns an owned copy of the requested range without checking
+// isCached. Used by the streaming chunker after the waiter mechanism has
+// confirmed data availability.
 func (c *Cache) sliceDirect(off, length int64) ([]byte, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	if c.isClosed() {
 		return nil, NewErrCacheClosed(c.filePath)
 	}
@@ -523,7 +549,7 @@ func (c *Cache) sliceDirect(off, length int64) ([]byte, error) {
 
 	end := min(off+length, c.size)
 
-	return (*c.mmap)[off:end], nil
+	return append([]byte(nil), (*c.mmap)[off:end]...), nil
 }
 
 // Zero blocks are treated as cached: the mmap region reads back as zero (punched).
@@ -551,32 +577,28 @@ func (c *Cache) punchHole(off, length int64) {
 // WriteAtShared is WriteAt under the read (shared) lock: callers that
 // already guarantee exactly one writer per block — the CoW window's claim
 // map — proceed in parallel with each other, while Close, which takes the
-// write lock before unmapping, is structurally excluded. The exclusion is
-// load-bearing: Close unmaps without nil'ing c.mmap, so WriteAtWithoutLock's
-// guards cannot detect a closed cache, and a write racing the unmap is a
-// SIGBUS that kills the whole process, not a failed write.
+// write lock before unmapping and nil'ing the mapping, is structurally
+// excluded for the whole write.
 func (c *Cache) WriteAtShared(b []byte, off int64) (int, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-
-	if c.mmap == nil {
-		return 0, nil
-	}
 
 	if c.isClosed() {
 		return 0, NewErrCacheClosed(c.filePath)
 	}
 
-	return c.WriteAtWithoutLock(b, off)
+	if c.mmap == nil {
+		return 0, nil
+	}
+
+	return c.writeAtWithoutLock(b, off)
 }
 
-// When using WriteAtWithoutLock you must ensure thread safety, ideally by only
-// writing to the same block once and then exposing the slice. The caller must
-// also exclude a concurrent Close for the write's whole duration (hold c.mu in
-// some mode, as WriteAt/WriteAtShared do): Close unmaps without nil'ing
-// c.mmap, so the guards below cannot detect it, and a write landing after the
-// unmap is a process-fatal SIGBUS.
-func (c *Cache) WriteAtWithoutLock(b []byte, off int64) (int, error) {
+// writeAtWithoutLock writes into the mapping. The caller must hold c.mu in
+// some mode for the whole write, as WriteAt, WriteAtShared and writeAtIfAbsent
+// do: Close unmaps and nils the mapping only under the write lock, so a write
+// that holds the lock can never land in unmapped memory.
+func (c *Cache) writeAtWithoutLock(b []byte, off int64) (int, error) {
 	if c.isClosed() {
 		return 0, NewErrCacheClosed(c.filePath)
 	}
@@ -630,12 +652,12 @@ func (c *Cache) WriteZeroesAt(off, length int64) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.mmap == nil {
-		return 0, nil
-	}
-
 	if c.isClosed() {
 		return 0, NewErrCacheClosed(c.filePath)
+	}
+
+	if c.mmap == nil {
+		return 0, nil
 	}
 
 	end := min(off+length, c.size)
@@ -660,19 +682,19 @@ func (c *Cache) writeAtIfAbsent(b []byte, off int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.mmap == nil {
-		return nil
-	}
-
 	if c.isClosed() {
 		return NewErrCacheClosed(c.filePath)
+	}
+
+	if c.mmap == nil {
+		return nil
 	}
 
 	if c.isCached(off, int64(len(b))) {
 		return nil
 	}
 
-	_, err := c.WriteAtWithoutLock(b, off)
+	_, err := c.writeAtWithoutLock(b, off)
 
 	return err
 }
@@ -730,32 +752,22 @@ func (c *Cache) FileSize(_ context.Context) (int64, error) {
 	return stat.Blocks * stBlockSize, nil
 }
 
-func (c *Cache) address(off int64) (*byte, error) {
-	if c.mmap == nil {
-		return nil, nil
-	}
-
-	if off >= c.size {
-		return nil, fmt.Errorf("offset %d is out of bounds", off)
-	}
-
-	return &(*c.mmap)[off], nil
-}
-
-// addressBytes returns a slice of the mmap and a function to release the read lock which blocks the cache from being closed.
+// addressBytes returns an alias of the mmap and a function that releases the
+// read lease: the read lock is held until the caller calls release, so Close
+// cannot unmap the range while the caller accesses it.
 func (c *Cache) addressBytes(off, length int64) ([]byte, func(), error) {
 	c.mu.RLock()
-
-	if c.mmap == nil {
-		c.mu.RUnlock()
-
-		return nil, func() {}, nil
-	}
 
 	if c.isClosed() {
 		c.mu.RUnlock()
 
 		return nil, func() {}, NewErrCacheClosed(c.filePath)
+	}
+
+	if c.mmap == nil {
+		c.mu.RUnlock()
+
+		return nil, func() {}, nil
 	}
 
 	if off >= c.size {
@@ -821,11 +833,24 @@ func (c *Cache) copyProcessMemory(
 			for i, r := range batch {
 				remote[i] = unix.RemoteIovec{Base: uintptr(r.Start), Len: int(r.Size)}
 			}
-			address, err := c.address(off)
+			// Lease the destination range for the whole syscall: the kernel
+			// writes into the mapping, so Close must not unmap it before the
+			// readv returns.
+			address, releaseLock, err := c.addressBytes(off, batchBytes)
 			if err != nil {
 				return fmt.Errorf("failed to get address: %w", err)
 			}
-			local := []unix.Iovec{{Base: address, Len: uint64(batchBytes)}}
+			defer releaseLock()
+
+			if batchBytes == 0 {
+				return nil
+			}
+
+			if int64(len(address)) != batchBytes {
+				return fmt.Errorf("cache range %d-%d is shorter than the memory batch (%d < %d)", off, off+batchBytes, len(address), batchBytes)
+			}
+
+			local := []unix.Iovec{{Base: &address[0], Len: uint64(batchBytes)}}
 
 			for {
 				select {
