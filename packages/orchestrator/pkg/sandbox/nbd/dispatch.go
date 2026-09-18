@@ -44,6 +44,45 @@ var dispatchBufPool = sync.Pool{
 	},
 }
 
+// dispatchWriteBufPool pools the body scratch for write requests that fit the
+// base class (dispatchBufferSize). Requests larger than that allocate exactly
+// their length, as they always have: a sync.Pool can retain up to one buffer
+// per P, so pooling the 32 MiB ceiling would put gigabytes of retention on a
+// large node (INV-7). The pool exists because every write request used to
+// allocate its body inline on the read loop (S-31).
+var dispatchWriteBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, dispatchBufferSize)
+
+		return &b
+	},
+}
+
+// acquireWriteData returns a buffer of at least length bytes and the pooled
+// holder that releases it. The holder is nil for a request above the base
+// class, where the buffer is allocated exactly and releaseWriteData is a no-op.
+func acquireWriteData(length uint32) ([]byte, *[]byte) {
+	if length > dispatchBufferSize {
+		return make([]byte, length), nil
+	}
+
+	pooled := dispatchWriteBufPool.Get().(*[]byte)
+
+	return (*pooled)[:length], pooled
+}
+
+// releaseWriteData returns a pooled write buffer. It is nil-safe so callers can
+// release unconditionally, and it must only be called once the backend is done
+// with the bytes: WriteAt may not retain the slice, but the write goroutine can
+// outlive the request loop on the ctx.Done() path (S-31).
+func releaseWriteData(pooled *[]byte) {
+	if pooled == nil {
+		return
+	}
+
+	dispatchWriteBufPool.Put(pooled)
+}
+
 type Provider interface {
 	ReadAt(ctx context.Context, p []byte, off int64) (int, error)
 	Size(ctx context.Context) (int64, error)
@@ -169,7 +208,9 @@ func (d *Dispatch) writeResponse(respError uint32, respHandle uint64, chunk []by
 }
 
 /**
- * This dispatches incoming NBD requests sequentially to the provider.
+ * Handle reads incoming NBD requests one at a time and dispatches each to the
+ * provider. Reads and writes run in their own goroutines, so the loop keeps
+ * draining the socket instead of waiting on the backend.
  *
  */
 func (d *Dispatch) Handle(ctx context.Context) error {
@@ -236,7 +277,7 @@ func (d *Dispatch) Handle(ctx context.Context) error {
 					return fmt.Errorf("nbd write request length %d exceeds maximum %d", request.Length, dispatchMaxWriteBufferSize)
 				}
 
-				data := make([]byte, request.Length)
+				data, pooledData := acquireWriteData(request.Length)
 
 				dataCopied := copy(data, buffer[rp:wp])
 
@@ -248,6 +289,8 @@ func (d *Dispatch) Handle(ctx context.Context) error {
 				for dataCopied < int(request.Length) {
 					n, err := d.fp.Read(data[dataCopied:])
 					if err != nil {
+						releaseWriteData(pooledData)
+
 						return fmt.Errorf("nbd write read error: %w", err)
 					}
 
@@ -255,15 +298,24 @@ func (d *Dispatch) Handle(ctx context.Context) error {
 
 					select {
 					case err := <-d.fatal:
+						releaseWriteData(pooledData)
+
 						return err
 					case <-ctx.Done():
+						releaseWriteData(pooledData)
+
 						return ctx.Err()
 					default:
 					}
 				}
 
-				err := d.cmdWrite(ctx, request.Handle, request.From, data)
+				// cmdWrite takes ownership of the buffer on success and releases
+				// it in the goroutine that owns the bytes until WriteAt returns;
+				// on error nothing was retained, so release here (S-31).
+				err := d.cmdWrite(ctx, request.Handle, request.From, data, pooledData)
 				if err != nil {
+					releaseWriteData(pooledData)
+
 					return err
 				}
 			case NBDCmdWriteZeroes, NBDCmdTrim:
@@ -376,7 +428,7 @@ func (d *Dispatch) cmdRead(ctx context.Context, cmdHandle uint64, cmdFrom uint64
 	return nil
 }
 
-func (d *Dispatch) cmdWrite(ctx context.Context, cmdHandle uint64, cmdFrom uint64, cmdData []byte) error {
+func (d *Dispatch) cmdWrite(ctx context.Context, cmdHandle uint64, cmdFrom uint64, cmdData []byte, pooledData *[]byte) error {
 	d.shuttingDownLock.Lock()
 	if d.shuttingDown {
 		d.shuttingDownLock.Unlock()
@@ -391,6 +443,12 @@ func (d *Dispatch) cmdWrite(ctx context.Context, cmdHandle uint64, cmdFrom uint6
 		// buffered to avoid goroutine leak
 		errchan := make(chan error, 1)
 		go func() {
+			// The buffer belongs to this goroutine until WriteAt returns: on
+			// the ctx.Done() path below performWrite returns while this
+			// goroutine may still be inside WriteAt, so release only here
+			// (S-31).
+			defer releaseWriteData(pooledData)
+
 			// Even a write can fault: a store to a non-resident page pages
 			// it in first.
 			errchan <- block.RunFaultSafe(ctx, func() error {
