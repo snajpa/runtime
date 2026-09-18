@@ -76,10 +76,11 @@ prefer cloning the repo inside the VM so builds run on the VM disk.
 
 - The host must have nested virtualization (this host: `kvm_amd nested=1`), so
   Firecracker and `/dev/kvm` work inside the VM. The runner uses `-cpu host`.
-- `ublk_drv` is probed by the boot check. If the HWE kernel does not ship it,
-  the ublk work needs a newer kernel or a switch of the dev VM to Ubuntu 26.04
-  (kernel 7.0, per `embed/compose/README.md`); the runner takes a different
-  image via `E2B_DEV_VM_IMAGE` if needed.
+- `ublk_drv` is present in the HWE kernel (validated 2026-09-18: Ubuntu
+  24.04.5, kernel 7.0.0-31-generic, module at
+  `/lib/modules/7.0.0-31-generic/kernel/drivers/block/ublk_drv.ko.zst`), so
+  the ublk transport can be developed here directly. The runner accepts a
+  different image via `E2B_DEV_VM_IMAGE` if a future kernel change needs it.
 - Template artifacts (kernels, firecrackers) are downloaded by the repo's
   `make download-public-*` targets, which expect `gsutil`; do that on the host
   (the dev shell has the Google Cloud SDK) and transfer, or install `gsutil`

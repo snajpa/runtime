@@ -88,6 +88,7 @@ let
           uname -r
           getconf PAGESIZE
           modprobe nbd nbds_max=4096 max_part=16
+          modprobe ublk_drv || echo "ublk_drv: not available on this kernel"
           lsmod | grep -E '^(nbd|ublk_drv)'
           ls -l /dev/kvm /dev/net/tun
           [ -f /sys/fs/cgroup/cgroup.controllers ] && echo "cgroup v2: yes"
