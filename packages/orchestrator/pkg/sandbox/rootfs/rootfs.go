@@ -15,6 +15,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
@@ -75,4 +77,30 @@ func flush(ctx context.Context, path string) error {
 	}
 
 	return nil
+}
+
+// NewOverlayProvider builds the overlay provider a sandbox runs its rootfs on:
+// the ublk transport when the feature flag selects it, the NBD transport
+// otherwise.
+//
+// A host that has the flag on but no usable ublk driver falls back to NBD with
+// the error logged, so a misconfiguration costs the transport, not the
+// sandboxes.
+func NewOverlayProvider(
+	ctx context.Context,
+	rootfs block.ReadonlyDevice,
+	cachePath string,
+	devicePool *nbd.DevicePool,
+	featureFlags *featureflags.Client,
+) (Provider, error) {
+	if featureFlags.BoolFlag(ctx, featureflags.UblkRootfsFlag) {
+		provider, err := NewUblkProvider(ctx, rootfs, cachePath, featureFlags)
+		if err == nil {
+			return provider, nil
+		}
+
+		logger.L().Error(ctx, "ublk transport unavailable, falling back to NBD", zap.Error(err))
+	}
+
+	return NewNBDProvider(ctx, rootfs, cachePath, devicePool, featureFlags)
 }
