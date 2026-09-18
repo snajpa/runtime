@@ -515,6 +515,21 @@ var (
 	// as guest I/O errors. Disabled by default.
 	NBDAsyncWriteZeroesFlag = NewBoolFlag("nbd-async-write-zeroes", false)
 
+	// UblkRootfsFlag selects the ublk transport for the sandbox rootfs device
+	// instead of NBD. It needs ublk_drv and /dev/ublk-control on the host; a
+	// host that has the flag on but no driver logs the failure and falls back
+	// to NBD. Disabled by default.
+	UblkRootfsFlag = NewBoolFlag("ublk-rootfs", false)
+
+	// UblkQueuesFlag is the number of hardware queues per ublk device. Every
+	// queue is served by one dedicated daemon task, so it is also the number
+	// of requests the device serves at a time.
+	UblkQueuesFlag = NewIntFlag("ublk-queues", 1)
+
+	// UblkQueueDepthFlag is the number of tags per ublk queue: how many
+	// requests the kernel may have in flight on one queue.
+	UblkQueueDepthFlag = NewIntFlag("ublk-queue-depth", 64)
+
 	// MemoryPrefetchMaxFetchWorkers is the maximum number of parallel fetch workers per sandbox for memory prefetching.
 	// Fetching is I/O bound so we can have more parallelism.
 	MemoryPrefetchMaxFetchWorkers = NewIntFlag("memory-prefetch-max-fetch-workers", 16)
