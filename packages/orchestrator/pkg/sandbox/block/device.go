@@ -21,11 +21,20 @@ type FramedReader interface {
 	ReadAt(ctx context.Context, p []byte, off int64, ft *storage.FrameTable) (int, error)
 }
 
+// FramedSlicer returns a caller-owned copy of [off, off+length) resolved
+// against the supplied frame table. Implementations clamp the range to the
+// object's size, so the result may be shorter than length.
 type FramedSlicer interface {
 	Slice(ctx context.Context, off, length int64, ft *storage.FrameTable) ([]byte, error)
 }
 
 // Slicer provides plain block reads (no FrameTable). Used by UFFD/NBD.
+//
+// Slice returns a caller-owned copy of [off, off+length), clamped to the device
+// size: the result may be shorter than length, a range starting past the end is
+// empty, and the caller may retain or mutate the bytes. Implementations must not
+// alias an internal cache slice. Callers that read large ranges should prefer
+// ReadAt into their own buffer to avoid the copy.
 type Slicer interface {
 	Slice(ctx context.Context, off, length int64) ([]byte, error)
 	BlockSize() int64

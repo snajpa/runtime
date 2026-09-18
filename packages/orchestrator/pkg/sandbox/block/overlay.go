@@ -62,7 +62,11 @@ func (o *Overlay) ReadAt(ctx context.Context, p []byte, off int64) (int, error) 
 	blocks := header.BlocksOffsets(int64(len(p)), o.blockSize)
 
 	for _, blockOff := range blocks {
-		buf := p[blockOff : blockOff+o.blockSize]
+		// The trailing chunk is partial when len(p) is not a block multiple;
+		// clamp it to the buffer so a shortened read cannot overrun it. For
+		// block-aligned offsets the chunk still lies within one block, so the
+		// per-block fallback below stays correct.
+		buf := p[blockOff:min(blockOff+o.blockSize, int64(len(p)))]
 		blockAbsOff := off + blockOff
 
 		// 1. writable cache
@@ -185,12 +189,43 @@ func (o *Overlay) ExportDiffInPlace(ctx context.Context, out *os.File) (*header.
 	return o.cache.Load().ExportToDiff(ctx, out)
 }
 
-// This method will not be very optimal if the length is not the same as the block size, because we cannot be just exposing the cache slice,
-// but creating and copying the bytes from the cache and device to the new slice.
+// Slice returns a caller-owned copy of [off, off+length), resolved through the
+// same layered read chain as ReadAt: writable cache, then a sealing cache if a
+// swap is outstanding, then the base device. The range is clamped to the device
+// size, so the result may be shorter than length and a range starting past the
+// end is empty.
 //
-// When we are implementing this we might want to just enforce the length to be the same as the block size.
-func (o *Overlay) Slice(_ context.Context, _, _ int64) ([]byte, error) {
-	return nil, errors.New("not implemented")
+// The copy is inherent: a block resolves across up to three layers, so there is
+// no single cache slice to expose. Callers reading large ranges should prefer
+// ReadAt into their own buffer.
+func (o *Overlay) Slice(ctx context.Context, off, length int64) ([]byte, error) {
+	if length <= 0 || off < 0 {
+		return []byte{}, nil
+	}
+
+	size, err := o.device.Size(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	end := min(off+length, size)
+	if end <= off {
+		return []byte{}, nil
+	}
+
+	// Read block-aligned and trim. ReadAt resolves whole blocks per layer, so a
+	// byte-granular range must be backed by an aligned read and then trimmed —
+	// slicing whole blocks out of an exactly-sized buffer panics on any range
+	// that is not block-aligned (S-24; reviewer0's partial-block probe).
+	alignedStart := off - off%o.blockSize
+	alignedEnd := ((end + o.blockSize - 1) / o.blockSize) * o.blockSize
+
+	out := make([]byte, alignedEnd-alignedStart)
+	if _, err := o.ReadAt(ctx, out, alignedStart); err != nil {
+		return nil, err
+	}
+
+	return out[off-alignedStart : end-alignedStart], nil
 }
 
 func (o *Overlay) WriteAt(p []byte, off int64) (int, error) {
