@@ -236,7 +236,7 @@ Key mechanisms (all under `pkg/sandbox/`):
   read-only; writes go to a per-sandbox COW cache exposed to Firecracker as a block device served
   in-process, either as an NBD device (default) or as a ublk device (`ublk/`, `/dev/ublkbN`) when
   the `ublk-rootfs` flag is on; a host with the flag on but no usable ublk driver logs the failure
-  and falls back to NBD. On pause, the dirty blocks are exported as a diff.
+  and falls back to NBD. On pause, the dirty blocks are exported as a diff. The ublk transport's requirements, design and implementation are documented in [`ublk-transport.md`](ublk-transport.md).
 - **Template cache** (`template/`): templates are fetched lazily from object storage and cached
   on local disk (and optionally on a shared NFS chunk cache, or fetched peer-to-peer from other
   nodes before upload completes).
