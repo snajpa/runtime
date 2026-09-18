@@ -32,6 +32,11 @@ type Memfd struct {
 	mmap []byte
 }
 
+// Size reports the mapped length of the memfd in bytes.
+func (m *Memfd) Size() int64 {
+	return int64(len(m.mmap))
+}
+
 func NewFromFd(fd int) (*Memfd, error) {
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
@@ -357,8 +362,9 @@ type DedupedMemfdCache struct {
 // memfdSwapGrace bounds how long runDedup keeps the memfd mapped waiting for the
 // provisional→deduped header swap, so a failed or absent swap can't leak the
 // mapping. The swap normally completes before the drain does (it only waits on
-// the compare), so this grace is a backstop, not the common path.
-const memfdSwapGrace = 30 * time.Second
+// the compare), so this grace is a backstop, not the common path. It is a var
+// only so tests can shorten the grace; production never writes it.
+var memfdSwapGrace = 30 * time.Second
 
 // swapGraceElapsedCounter counts memfd releases that fell back to the grace
 // timeout because no swap signal arrived. Expected to be ~0 (the swap normally
@@ -380,6 +386,15 @@ var swapGraceElapsedCounter = utils.Must(otel.Meter("github.com/e2b-dev/infra/pa
 var inflightServePagesCounter = utils.Must(otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block").
 	Int64Counter("orchestrator.memfd.inflight_serve_pages",
 		metric.WithDescription("Guest pages served from the still-mapped memfd during dedup (in-flight memfd serving)")))
+
+// memfdHeldBytes accounts the guest-RAM-sized memfd footprint a dedup cache
+// holds while serving provisional reads: added by adoptMemfd, subtracted by
+// releaseMemfd (the single, nil-checked release choke point), so the counter
+// returns to zero on every path and a spike in concurrently held memfds is
+// visible and alertable (INV-7).
+var memfdHeldBytes = utils.Must(otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block").
+	Int64UpDownCounter("orchestrator.memfd.held_bytes",
+		metric.WithDescription("Memfd bytes held for dedup/provisional serving")))
 
 // inflightServe{Provisional,Drain}Attr tag which serving path recorded a page:
 // the provisional compare window (ServeMemfd, identity offsets) or the in-flight
@@ -503,7 +518,7 @@ func (d *DedupedMemfdCache) runDedup(
 	compareDur := time.Since(compareStart)
 	if err != nil {
 		logSetOnceErr(ctx, "dedup metaOut", metaOut.SetError(err))
-		logSetOnceErr(ctx, "dedup done", d.done.SetError(errors.Join(err, d.releaseMemfd())))
+		logSetOnceErr(ctx, "dedup done", d.done.SetError(errors.Join(err, d.releaseMemfd(ctx))))
 
 		return
 	}
@@ -530,10 +545,7 @@ func (d *DedupedMemfdCache) runDedup(
 	// take mu.RLock; the drain's close below takes mu.Lock, so the memfd is never
 	// unmapped under an in-flight reader.
 	if d.inflight {
-		d.mu.Lock()
-		d.index = buildPackedIndex(plan.pageDirty)
-		d.memfd = memfd
-		d.mu.Unlock()
+		d.adoptMemfd(ctx, memfd, buildPackedIndex(plan.pageDirty))
 	}
 
 	logSetOnceErr(ctx, "dedup metaOut", metaOut.SetValue(meta))
@@ -561,7 +573,7 @@ func (d *DedupedMemfdCache) runDedup(
 			logger.L().Warn(ctx, "memfd swap grace elapsed; releasing memfd without a swap signal")
 		}
 	}
-	if closeErr := d.releaseMemfd(); closeErr != nil {
+	if closeErr := d.releaseMemfd(ctx); closeErr != nil {
 		logger.L().Warn(ctx, "close memfd after dedup drain", zap.Error(closeErr))
 	}
 }
@@ -665,12 +677,24 @@ func (d *DedupedMemfdCache) waitBounded() (*Cache, error) {
 
 // releaseMemfd closes the memfd exactly once, under the write lock so it can't
 // be unmapped beneath an in-flight ServeMemfd/tryInflightRead reader.
-func (d *DedupedMemfdCache) releaseMemfd() error {
+// adoptMemfd publishes the memfd and its packed index for provisional serving
+// (before metaOut resolves, so a provisional read never sees a nil index) and
+// accounts the bytes the hold keeps mapped until releaseMemfd.
+func (d *DedupedMemfdCache) adoptMemfd(ctx context.Context, memfd *Memfd, index packedIndex) {
+	d.mu.Lock()
+	d.index = index
+	d.memfd = memfd
+	memfdHeldBytes.Add(ctx, memfd.Size())
+	d.mu.Unlock()
+}
+
+func (d *DedupedMemfdCache) releaseMemfd(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.memfd == nil {
 		return nil
 	}
+	memfdHeldBytes.Add(ctx, -d.memfd.Size())
 	err := d.memfd.Close()
 	d.memfd = nil
 
@@ -754,8 +778,9 @@ func (s *MemfdIdentitySource) Slice(off, length int64) ([]byte, error) {
 
 // IsCached reports the range as resident while the memfd is mapped. It satisfies
 // the CachePeeker contract for callers that hold a *MemfdIdentitySource directly
-// (e.g. the block-level tests). Note the wrapping *build.localDiff does not
-// promote this method, so build.File.IsCached does not reach it today.
+// (e.g. the block-level tests), and *build.localDiff forwards residency queries
+// to it, so build.File.IsCached sees a provisional range as resident while the
+// memfd is mapped and uncached once it has been released.
 func (s *MemfdIdentitySource) IsCached(_ context.Context, off, length int64) bool {
 	s.d.mu.RLock()
 	defer s.d.mu.RUnlock()

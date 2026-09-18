@@ -108,7 +108,10 @@ type localDiff struct {
 	cache    block.DiffSource
 }
 
-var _ Diff = (*localDiff)(nil)
+var (
+	_ Diff              = (*localDiff)(nil)
+	_ block.CachePeeker = (*localDiff)(nil)
+)
 
 func NewLocalDiffFromCache(
 	cacheKey DiffStoreKey,
@@ -164,4 +167,21 @@ func (b *localDiff) CacheKey() DiffStoreKey {
 
 func (b *localDiff) BlockSize() int64 {
 	return b.cache.BlockSize()
+}
+
+// IsCached reports whether [off, off+length) is resident in the wrapped
+// source. Sources that can answer residency queries (block.CachePeeker) are
+// consulted, in particular the memfd-backed provisional source, which reports
+// the range as resident while the memfd is mapped and uncached once it has
+// been released. Sources that cannot answer (the file-backed *block.Cache
+// keeps its presence tracker internal) report not cached, which is the
+// conservative answer for the dedup best-effort peek: an uncached page is
+// stored as current instead of being read from the base (S-35).
+func (b *localDiff) IsCached(ctx context.Context, off, length int64) bool {
+	peeker, ok := b.cache.(block.CachePeeker)
+	if !ok {
+		return false
+	}
+
+	return peeker.IsCached(ctx, off, length)
 }
