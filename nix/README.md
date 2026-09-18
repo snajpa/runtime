@@ -81,7 +81,41 @@ prefer cloning the repo inside the VM so builds run on the VM disk.
   `/lib/modules/7.0.0-31-generic/kernel/drivers/block/ublk_drv.ko.zst`), so
   the ublk transport can be developed here directly. The runner accepts a
   different image via `E2B_DEV_VM_IMAGE` if a future kernel change needs it.
-- Template artifacts (kernels, firecrackers) are downloaded by the repo's
-  `make download-public-*` targets, which expect `gsutil`; do that on the host
-  (the dev shell has the Google Cloud SDK) and transfer, or install `gsutil`
-  in the VM.
+## Running the ublk transport tests in the VM
+
+The kernel-touching tests build on the host and run inside the VM, so the host
+never creates ublk devices:
+
+```sh
+# on the host
+go test -c -o /tmp/ublk.test ./packages/orchestrator/pkg/sandbox/ublk/
+go test -c -o /tmp/rootfs.test ./packages/orchestrator/pkg/sandbox/rootfs/
+scp -P 2222 /tmp/ublk.test /tmp/rootfs.test dev@127.0.0.1:/tmp/
+
+# in the VM
+sudo modprobe ublk_drv     # not loaded by default after a reboot
+sudo /tmp/ublk.test -test.v
+sudo /tmp/rootfs.test -test.run TestUblkProviderOverlayLifecycle -test.v
+```
+
+Prerequisites inside the VM:
+
+- root, and `/dev/kvm` for the Firecracker guest tests (the runner enables
+  nested virtualization with `-cpu host`);
+- `fio`, `mkfs.ext4` and `debugfs` for the device tests (all in the image);
+- `busybox-static` (`/bin/busybox`) for the rootfs the guest tests build:
+  `sudo apt-get install -y busybox-static`;
+- a kernel and a Firecracker binary for the guest tests, passed as
+  `UBLK_TEST_KERNEL` and `UBLK_TEST_FIRECRACKER`. The public artifacts work and
+  need no credentials, over plain HTTPS:
+  `https://storage.googleapis.com/e2b-artifact-binaries/kernels/vmlinux-6.1.158/vmlinux.bin`
+  and
+  `https://storage.googleapis.com/e2b-artifact-binaries/firecrackers/v1.14-0.2.0/amd64/firecracker`.
+  `UBLK_TEST_BUSYBOX` overrides the busybox path. The guest tests skip when the
+  artifacts are missing, the same way the fio tests skip without fio.
+
+If a test kills a daemon with a request still in flight, the device it leaves
+behind can wedge the driver's control mutex, and every later device operation
+blocks with it. Reboot the VM in that case instead of hunting the device: the
+daemon-side fix is in the transport, but a device already in that state cannot
+be cleaned up any other way.
