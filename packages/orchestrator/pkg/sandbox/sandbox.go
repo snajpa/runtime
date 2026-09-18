@@ -855,7 +855,7 @@ func (f *Factory) CreateSandbox(
 
 	var rootfsProvider rootfs.Provider
 	if rootfsCachePath == "" {
-		rootfsProvider, err = rootfs.NewNBDProvider(
+		rootfsProvider, err = rootfs.NewOverlayProvider(
 			ctx,
 			rootFS,
 			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
@@ -1344,7 +1344,7 @@ func (f *Factory) ResumeSandbox(
 
 		telemetry.ReportEvent(ctx, "got template rootfs")
 
-		overlay, err := rootfs.NewNBDProvider(
+		overlay, err := rootfs.NewOverlayProvider(
 			ctx,
 			readonlyRootfs,
 			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),

@@ -232,9 +232,11 @@ Key mechanisms (all under `pkg/sandbox/`):
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
-- **Copy-on-write rootfs** (`rootfs/`, `nbd/`, `block/`): the template rootfs stays read-only;
-  writes go to a per-sandbox COW cache exposed to Firecracker as an NBD block device served by
-  an in-process userspace NBD server. On pause, the dirty blocks are exported as a diff.
+- **Copy-on-write rootfs** (`rootfs/`, `nbd/`, `ublk/`, `block/`): the template rootfs stays
+  read-only; writes go to a per-sandbox COW cache exposed to Firecracker as a block device served
+  in-process, either as an NBD device (default) or as a ublk device (`ublk/`, `/dev/ublkbN`) when
+  the `ublk-rootfs` flag is on; a host with the flag on but no usable ublk driver logs the failure
+  and falls back to NBD. On pause, the dirty blocks are exported as a diff.
 - **Template cache** (`template/`): templates are fetched lazily from object storage and cached
   on local disk (and optionally on a shared NFS chunk cache, or fetched peer-to-peer from other
   nodes before upload completes).
@@ -396,7 +398,7 @@ sequenceDiagram
     API->>API: best-of-K placement → pick node
     API->>O: gRPC SandboxService.Create(SandboxConfig)
     O->>O: fetch template (local cache / NFS / object storage)
-    O->>O: acquire network slot + NBD rootfs overlay + uffd memory
+    O->>O: acquire network slot + rootfs overlay (NBD/ublk) + uffd memory
     O->>FC: load snapshot, resume VM
     O->>E: POST /init (env vars, access token) — retried until ready
     E-->>O: 204
@@ -560,7 +562,7 @@ sequenceDiagram
   rescue and a legacy sync-fallback filesystem-only snapshot both mount a consistent disk. It
   replays and exits without a full consistency scan, so the cost is bounded by journal content,
   not filesystem size. Runs under the same confinement as the offline envd swap (unprivileged
-  transient unit, device access pinned to the sandbox's own NBD node). A clean replay boots;
+  transient unit, device access pinned to the sandbox's own device node). A clean replay boots;
   anything else fails the start with the snapshot untouched but stays retryable. Journal replay
   never condemns a snapshot: its exit codes cannot tell an unmountable filesystem apart from a
   transient device fault, so every non-replayed outcome — an operational failure (timeout, I/O,
