@@ -211,7 +211,11 @@ a 16 vCPU dev VM:
 table (`-bench BenchmarkTransportThroughput -benchtime=1x`, as root, in the dev
 VM). The numbers are one VM and one run each; the NBD side is the in-repo
 userspace server over the same cache, so the comparison is between transports,
-not storage backends.
+not storage backends. A second run of the same harness on the same VM moved the
+numbers by up to about 40% (NBD random read 24-57 MB/s, ublk sequential read
+1020-1637 MB/s), so the table is one sample of a range rather than a tight
+measurement, and the gap between the transports is an order of magnitude larger
+than that spread.
 
 ## References
 
