@@ -133,6 +133,12 @@ func (c cache) GetDetails() string {
 		c.rootPath, c.inner.GetDetails())
 }
 
+// Capabilities implements CapabilityReporter by forwarding the wrapped
+// provider's matrix — the cache layer does not change backend capabilities.
+func (c cache) Capabilities() Capabilities {
+	return CapabilitiesOf(c.inner)
+}
+
 func (c cache) deleteCachedObjectsWithPrefix(ctx context.Context, prefix string) {
 	fullPrefix := filepath.Join(c.rootPath, prefix)
 	if err := os.RemoveAll(fullPrefix); err != nil {

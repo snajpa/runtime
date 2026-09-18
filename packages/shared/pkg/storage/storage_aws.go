@@ -163,6 +163,22 @@ func (s *awsStorage) GetDetails() string {
 	return fmt.Sprintf("[AWS Storage, bucket set to %s]", s.bucketName)
 }
 
+// Capabilities implements CapabilityReporter. S3 batches up to 1000 deletes
+// per request, aborts multipart uploads, presigns upload URLs, and uses the
+// shared 5 MiB non-final part minimum; the shared layer does not read custom
+// metadata from S3 (no MetadataReader), so callers get ErrMetadataUnsupported
+// instead of object metadata.
+func (s *awsStorage) Capabilities() Capabilities {
+	return Capabilities{
+		Name:                 "s3",
+		DeleteBatchSize:      1000,
+		AbortUpload:          true,
+		SignedUploadURL:      true,
+		Multipart:            true,
+		MultipartMinPartSize: cloudMinPartSizeMB << 20,
+	}
+}
+
 func (s *awsStorage) UploadSignedURL(ctx context.Context, path string, ttl time.Duration) (UploadURL, error) {
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(s.bucketName),

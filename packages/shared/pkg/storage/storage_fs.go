@@ -58,6 +58,19 @@ func (s *fsStorage) GetDetails() string {
 	return fmt.Sprintf("[Local file storage, base path set to %s]", s.basePath)
 }
 
+// Capabilities implements CapabilityReporter. The filesystem provider deletes
+// a whole prefix with one RemoveAll (no batching), can discard the temp file
+// of an in-flight write, signs upload URLs only when the local upload
+// endpoint is configured, and has neither custom metadata nor multipart
+// uploads.
+func (s *fsStorage) Capabilities() Capabilities {
+	return Capabilities{
+		Name:            "fs",
+		AbortUpload:     true,
+		SignedUploadURL: s.uploadURL != "" && len(s.hmacKey) > 0,
+	}
+}
+
 func (s *fsStorage) UploadSignedURL(_ context.Context, path string, ttl time.Duration) (UploadURL, error) {
 	if s.uploadURL == "" || s.hmacKey == nil {
 		return UploadURL{}, errors.New("file system storage does not support signed URLs (no local upload endpoint configured)")
