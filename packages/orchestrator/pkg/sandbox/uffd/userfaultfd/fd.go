@@ -144,7 +144,7 @@ func getMsgArg(msg *UffdMsg) [24]byte {
 	return msg.arg
 }
 
-func getPagefaultAddress(pagefault *UffdPagefault) uintptr {
+func getPagefaultAddress(pagefault UffdPagefault) uintptr {
 	return uintptr(pagefault.address)
 }
 

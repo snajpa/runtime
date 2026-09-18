@@ -8,8 +8,8 @@ import "sync"
 // retried on the next poll iteration. Safe for concurrent push.
 type deferredFaults struct {
 	mu    sync.Mutex
-	pf    []*UffdPagefault
-	byKey map[deferredKey]*UffdPagefault
+	pf    []UffdPagefault
+	byKey map[deferredKey]int
 }
 
 // deferredKey dedupes deferred faults per (page, fault kind). WP faults must
@@ -31,28 +31,28 @@ type deferredKey struct {
 // the same page is missing-faulted as both read and write, the retained fault
 // is upgraded to write so the retry installs it dirty instead of leaving a
 // later WP fault to catch it.
-func (d *deferredFaults) push(pf *UffdPagefault) {
+func (d *deferredFaults) push(pf UffdPagefault) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.byKey == nil {
-		d.byKey = make(map[deferredKey]*UffdPagefault)
+		d.byKey = make(map[deferredKey]int)
 	}
 	key := deferredKey{
 		addr: uint64(pf.address),
 		wp:   pf.flags&UFFD_PAGEFAULT_FLAG_WP != 0,
 	}
-	if existing, ok := d.byKey[key]; ok {
+	if i, ok := d.byKey[key]; ok {
 		if pf.flags&UFFD_PAGEFAULT_FLAG_WRITE != 0 {
-			existing.flags |= UFFD_PAGEFAULT_FLAG_WRITE
+			d.pf[i].flags |= UFFD_PAGEFAULT_FLAG_WRITE
 		}
 
 		return
 	}
-	d.byKey[key] = pf
+	d.byKey[key] = len(d.pf)
 	d.pf = append(d.pf, pf)
 }
 
-func (d *deferredFaults) drain() []*UffdPagefault {
+func (d *deferredFaults) drain() []UffdPagefault {
 	d.mu.Lock()
 	out := d.pf
 	d.pf = nil

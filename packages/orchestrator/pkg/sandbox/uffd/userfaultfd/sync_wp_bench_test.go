@@ -181,7 +181,7 @@ func TestSyncWPFaultLatency(t *testing.T) {
 				nonWP++
 			}
 
-			addr := getPagefaultAddress(pf) &^ uintptr(pagesize-1)
+			addr := getPagefaultAddress(*pf) &^ uintptr(pagesize-1)
 			// mode 0 = clear WP + wake the blocked writer (no DONTWAKE).
 			if werr := fd.writeProtectRange(addr, uintptr(pagesize), uintptr(pagesize), 0); werr != nil {
 				done <- serveResult{resolved, nonWP, fmt.Errorf("unprotect: %w", werr)}
@@ -505,7 +505,7 @@ func runConcurrentSyncWP(t *testing.T, mem []byte, memStart uintptr, pagesize ui
 				}
 				arg := getMsgArg(msg)
 				pf := (*UffdPagefault)(unsafe.Pointer(&arg[0]))
-				workCh <- getPagefaultAddress(pf) &^ uintptr(pagesize-1)
+				workCh <- getPagefaultAddress(*pf) &^ uintptr(pagesize-1)
 			}
 		}
 	}()
