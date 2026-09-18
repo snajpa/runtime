@@ -71,9 +71,9 @@ func TestDecompressingCacheReader(t *testing.T) {
 		c := newTestCache(t)
 		framePath := makeFrameFilename(c.path, Range{Offset: 0, Length: len(compressed)})
 
-		var captured []byte
+		var captured capturedBytes
 		capturing := newCaptureReader(bytesRangeReader(compressed), len(compressed), true,
-			func(_ context.Context, frame []byte) { captured = frame })
+			func(_ context.Context, frame capturedBytes) { captured = frame })
 		rc, err := NewDecompressReader(capturing, CompressionLZ4, SourceFS, c.objType)
 		require.NoError(t, err)
 
@@ -106,9 +106,9 @@ func TestDecompressingCacheReader(t *testing.T) {
 		compressedProd := lz4CompressProd(t, original)
 		framePath := makeFrameFilename(c.path, Range{Offset: 0, Length: len(compressedProd)})
 
-		var captured []byte
+		var captured capturedBytes
 		capturing := newCaptureReader(bytesRangeReader(compressedProd), len(compressedProd), true,
-			func(_ context.Context, frame []byte) { captured = frame })
+			func(_ context.Context, frame capturedBytes) { captured = frame })
 		rc, err := NewDecompressReader(capturing, CompressionLZ4, SourceFS, c.objType)
 		require.NoError(t, err)
 
@@ -135,9 +135,9 @@ func TestDecompressingCacheReader(t *testing.T) {
 		c := newTestCache(t)
 		framePath := makeFrameFilename(c.path, Range{Offset: 0, Length: len(compressed)})
 
-		var captured []byte
+		var captured capturedBytes
 		capturing := newCaptureReader(bytesRangeReader(compressed), len(compressed), true,
-			func(_ context.Context, frame []byte) { captured = frame })
+			func(_ context.Context, frame capturedBytes) { captured = frame })
 		rc, err := NewDecompressReader(capturing, CompressionLZ4, SourceFS, c.objType)
 		require.NoError(t, err)
 

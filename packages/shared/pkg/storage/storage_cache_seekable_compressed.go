@@ -67,11 +67,11 @@ func (c *cachedSeekable) openReaderCompressed(ctx context.Context, offsetU int64
 	// The captureReader tees the raw compressed bytes into `captured`; write
 	// them back only if the frame decoded cleanly (Close error == nil), so a
 	// corrupt-but-right-sized frame is never cached.
-	var captured []byte
+	var captured capturedBytes
 	capturing := !skipCacheWriteback(ctx)
 	frameReader := raw
 	if capturing {
-		frameReader = newCaptureReader(raw, rng.Length, true, func(_ context.Context, frame []byte) {
+		frameReader = newCaptureReader(raw, rng.Length, true, func(_ context.Context, frame capturedBytes) {
 			captured = frame
 		})
 	}
@@ -84,9 +84,17 @@ func (c *cachedSeekable) openReaderCompressed(ctx context.Context, offsetU int64
 	}
 
 	return &closeHookReader{RangeReader: dec, onClose: func(ctx context.Context, err error) {
-		if err != nil || !capturing {
+		if !capturing {
 			return
 		}
+		if err != nil {
+			// A frame that did not decode cleanly is never cached: return the
+			// capture buffer.
+			captured.Release()
+
+			return
+		}
+
 		c.writeFrameBack(ctx, path, offsetU, rng.Length, innerSource, ct, captured)
 	}}, innerSource, nil
 }
@@ -115,27 +123,34 @@ func (r *closeHookReader) Close(ctx context.Context) (*ReadStats, error) {
 // writeFrameBack persists a fully-read compressed frame to the NFS cache in a
 // detached goroutine. Best-effort: a short frame is logged and skipped — the
 // caller already has valid decompressed bytes.
-func (c *cachedSeekable) writeFrameBack(ctx context.Context, framePath string, offset int64, expectedSize int, src Source, codec CompressionType, frame []byte) {
-	if !isCompleteRead(len(frame), expectedSize, nil) {
+func (c *cachedSeekable) writeFrameBack(ctx context.Context, framePath string, offset int64, expectedSize int, src Source, codec CompressionType, frame capturedBytes) {
+	if !isCompleteRead(len(frame.Bytes()), expectedSize, nil) {
 		logger.L().Warn(ctx, "compressed frame cache writeback short, skipping",
-			zap.Int("got", len(frame)), zap.Int("expected", expectedSize), zap.String("path", framePath))
+			zap.Int("got", len(frame.Bytes())), zap.Int("expected", expectedSize), zap.String("path", framePath))
+
+		frame.Release()
 
 		return
 	}
 
-	c.goCtx(ctx, func(ctx context.Context) {
+	admitted := c.goCtx(ctx, func(ctx context.Context) {
 		ctx, span := c.tracer.Start(ctx, "write compressed frame back to cache")
 		defer span.End()
 
 		start := time.Now()
-		err := c.writeToCache(ctx, offset, framePath, frame)
-		recordWriteback(ctx, time.Since(start), int64(len(frame)), c.objType, src, codec, TriggerRead, err)
+		err := c.writeToCache(ctx, offset, framePath, frame.Bytes())
+		recordWriteback(ctx, time.Since(start), int64(len(frame.Bytes())), c.objType, src, codec, TriggerRead, err)
+		frame.Release()
 
 		if err != nil && !errors.Is(err, lock.ErrLockAlreadyHeld) {
 			recordError(span, err)
 			logger.L().Warn(ctx, "failed to write frame back to cache", zap.Error(err))
 		}
 	})
+	if !admitted {
+		// The writeback queue was full: nothing consumes the capture.
+		frame.Release()
+	}
 }
 
 // makeFrameFilename returns the NFS cache path for a compressed frame.
