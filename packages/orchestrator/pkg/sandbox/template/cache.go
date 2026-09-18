@@ -30,10 +30,13 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-// How long to keep the template in the cache since the last access.
-// Should be longer than the maximum possible sandbox lifetime.
+// CacheExpiration is how long to keep the template in the cache since the last
+// access. Should be longer than the maximum possible sandbox lifetime. The
+// orchestrator server's uploaded-build hint follows this window (S-38);
+// long-running sandboxes can extend a specific entry beyond it (see
+// getTemplateWithFetch).
 const (
-	templateExpiration       = time.Hour * 25
+	CacheExpiration          = time.Hour * 25
 	templateExpirationBuffer = time.Hour
 
 	buildCacheTTL           = time.Hour * 25
@@ -73,7 +76,7 @@ func NewCache(
 	peers peerclient.Resolver,
 ) (*Cache, error) {
 	cache := ttlcache.New(
-		ttlcache.WithTTL[string, Template](templateExpiration),
+		ttlcache.WithTTL[string, Template](CacheExpiration),
 	)
 
 	cache.OnEviction(func(ctx context.Context, _ ttlcache.EvictionReason, item *ttlcache.Item[string, Template]) {
@@ -473,7 +476,7 @@ func cleanDir(path string) error {
 }
 
 func (c *Cache) getTemplateWithFetch(ctx context.Context, tmpl *storageTemplate, maxSandboxLengthHours int64) Template {
-	ttl := templateExpiration
+	ttl := CacheExpiration
 	if maxSandboxLengthHours > 0 {
 		ttl = max(ttl, time.Duration(maxSandboxLengthHours)*time.Hour+templateExpirationBuffer)
 	}
