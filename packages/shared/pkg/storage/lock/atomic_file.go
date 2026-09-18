@@ -68,6 +68,16 @@ func (f *AtomicImmutableFile) close(ctx context.Context, success bool) error {
 			return ReleaseLock(ctx, f.lockFile)
 		})
 
+		// fsync before the link publishes the file: a crash must not leave a
+		// visible cache entry whose contents were never flushed (REQ-C2).
+		if success {
+			if err = f.tempFile.Sync(); err != nil {
+				errs = append(errs, fmt.Errorf("failed to sync temp file: %w", err))
+
+				success = false
+			}
+		}
+
 		if err = f.tempFile.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close temp file: %w", err))
 		}
