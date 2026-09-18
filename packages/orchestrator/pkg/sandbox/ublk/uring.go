@@ -78,6 +78,8 @@ type ioUring struct {
 	sqMask  uint32
 	sqArray []byte
 
+	sqEntries uint32
+
 	cqHead *uint32
 	cqTail *uint32
 	cqMask uint32
@@ -151,6 +153,7 @@ func newIOUring(entries, flags uint32, sqeSize int) (*ioUring, error) {
 	r.sqTail = u32At(r.sqRing, getU32(params, ioUringParamsOffSQTail))
 	r.sqMask = getU32(r.sqRing, int(getU32(params, ioUringParamsOffSQMak)))
 	r.sqArray = r.sqRing[int(sqArrayOff):]
+	r.sqEntries = sqEntries
 	r.cqHead = u32At(r.cqRing, getU32(params, ioUringParamsOffCQHead))
 	r.cqTail = u32At(r.cqRing, getU32(params, ioUringParamsOffCQTail))
 	r.cqMask = getU32(r.cqRing, int(getU32(params, ioUringParamsOffCQMask)))
@@ -180,7 +183,17 @@ func (r *ioUring) close() {
 
 // getSQE returns a zeroed submission queue entry. The caller fills it and
 // submits it with flush.
+//
+// The ring has to be sized for the commands a caller can have in flight between
+// two flushes: a device keeps one command per tag pending, so its rings are
+// created with at least queue_depth entries. Filling the ring past its capacity
+// would overwrite a submission that has not been submitted yet, so it fails
+// loudly instead.
 func (r *ioUring) getSQE() []byte {
+	if r.tailLocal-r.submitted >= r.sqEntries {
+		panic("ublk: io_uring submission ring is full")
+	}
+
 	idx := r.tailLocal & r.sqMask
 	putU32(r.sqArray, int(idx)*4, idx)
 
