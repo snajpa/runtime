@@ -243,12 +243,12 @@ func (c *cachedSeekable) frameSink(ctx context.Context, ct CompressionType) Fram
 	}
 }
 
-// goCtx runs fn on c.wg with WithoutCancel so an in-flight cache write isn't
-// aborted when the upload's context is cancelled.
+// goCtx submits fn as a bounded, process-tracked cache fill on a
+// WithoutCancel context, so an in-flight cache write isn't aborted when the
+// upload's (or read's) context is cancelled; c.wg keeps the fill awaitable by
+// tests.
 func (c *cachedSeekable) goCtx(ctx context.Context, fn func(context.Context)) {
-	c.wg.Go(func() {
-		fn(context.WithoutCancel(ctx))
-	})
+	writebacks.submit(ctx, &c.wg, fn)
 }
 
 func (c *cachedSeekable) makeChunkFilename(offset int64) string {
@@ -297,7 +297,9 @@ func (c *cachedSeekable) validateReadParams(buffSize, offset int64) error {
 
 func (c *cachedSeekable) writeToCache(ctx context.Context, offset int64, finalPath string, bytes []byte) error {
 	// Lock contention surfaces as ErrLockAlreadyHeld; callers skip it as dedup.
-	lockFile, err := lock.TryAcquireLock(ctx, finalPath)
+	lockFile, err := retryContendedLock(ctx, writebackMaxAttempts, writebackRetryBackoff, func() (*os.File, error) {
+		return lock.TryAcquireLock(ctx, finalPath)
+	})
 	if err != nil {
 		return err
 	}
@@ -339,7 +341,9 @@ func (c *cachedSeekable) writeLocalSize(ctx context.Context, size int64) error {
 	finalFilename := c.sizeFilename()
 
 	// Try to acquire lock for this chunk write to NFS cache
-	lockFile, err := lock.TryAcquireLock(ctx, finalFilename)
+	lockFile, err := retryContendedLock(ctx, writebackMaxAttempts, writebackRetryBackoff, func() (*os.File, error) {
+		return lock.TryAcquireLock(ctx, finalFilename)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to acquire lock for local size: %w", err)
 	}

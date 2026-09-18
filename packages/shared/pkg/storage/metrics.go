@@ -24,12 +24,20 @@ const (
 	AttrFileType = "file_type"
 	AttrTrigger  = "trigger"
 	AttrProvider = "provider"
+	AttrReason   = "reason"
 )
 
 // Writeback triggers: a read-miss cache fill vs a build/store write-through.
 const (
 	TriggerRead  = "read"
 	TriggerWrite = "write"
+)
+
+// Causes for a cache fill dropped before it ran
+// (orchestrator.writeback.dropped).
+const (
+	ReasonWritebackQueueFull = "full"
+	ReasonWritebackDraining  = "draining"
 )
 
 const (
@@ -190,6 +198,22 @@ var (
 		"orchestrator.writeback",
 		"NFS cache write wall",
 		"Bytes written to NFS",
+	))
+
+	// writebackInFlight is the depth of the bounded writeback queue; dropped
+	// fills (queue full or draining) and contention retries are counted so a
+	// lost fill is never silent (REQ-C4, INV-10).
+	writebackInFlight = utils.Must(meter.Int64UpDownCounter(
+		"orchestrator.writeback.in_flight",
+		metric.WithDescription("Cache fills currently running (bounded writeback queue depth)"),
+	))
+	writebackDropped = utils.Must(meter.Int64Counter(
+		"orchestrator.writeback.dropped",
+		metric.WithDescription("Cache fills dropped because the writeback queue was full or draining"),
+	))
+	writebackRetries = utils.Must(meter.Int64Counter(
+		"orchestrator.writeback.retries",
+		metric.WithDescription("Cache fills that retried after losing the cache lock to another writer"),
 	))
 
 	// Size() transfers nothing, so duration + count only (no bytes counter).
