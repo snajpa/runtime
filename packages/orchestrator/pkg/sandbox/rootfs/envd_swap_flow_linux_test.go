@@ -37,6 +37,8 @@ const statNotFound = "/usr/bin/envd: File not found by ext2_lookup\n"
 // script writes dumpBody[phase] to the target path parsed out of the script, so the
 // production code's own file handling (pre-create, size check, hashing) still runs.
 type fakeDebugfs struct {
+	t        *testing.T
+	stageDir string
 	mu       sync.Mutex
 	phases   []string          // every phase invoked, in order
 	stdout   map[string]string // phase -> stdout
@@ -47,10 +49,14 @@ type fakeDebugfs struct {
 var dumpTargetRe = regexp.MustCompile(`^dump\s+\S+\s+(\S+)`)
 
 func (f *fakeDebugfs) io(stageDir string) swapIO {
-	return swapIO{stageDir: stageDir, run: f.run}
+	f.stageDir = stageDir
+
+	return swapIO{stageDir: stageDir, gid: -1, run: f.run}
 }
 
 func (f *fakeDebugfs) run(_ context.Context, phase, script string, _ bool) ([]byte, error) {
+	assertStagePrivate(f.t, f.stageDir)
+
 	f.mu.Lock()
 	f.phases = append(f.phases, phase)
 	f.mu.Unlock()
@@ -74,17 +80,42 @@ func (f *fakeDebugfs) ran(phase string) bool {
 	return slices.Contains(f.phases, phase)
 }
 
+// assertStagePrivate pins this item's property at every phase the fake serves:
+// nothing in the staging directory may be readable or writable by "other", so a
+// local user outside the jail's group can neither read the tenant's dumped
+// binary nor rewrite the bytes the swap classifies as evidence.
+func assertStagePrivate(t *testing.T, dir string) {
+	t.Helper()
+
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	assert.Zerof(t, info.Mode().Perm()&0o007, "staging dir %s must have no world bits", dir)
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	for _, entry := range entries {
+		fi, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		assert.Zerof(t, fi.Mode().Perm()&0o007, "staged file %s must have no world bits", entry.Name())
+	}
+}
+
 // newSwapFixture stages a source binary and returns the fake plus its swapIO.
 // `target` is the content the swap intends to install; `orig` what the rootfs held.
 func newSwapFixture(t *testing.T, target string) (*fakeDebugfs, swapIO, string) {
 	t.Helper()
 
 	stage := t.TempDir()
-	require.NoError(t, os.Chmod(stage, 0o755))
+	require.NoError(t, os.Chmod(stage, swapStageDirMode))
 	src := filepath.Join(t.TempDir(), "envd.src")
 	require.NoError(t, os.WriteFile(src, []byte(target), 0o755))
 
 	f := &fakeDebugfs{
+		t:        t,
 		stdout:   map[string]string{},
 		dumpBody: map[string]string{},
 		errs:     map[string]error{},
