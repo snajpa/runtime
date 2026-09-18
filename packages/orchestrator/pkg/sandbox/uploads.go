@@ -49,6 +49,23 @@ const (
 	// uploadDoneChannelPrefix is the Redis pub/sub channel prefix for per-build
 	// upload-finished signals. Empty payload = success; non-empty = upload error.
 	uploadDoneChannelPrefix = "orchestrator.upload.done." // followed by buildID String
+
+	// uploadLeaseKeyPrefix is the Redis key prefix for the uploader lease: a
+	// short-TTL, refreshed key that lets cross-orchestrator header waiters
+	// tell a live upload apart from a node that died (S-40). It is separate
+	// from the reader-facing peer routing key, whose semantics stay unchanged.
+	uploadLeaseKeyPrefix = "orchestrator.upload.lease." // followed by buildID String
+)
+
+// The lease timings are package vars so tests can shorten them; only tests
+// write them.
+var (
+	// uploadLeaseTTL bounds how long a waiter trusts an uploader that stops
+	// refreshing. It is refreshed at one third of the TTL while the upload runs.
+	uploadLeaseTTL = 60 * time.Second
+	// uploadLeaseMaxLifetime caps the heartbeat when an upload never signals a
+	// terminal outcome; it mirrors the upload retry window plus margin.
+	uploadLeaseMaxLifetime = 2*time.Hour + 5*time.Minute
 )
 
 type templateLookup interface {
@@ -61,14 +78,33 @@ type templateLookup interface {
 // Cross-orch coordination uses Redis pub/sub on per-build channels: the
 // uploader publishes on Finish, consumers subscribe inside Wait while polling
 // remote storage. The Redis client is optional — nil falls back to ticker-only
-// polling.
+// polling. While an upload is in flight, Uploads also keeps a short-TTL lease
+// key fresh (startUploadLease); waiters read it through leaseProbe to bound
+// their storage poll by the uploader's liveness instead of the flat budget.
+//
+// leaseStore is the narrow Redis surface the upload lease needs (Set/Get/Del).
+// *redis.Client and the other UniversalClient implementations satisfy it; the
+// interface keeps the heartbeat and its probe testable without a server.
+type leaseStore interface {
+	Set(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd
+	Get(ctx context.Context, key string) *redis.StringCmd
+	Del(ctx context.Context, keys ...string) *redis.IntCmd
+}
+
 type Uploads struct {
 	tc          templateLookup
 	persistence storage.StorageProvider
 	p2p         peerclient.Resolver
 	redis       redis.UniversalClient
+	// lease is the same Redis client narrowed for the upload lease. Nil when
+	// Redis is not configured: the lease then no-ops and waiters keep the
+	// plain budget (REQ-G4).
+	lease leaseStore
 
 	futures *ttlcache.Cache[uuid.UUID, *utils.ErrorOnce]
+	// stopCh ends every lease heartbeat on Stop. Nil for Uploads values built
+	// without NewUploads (tests); a nil channel never fires.
+	stopCh chan struct{}
 }
 
 func NewUploads(tc *template.Cache, persistence storage.StorageProvider, p2p peerclient.Resolver, redisClient redis.UniversalClient) *Uploads {
@@ -77,17 +113,42 @@ func NewUploads(tc *template.Cache, persistence storage.StorageProvider, p2p pee
 	)
 	go futures.Start()
 
-	return &Uploads{tc: tc, persistence: persistence, p2p: p2p, redis: redisClient, futures: futures}
+	var lease leaseStore
+	if redisClient != nil {
+		lease = redisClient
+	}
+
+	return &Uploads{
+		tc:          tc,
+		persistence: persistence,
+		p2p:         p2p,
+		redis:       redisClient,
+		lease:       lease,
+		futures:     futures,
+		stopCh:      make(chan struct{}),
+	}
 }
 
 func (u *Uploads) Stop() {
 	u.futures.Stop()
+
+	if u.stopCh != nil {
+		select {
+		case <-u.stopCh:
+		default:
+			close(u.stopCh)
+		}
+	}
 }
 
 // Start replaces a finished future at the same key; rejects an in-flight one.
 // Build IDs are unique per upload so concurrent Starts for the same key are
 // not expected — the in-flight check only guards against accidental misuse.
-func (u *Uploads) Start(buildID uuid.UUID) (*utils.ErrorOnce, error) {
+//
+// ctx only seeds the lease heartbeat; the heartbeat is detached from its
+// cancellation (see startUploadLease) and outlives the request that started
+// the upload.
+func (u *Uploads) Start(ctx context.Context, buildID uuid.UUID) (*utils.ErrorOnce, error) {
 	if existing := u.futures.Get(buildID); existing != nil {
 		select {
 		case <-existing.Value().Done():
@@ -98,8 +159,106 @@ func (u *Uploads) Start(buildID uuid.UUID) (*utils.ErrorOnce, error) {
 
 	fut := utils.NewErrorOnce()
 	u.futures.Set(buildID, fut, ttlcache.DefaultTTL)
+	// The lease spans the whole retry window: it is refreshed until the
+	// terminal outcome is signalled (Finish sets the future).
+	u.startUploadLease(ctx, buildID, fut.Done())
 
 	return fut, nil
+}
+
+func uploadLeaseKey(buildID uuid.UUID) string {
+	return uploadLeaseKeyPrefix + buildID.String()
+}
+
+// startUploadLease keeps the per-build lease key fresh for as long as the
+// upload's future is pending, so cross-orchestrator waiters can tell a live
+// upload apart from a node that died (S-40). No-op without Redis; the key's
+// TTL covers a crashed process, and the heartbeat is bounded by
+// uploadLeaseMaxLifetime even if a terminal outcome never arrives.
+func (u *Uploads) startUploadLease(ctx context.Context, buildID uuid.UUID, done <-chan struct{}) {
+	if u.lease == nil {
+		return
+	}
+
+	// The lease must outlive the request that started the upload — the upload
+	// itself runs detached the same way — so only the terminal outcome, Stop,
+	// or the lifetime cap ends the heartbeat.
+	go u.runUploadLease(context.WithoutCancel(ctx), buildID, done)
+}
+
+// runUploadLease is the heartbeat loop. It clears the key when the upload
+// concludes, when the process stops its uploads, or at the lifetime cap.
+func (u *Uploads) runUploadLease(ctx context.Context, buildID uuid.UUID, done <-chan struct{}) {
+	key := uploadLeaseKey(buildID)
+
+	refresh := uploadLeaseTTL / 3
+	if refresh <= 0 {
+		refresh = time.Millisecond
+	}
+	ticker := time.NewTicker(refresh)
+	defer ticker.Stop()
+	maxLifetime := time.NewTimer(uploadLeaseMaxLifetime)
+	defer maxLifetime.Stop()
+
+	for {
+		if err := u.lease.Set(ctx, key, "1", uploadLeaseTTL).Err(); err != nil {
+			logger.L().Warn(ctx, "failed to refresh upload lease",
+				logger.WithBuildID(buildID.String()),
+				zap.Error(err),
+			)
+		}
+
+		select {
+		case <-done:
+			u.clearUploadLease(ctx, key)
+
+			return
+		case <-u.stopCh:
+			u.clearUploadLease(ctx, key)
+
+			return
+		case <-maxLifetime.C:
+			u.clearUploadLease(ctx, key)
+
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// clearUploadLease drops the lease; the TTL would cover it anyway, this just
+// makes completion visible to waiters immediately.
+func (u *Uploads) clearUploadLease(ctx context.Context, key string) {
+	if err := u.lease.Del(ctx, key).Err(); err != nil {
+		logger.L().Warn(ctx, "failed to clear upload lease",
+			zap.String("key", key),
+			zap.Error(err),
+		)
+	}
+}
+
+// leaseProbe answers the header poll's liveness question from the uploader's
+// lease key. Nil when Redis is not configured: the poll then keeps the plain
+// budget. An error reading the key is reported as inconclusive so a Redis
+// problem can never fail a wait early.
+func (u *Uploads) leaseProbe(buildID uuid.UUID) build.LivenessProbe {
+	if u.lease == nil {
+		return nil
+	}
+
+	key := uploadLeaseKey(buildID)
+
+	return func(ctx context.Context) (alive, known bool) {
+		_, err := u.lease.Get(ctx, key).Result()
+		switch {
+		case err == nil:
+			return true, true
+		case errors.Is(err, redis.Nil):
+			return false, true
+		default:
+			return false, false
+		}
+	}
 }
 
 // Wait returns the parent's post-upload header, or (nil, nil) when the
@@ -147,7 +306,7 @@ func (u *Uploads) Wait(ctx context.Context, buildID uuid.UUID, t build.DiffType)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	h, err := build.PollRemoteStorageForHeader(ctx, u.persistence, buildID, t, u.subscribe(ctx, buildID), refreshHeaderBudget)
+	h, err := build.PollRemoteStorageForHeader(ctx, u.persistence, buildID, t, u.subscribe(ctx, buildID), refreshHeaderBudget, u.leaseProbe(buildID))
 	if err != nil {
 		return nil, err
 	}

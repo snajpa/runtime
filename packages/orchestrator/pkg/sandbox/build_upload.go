@@ -84,7 +84,7 @@ func NewUpload(
 	}
 
 	if uploads != nil {
-		fut, err := uploads.Start(snap.BuildID)
+		fut, err := uploads.Start(ctx, snap.BuildID)
 		if err != nil {
 			return nil, err
 		}

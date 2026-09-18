@@ -94,9 +94,9 @@ func TestUploads_BeginDistinctIDsAreIndependent(t *testing.T) {
 	a := uuid.New()
 	b := uuid.New()
 
-	futA, err := c.Start(a)
+	futA, err := c.Start(t.Context(), a)
 	require.NoError(t, err)
-	futB, err := c.Start(b)
+	futB, err := c.Start(t.Context(), b)
 	require.NoError(t, err)
 
 	require.NotSame(t, futA, futB)
@@ -117,7 +117,7 @@ func TestUploads_Wait_BlocksUntilSet(t *testing.T) {
 	// Pending header → Wait reaches the future-wait branch instead of
 	// short-circuiting on the cleared bit.
 	putPendingHeader(t, cache, id, build.Memfile)
-	fut, err := c.Start(id)
+	fut, err := c.Start(t.Context(), id)
 	require.NoError(t, err)
 
 	done := make(chan struct{})
@@ -147,7 +147,7 @@ func TestUploads_Wait_PropagatesUploadError(t *testing.T) {
 
 	id := uuid.New()
 	putPendingHeader(t, cache, id, build.Memfile)
-	fut, err := c.Start(id)
+	fut, err := c.Start(t.Context(), id)
 	require.NoError(t, err)
 
 	uploadErr := errors.New("upload exploded")
@@ -162,7 +162,7 @@ func TestUploads_Wait_ContextCancellation(t *testing.T) {
 	c, _ := newUploads(t)
 
 	id := uuid.New()
-	_, err := c.Start(id) // never signaled
+	_, err := c.Start(t.Context(), id) // never signaled
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -215,7 +215,7 @@ func TestUploads_ConcurrentBeginsAndWaits(t *testing.T) {
 	for i := range n {
 		ids[i] = uuid.New()
 		putPendingHeader(t, cache, ids[i], build.Memfile)
-		fut, err := c.Start(ids[i])
+		fut, err := c.Start(t.Context(), ids[i])
 		require.NoError(t, err)
 		futs[i] = fut
 	}
