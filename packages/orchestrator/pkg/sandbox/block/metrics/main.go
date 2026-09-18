@@ -20,6 +20,10 @@ type Metrics struct {
 	FetchAdmissionInFlight metric.Int64UpDownCounter
 	FetchAdmissionQueued   metric.Int64UpDownCounter
 	FetchAdmissionExpired  metric.Int64Counter
+
+	// FetchAbandoned counts chunk-fetch waits abandoned by a cancelled reader
+	// while the shared fetch keeps running for the other waiters (S-21).
+	FetchAbandoned metric.Int64Counter
 }
 
 func NewMetrics(meterProvider metric.MeterProvider) (Metrics, error) {
@@ -59,6 +63,12 @@ func NewMetrics(meterProvider metric.MeterProvider) (Metrics, error) {
 		metric.WithDescription("Chunk fetches whose admission wait was cut short by their context"),
 	); err != nil {
 		return m, fmt.Errorf("error creating fetch admission expired counter: %w", err)
+	}
+
+	if m.FetchAbandoned, err = blocksMeter.Int64Counter("orchestrator.chunk.fetch.abandoned",
+		metric.WithDescription("Chunk-fetch waits abandoned by a cancelled reader while the shared fetch keeps running"),
+	); err != nil {
+		return m, fmt.Errorf("error creating fetch abandoned counter: %w", err)
 	}
 
 	return m, nil

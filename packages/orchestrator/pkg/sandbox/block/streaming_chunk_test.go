@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -444,6 +445,82 @@ func TestChunker_ContextCancellation(t *testing.T) {
 	slice, err := chunker.Slice(t.Context(), 0, testBlockSize, nil)
 	require.NoError(t, err)
 	require.Equal(t, data[:testBlockSize], slice)
+}
+
+// TestChunker_ParallelSpanStartsAllFetches pins S-21: a Slice that spans two
+// chunks starts both fetches before waiting for either, instead of paying each
+// chunk's latency in sequence.
+func TestChunker_ParallelSpanStartsAllFetches(t *testing.T) {
+	t.Parallel()
+
+	// Two frames of compressed data; a span across them is two chunks.
+	data := makeTestData(2 * testFrameSize)
+	ft, compressedFile := makeCompressedTestData(t, data)
+
+	ctrl := &testControl{
+		advance:  make(chan struct{}),
+		consumed: make(chan struct{}, 10),
+		opened:   make(chan struct{}, 10),
+		closed:   make(chan struct{}, 10),
+	}
+
+	var opened atomic.Int64
+	ctrl.onOpen = func() { opened.Add(1) }
+	compressedFile.ctrl = ctrl
+
+	chunker := newTestChunker(t, int64(len(data)))
+	t.Cleanup(func() { _ = chunker.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		_, sliceErr := chunker.Slice(t.Context(), 0, 2*testBlockSize+testFrameSize, compressedFile, ft)
+		done <- sliceErr
+	}()
+
+	// Both chunk fetches of the span must have started before either is
+	// released: with a sequential span fetch, the second open would only
+	// happen after the first fetch completed.
+	require.Eventually(t, func() bool { return opened.Load() >= 2 }, 5*time.Second, 2*time.Millisecond,
+		"both chunk fetches of the span must start before waiting")
+
+	close(ctrl.advance)
+	require.NoError(t, <-done)
+}
+
+// TestChunker_AbandonedWaiterCounted pins S-21's abandonment signal: a reader
+// cancelled while the shared fetch keeps running is counted on the session.
+func TestChunker_AbandonedWaiterCounted(t *testing.T) {
+	t.Parallel()
+
+	data := makeTestData(testFileSize)
+	chunker := newControlledChunker(t, data)
+	defer chunker.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	done := make(chan error, 1)
+	go func() {
+		_, sliceErr := chunker.Slice(ctx, 0, testBlockSize, nil)
+		done <- sliceErr
+	}()
+
+	// Wait for the fetch to start, then abandon the wait.
+	<-chunker.opened
+	cancel()
+
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	// The shared fetch keeps running; the abandoned wait is counted on it.
+	chunker.fetchMu.Lock()
+	sessions := append([]*fetchSession(nil), chunker.fetchSessions...)
+	chunker.fetchMu.Unlock()
+
+	require.Len(t, sessions, 1)
+	require.EqualValues(t, 1, sessions[0].Abandoned(), "the abandoned wait must be counted")
+
+	// Release the fetch so the test leaves no running work behind.
+	close(chunker.advance)
+	<-chunker.closed
 }
 
 // TestChunker_LastBlockPartial verifies correct handling of a file whose size

@@ -30,6 +30,12 @@ type fetchSession struct {
 	// are fully written and marked cached. Atomic so registerAndWait can
 	// do a lock-free fast-path check: bytesReady only increases.
 	bytesReady atomic.Int64
+
+	// abandoned counts waiters that gave up while the shared fetch keeps
+	// running (their reader was cancelled); onAbandon reports each one so the
+	// node can count and classify abandoned fetches (S-21).
+	abandoned atomic.Int64
+	onAbandon func(ctx context.Context)
 }
 
 func (s *fetchSession) setSource(src storage.Source) {
@@ -118,11 +124,55 @@ func (s *fetchSession) registerAndWait(ctx context.Context, blockOff int64) erro
 		}
 
 		if ctx.Err() != nil {
+			// The reader gave up while the shared fetch keeps running for the
+			// other waiters and the cache: count the abandonment (S-21).
+			s.abandoned.Add(1)
+			if s.onAbandon != nil {
+				s.onAbandon(ctx)
+			}
+
 			return ctx.Err()
 		}
 
 		s.cond.Wait()
 	}
+}
+
+// Abandoned reports how many waiters gave up on this session while it kept
+// running.
+func (s *fetchSession) Abandoned() int64 {
+	return s.abandoned.Load()
+}
+
+// waitForRange blocks until every block covering [off, off+length) is cached
+// in this session's chunk, the session terminates, or ctx is cancelled. A
+// range that is already streamed past reports storage.SourceMmap without
+// waiting. Starting several of these waits after starting all of a span's
+// fetches lets the chunks of one span fetch in parallel (S-21).
+func (s *fetchSession) waitForRange(ctx context.Context, off, length int64) (storage.Source, error) {
+	blockSize := s.cache.BlockSize()
+	startBlock := (off / blockSize) * blockSize
+	endBlock := ((off + length - 1) / blockSize) * blockSize
+
+	chunkEnd := s.chunkOff + s.chunkLen
+
+	// Already streamed past every byte we need: it's in the mmap, source=mmap.
+	endByte := min(endBlock+blockSize, chunkEnd) - s.chunkOff
+	if s.bytesReady.Load() >= endByte {
+		return storage.SourceMmap, nil
+	}
+
+	for b := startBlock; b <= endBlock; b += blockSize {
+		if b >= chunkEnd {
+			break // tail belongs to the caller's next chunk fetch.
+		}
+
+		if err := s.registerAndWait(ctx, b); err != nil {
+			return s.Source(), err
+		}
+	}
+
+	return s.Source(), nil
 }
 
 // advance updates progress and wakes all waiters.
