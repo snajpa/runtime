@@ -22,6 +22,9 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
 // EnvdSwapTimeout bounds a SINGLE debugfs invocation — it is what RuntimeMaxSec is
@@ -196,7 +199,11 @@ func SwapEnvdBinary(ctx context.Context, devicePath, srcPath, stageRoot string) 
 	if err != nil {
 		return SwapResult{}, err
 	}
-	defer os.RemoveAll(stage)
+	defer func() {
+		if err := removeSwapStage(stage); err != nil {
+			logger.L().Error(ctx, "envd swap stage directory left behind", zap.String("path", stage), zap.Error(err))
+		}
+	}()
 
 	return swapEnvd(ctx, swapIO{
 		stageDir: stage,
@@ -717,6 +724,18 @@ func swapStageGroup() (int, error) {
 // stageSwapDir creates the staging directory for one swap: owner-only, plus
 // traversal for the jail's group. gid < 0 skips the group ownership (tests that
 // run without the jailed group); production passes the resolved group.
+//
+// removeSwapStage removes it again: a failed removal leaves up to maxEnvdSize
+// of dumped bytes on the host, so the caller reports it instead of ignoring it
+// (REQ-H2, NFR-3).
+func removeSwapStage(stage string) error {
+	if err := os.RemoveAll(stage); err != nil {
+		return fmt.Errorf("remove swap stage %s: %w", stage, err)
+	}
+
+	return nil
+}
+
 func stageSwapDir(stageRoot string, gid int) (string, error) {
 	stage, err := os.MkdirTemp(stageRoot, ".envd-swap-")
 	if err != nil {
