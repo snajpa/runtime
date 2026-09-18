@@ -483,6 +483,11 @@ var (
 	OrchestratorRoutingPrioritizedFlag = NewBoolFlag("orchestrator-routing-prioritized", false)
 	MaxCacheWriterConcurrencyFlag      = NewIntFlag("max-cache-writer-concurrency", 10)
 
+	// MaxConcurrentChunkFetches bounds the upstream chunk fetches one node
+	// runs at once: a burst of guest faults queues behind the gate instead of
+	// stampeding the object store (REQ-D2, S-18).
+	MaxConcurrentChunkFetches = NewIntFlag("max-concurrent-chunk-fetches", 32)
+
 	// BuildCacheMaxUsagePercentage the maximum percentage of the cache disk storage
 	// that can be used before the cache starts evicting items.
 	BuildCacheMaxUsagePercentage = NewIntFlag("build-cache-max-usage-percentage", 85)
