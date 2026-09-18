@@ -108,26 +108,35 @@ func (c *cachedSeekable) openReaderUncompressed(ctx context.Context, off, length
 // uncompressedChunkWriteback returns a captureReader callback that persists
 // the captured chunk to the NFS cache in a detached goroutine. Best-effort:
 // a short capture (e.g. upstream truncation) is dropped silently — a streaming
-// reader always ends in EOF, so byte count is the only reliable signal.
-func (c *cachedSeekable) uncompressedChunkWriteback(chunkPath string, off, expectedLen int64, src Source) func(context.Context, []byte) {
-	return func(ctx context.Context, captured []byte) {
-		if !isCompleteRead(len(captured), int(expectedLen), nil) {
+// reader always ends in EOF, so byte count is the only reliable signal. The
+// captured buffer is released once the write finishes, when the capture is
+// unusable, and when the writeback queue drops the fill.
+func (c *cachedSeekable) uncompressedChunkWriteback(chunkPath string, off, expectedLen int64, src Source) func(context.Context, capturedBytes) {
+	return func(ctx context.Context, captured capturedBytes) {
+		if !isCompleteRead(len(captured.Bytes()), int(expectedLen), nil) {
+			captured.Release()
+
 			return
 		}
 
-		c.goCtx(ctx, func(ctx context.Context) {
+		admitted := c.goCtx(ctx, func(ctx context.Context) {
 			ctx, span := c.tracer.Start(ctx, "write range reader chunk back to cache")
 			defer span.End()
 
 			start := time.Now()
-			err := c.writeToCache(ctx, off, chunkPath, captured)
-			recordWriteback(ctx, time.Since(start), int64(len(captured)), c.objType, src, CompressionNone, TriggerRead, err)
+			err := c.writeToCache(ctx, off, chunkPath, captured.Bytes())
+			recordWriteback(ctx, time.Since(start), int64(len(captured.Bytes())), c.objType, src, CompressionNone, TriggerRead, err)
+			captured.Release()
 
 			if err != nil && !errors.Is(err, lock.ErrLockAlreadyHeld) {
 				recordError(span, err)
 				logger.L().Warn(ctx, "failed to write chunk back to cache", zap.Error(err))
 			}
 		})
+		if !admitted {
+			// The writeback queue was full: nothing consumes the capture.
+			captured.Release()
+		}
 	}
 }
 
@@ -246,9 +255,10 @@ func (c *cachedSeekable) frameSink(ctx context.Context, ct CompressionType) Fram
 // goCtx submits fn as a bounded, process-tracked cache fill on a
 // WithoutCancel context, so an in-flight cache write isn't aborted when the
 // upload's (or read's) context is cancelled; c.wg keeps the fill awaitable by
-// tests.
-func (c *cachedSeekable) goCtx(ctx context.Context, fn func(context.Context)) {
-	writebacks.submit(ctx, &c.wg, fn)
+// tests. It reports whether the fill was admitted: a dropped fill's owner must
+// release any resources it handed over (a capture buffer).
+func (c *cachedSeekable) goCtx(ctx context.Context, fn func(context.Context)) bool {
+	return writebacks.submit(ctx, &c.wg, fn)
 }
 
 func (c *cachedSeekable) makeChunkFilename(offset int64) string {

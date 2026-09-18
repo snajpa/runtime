@@ -1,11 +1,11 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -107,46 +107,145 @@ func (m *meteredReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// capturedBytes is one captureReader payload: the captured bytes plus the
+// release that returns the backing buffer to the pool. onClose receives it and
+// must call Release once the bytes are no longer read — including when the
+// writeback is skipped, dropped, or fails, and before returning when it does
+// not keep the payload. Release is safe to call more than once.
+type capturedBytes struct {
+	data    []byte
+	release func()
+}
+
+// Bytes returns the captured payload; it is only valid until Release is called.
+func (c capturedBytes) Bytes() []byte { return c.data }
+
+// Release returns the backing buffer to the pool.
+func (c capturedBytes) Release() {
+	if c.release != nil {
+		c.release()
+	}
+}
+
+// maxPooledCaptureSize bounds what the capture pool keeps. Captures can be as
+// large as a memory chunk (4 MiB); pooling beyond that only holds memory the
+// GC would otherwise reclaim.
+const maxPooledCaptureSize = MemoryChunkSize
+
+// captureBufPool pools the capture buffers of the read path's cache writebacks:
+// a cache miss allocates one capture buffer per read, and chunk-sized reads hit
+// the same size class over and over (REQ-D3).
+var captureBufPool = newBufferPool()
+
 // captureReader tees every read byte into a buffer and hands the captured
-// bytes to onClose on Close. Used by the compressed cache writeback path.
+// payload to onClose on Close. Used by the cache writeback paths.
 // drainOnClose=true reads inner to EOF on Close even if the caller above hasn't
 // consumed everything — the compressed cache needs the full frame regardless
 // of how many bytes the decoder happened to demand.
 type captureReader struct {
 	inner        RangeReader
-	buf          *bytes.Buffer
-	onClose      func(ctx context.Context, captured []byte)
+	buf          []byte
+	free         func() // returns the pooled backing array; nil once detached
+	onClose      func(ctx context.Context, captured capturedBytes)
 	drainOnClose bool
 }
 
-func newCaptureReader(inner RangeReader, capHint int, drainOnClose bool, onClose func(context.Context, []byte)) *captureReader {
-	return &captureReader{
+// newCaptureReader tees the reads of inner into a pooled capture buffer of
+// capHint (the expected payload). A hint outside the pool's bound falls back to
+// a plain allocation, so a read cannot park an arbitrarily large buffer in the
+// pool.
+func newCaptureReader(inner RangeReader, capHint int, drainOnClose bool, onClose func(context.Context, capturedBytes)) *captureReader {
+	r := &captureReader{
 		inner:        inner,
-		buf:          bytes.NewBuffer(make([]byte, 0, capHint)),
 		onClose:      onClose,
 		drainOnClose: drainOnClose,
 	}
+
+	switch {
+	case capHint <= 0:
+		// No hint: capture into a plain buffer.
+	case capHint <= maxPooledCaptureSize:
+		pooled := captureBufPool.Get(capHint)
+		r.buf = pooled.Bytes()[:0]
+		r.free = pooled.Free
+	default:
+		r.buf = make([]byte, 0, capHint)
+	}
+
+	return r
 }
 
 func (r *captureReader) Read(p []byte) (int, error) {
 	n, err := r.inner.Read(p)
 	if n > 0 {
-		r.buf.Write(p[:n])
+		r.capture(p[:n])
 	}
 
 	return n, err
+}
+
+// capture appends to the capture buffer, detaching from the pooled array when
+// the payload outgrows it: the pooled array cannot go back to the pool while
+// the payload lives in it, so the reader continues in a buffer of its own.
+func (r *captureReader) capture(p []byte) {
+	if r.free != nil && len(r.buf)+len(p) > cap(r.buf) {
+		grown := make([]byte, len(r.buf), len(r.buf)+len(p))
+		copy(grown, r.buf)
+		r.buf = grown
+		r.free()
+		r.free = nil
+	}
+
+	r.buf = append(r.buf, p...)
 }
 
 func (r *captureReader) Close(ctx context.Context) (*ReadStats, error) {
 	if r.drainOnClose {
 		_, _ = io.Copy(io.Discard, r)
 	}
+
 	stats, err := r.inner.Close(ctx)
-	if err == nil {
-		r.onClose(ctx, r.buf.Bytes())
+
+	onClose := r.onClose
+	r.onClose = nil
+	if onClose == nil {
+		return stats, err
 	}
 
+	if err != nil {
+		// The consumer never receives the payload: return the buffer.
+		r.releaseBuffer()
+
+		return stats, err
+	}
+
+	onClose(ctx, capturedBytes{data: r.buf, release: r.takeRelease()})
+
 	return stats, err
+}
+
+// takeRelease hands ownership of the pooled buffer to the captured payload.
+// The returned func is safe to call more than once.
+func (r *captureReader) takeRelease() func() {
+	free := r.free
+	r.free = nil
+	if free == nil {
+		return func() {}
+	}
+
+	var once sync.Once
+
+	return func() { once.Do(free) }
+}
+
+// releaseBuffer returns the pooled buffer when no payload was handed out.
+func (r *captureReader) releaseBuffer() {
+	if r.free == nil {
+		return
+	}
+
+	r.free()
+	r.free = nil
 }
 
 // spanReader ends a trace span on Close, recording the close error or the first
