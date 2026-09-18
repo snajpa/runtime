@@ -55,6 +55,7 @@ func TestPeerSeekable_Size_PeerNotAvailable_EmitsPeerTransitionedError(t *testin
 	_, err := s.Size(t.Context())
 	var transErr *storage.PeerTransitionedError
 	require.ErrorAs(t, err, &transErr)
+	assert.Equal(t, peerTransitionRetryAfter, transErr.RetryAfter, "transitions must carry a bounded retry")
 }
 
 func TestPeerSeekable_OpenRangeReader_PeerSucceeds(t *testing.T) {
@@ -173,7 +174,7 @@ func TestPeerStorageProvider_TransitionEmitsError(t *testing.T) {
 	// no unexpected calls on cleanup.
 	base := storage.NewMockStorageProvider(t)
 
-	p := newPeerStorageProvider(base, client, uploaded)
+	p := newPeerStorageProvider(base, client, uploaded, "peer-test:1234", nil)
 	seekable, err := p.OpenSeekable(t.Context(), "build-1/memfile")
 	require.NoError(t, err)
 
