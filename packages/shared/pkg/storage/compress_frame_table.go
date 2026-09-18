@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 )
 
 type CompressionType byte
@@ -392,15 +393,32 @@ func (ct CompressionType) String() string {
 	}
 }
 
-// parseCompressionType converts a string to CompressionType.
-// Returns CompressionNone for unrecognised values.
-func parseCompressionType(s string) CompressionType {
-	switch s {
+// ParseCompressionType converts a configured compression type name to a
+// CompressionType. Names match case-insensitively with surrounding space
+// ignored; "" and "none" select CompressionNone. Any other name is an error
+// naming the value, so a typo cannot silently disable compression.
+func ParseCompressionType(s string) (CompressionType, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "none":
+		return CompressionNone, nil
 	case "lz4":
-		return CompressionLZ4
+		return CompressionLZ4, nil
 	case "zstd":
-		return CompressionZstd
+		return CompressionZstd, nil
 	default:
-		return CompressionNone
+		return CompressionNone, fmt.Errorf("unknown compression type %q (accepted: none, lz4, zstd)", s)
 	}
+}
+
+// parseCompressionType is the total form of ParseCompressionType: callers that
+// classify an already-validated value map unknown names to CompressionNone.
+func parseCompressionType(s string) CompressionType {
+	t, _ := ParseCompressionType(s)
+
+	return t
+}
+
+// Valid reports whether ct is one of the defined compression types.
+func (ct CompressionType) Valid() bool {
+	return ct < numCompressionTypes
 }

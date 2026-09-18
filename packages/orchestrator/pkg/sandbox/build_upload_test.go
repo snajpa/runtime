@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/launchdarkly/go-sdk-common/v3/ldvalue"
 	"github.com/launchdarkly/go-server-sdk/v7/testhelpers/ldtestdata"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
@@ -65,6 +67,66 @@ func TestResolveCompressConfig_V4_FlagOn(t *testing.T) {
 
 	ff := newV4HeaderFF(t, true)
 	require.True(t, resolveV4(t, ff))
+}
+
+// compressFF builds a feature-flags client whose compress-config flag carries
+// the given JSON value.
+func compressFF(t *testing.T, value map[string]any) *featureflags.Client {
+	t.Helper()
+
+	td := ldtestdata.DataSource()
+	td.Update(td.Flag(featureflags.CompressConfigFlag.Key()).ValueForAll(ldvalue.FromJSONMarshal(value)))
+
+	ff, err := featureflags.NewClientWithDatasource(td)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = ff.Close(context.WithoutCancel(t.Context()))
+	})
+
+	return ff
+}
+
+func TestResolveCompressConfig_Flag(t *testing.T) {
+	t.Parallel()
+
+	t.Run("unknown compression type is an error", func(t *testing.T) {
+		t.Parallel()
+
+		ff := compressFF(t, map[string]any{"compressBuilds": true, "compressionType": "zstandard"})
+		_, _, err := resolveCompressConfig(t.Context(), storage.CompressConfig{}, ff, storage.MemfileName, 4096, storage.UseCaseBuild)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "zstandard")
+	})
+
+	t.Run("known compression type overrides the base config", func(t *testing.T) {
+		t.Parallel()
+
+		ff := compressFF(t, map[string]any{"compressBuilds": true, "compressionType": "lz4", "frameSizeKB": 256})
+		cfg, useV4, err := resolveCompressConfig(t.Context(), storage.CompressConfig{}, ff, storage.MemfileName, 4096, storage.UseCaseBuild)
+		require.NoError(t, err)
+		assert.False(t, useV4)
+		assert.True(t, cfg.IsCompressionEnabled())
+		assert.Equal(t, storage.CompressionLZ4, cfg.CompressionType())
+	})
+
+	t.Run("inactive flag does not evaluate its value", func(t *testing.T) {
+		t.Parallel()
+
+		ff := compressFF(t, map[string]any{"compressBuilds": false, "compressionType": "zstandard"})
+		cfg, _, err := resolveCompressConfig(t.Context(), storage.CompressConfig{}, ff, storage.MemfileName, 4096, storage.UseCaseBuild)
+		require.NoError(t, err)
+		assert.False(t, cfg.IsCompressionEnabled())
+	})
+
+	t.Run("unknown base config type is an error", func(t *testing.T) {
+		t.Parallel()
+
+		base := storage.CompressConfig{Enabled: true, Type: "zstandard"}
+		_, _, err := resolveCompressConfig(t.Context(), base, nil, storage.MemfileName, 4096, storage.UseCaseBuild)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "zstandard")
+	})
 }
 
 // putV3Header registers a V3 ancestor in the fake cache. V3 headers carry no
@@ -266,9 +328,9 @@ func TestAppendAncestorBuilds_ExistingEntrySkipsStorage(t *testing.T) {
 
 // A filesystem-only snapshot has no memfile, so its MemorySnapshot.BlockSize is
 // 0. NewUpload must skip resolving the memfile compress config for it —
-// otherwise, with compression enabled, validateCompressConfig would reject the
-// zero block size and fail the upload. FrameSizeKB is a multiple of the 4 KiB
-// rootfs block so the rootfs config (which is always resolved) stays valid.
+// otherwise, with compression enabled, ValidateFrameSize would reject the zero
+// block size and fail the upload. FrameSizeKB is a multiple of the 4 KiB rootfs
+// block so the rootfs config (which is always resolved) stays valid.
 func TestNewUpload_FilesystemSnapshotSkipsMemfileCompressConfig(t *testing.T) {
 	t.Parallel()
 
