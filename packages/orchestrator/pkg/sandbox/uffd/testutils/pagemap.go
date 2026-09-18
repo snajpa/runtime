@@ -6,13 +6,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 )
 
 // Pagemap always uses the host page size (4K) for indexing,
 // regardless of hugepages.
 const (
 	pagemapEntrySize = 8
-	hostPageSize     = 4096
+	hostPageSize     = units.PageSize
 
 	// https://docs.kernel.org/admin-guide/mm/pagemap.html
 	pmUffdWP  = uint64(1) << 57 // Page is write-protected via userfaultfd
