@@ -87,8 +87,19 @@ func (c *Chunker) Slice(ctx context.Context, off, length int64, upstream storage
 		return nil, fmt.Errorf("failed read from cache at offset %d: %w", off, err)
 	}
 
-	// Fetch every chunk the range spans (one fetch session per chunk).
-	var src storage.Source
+	// Resolve every chunk of the span and start its fetch session before
+	// waiting for any of them: the chunks are independent, so their fetches
+	// overlap instead of paying each chunk's latency in sequence (S-21).
+	type chunkSpan struct {
+		session *fetchSession
+		off     int64
+		end     int64
+	}
+
+	var (
+		src   storage.Source
+		spans []chunkSpan
+	)
 	end := off + length
 	for cur := off; cur < end; {
 		chunkOff, chunkLen, lerr := c.locateChunk(cur, ft)
@@ -99,14 +110,26 @@ func (c *Chunker) Slice(ctx context.Context, off, length int64, upstream storage
 		}
 		chunkEnd := chunkOff + chunkLen
 		rangeEnd := min(end, chunkEnd)
-		s, err := c.fetch(ctx, cur, rangeEnd-cur, upstream, ft)
-		if err != nil {
-			c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), 0, storage.ErrAttrs(c.objType, s, ct, err))
 
-			return nil, fmt.Errorf("failed to ensure data at %d-%d: %w", cur, rangeEnd, err)
+		session, justGotCached := c.getOrCreateSession(ctx, chunkOff, chunkLen, upstream, ft)
+		if justGotCached {
+			src = max(src, storage.SourceMmap)
+		} else {
+			spans = append(spans, chunkSpan{session: session, off: cur, end: rangeEnd})
 		}
-		src = max(src, s)
+
 		cur = chunkEnd
+	}
+
+	for _, span := range spans {
+		spanSrc, err := span.session.waitForRange(ctx, span.off, span.end)
+		if err != nil {
+			c.metrics.ChunkSliceTimerFactory.Record(ctx, time.Since(sliceStart), 0, storage.ErrAttrs(c.objType, spanSrc, ct, err))
+
+			return nil, fmt.Errorf("failed to ensure data at %d-%d: %w", span.off, span.end, err)
+		}
+
+		src = max(src, spanSrc)
 	}
 
 	// sliceDirect skips isCached — the waiter already confirmed the data is in the mmap.
@@ -143,6 +166,7 @@ func (c *Chunker) getOrCreateSession(ctx context.Context, off, length int64, ups
 	}
 
 	s := newFetchSession(off, length, c.cache)
+	s.onAbandon = func(ctx context.Context) { c.metrics.FetchAbandoned.Add(ctx, 1) }
 	c.fetchSessions = append(c.fetchSessions, s)
 
 	// Detach from the caller's cancel signal so the shared fetch goroutine
@@ -173,28 +197,7 @@ func (c *Chunker) fetch(ctx context.Context, off, length int64, upstream storage
 		return storage.SourceMmap, nil
 	}
 
-	blockSize := c.cache.BlockSize()
-	startBlock := (off / blockSize) * blockSize
-	endBlock := ((off + length - 1) / blockSize) * blockSize
-
-	chunkEnd := session.chunkOff + session.chunkLen
-
-	// Already streamed past every byte we need: it's in the mmap, source=mmap.
-	endByte := min(endBlock+blockSize, chunkEnd) - session.chunkOff
-	if session.bytesReady.Load() >= endByte {
-		return storage.SourceMmap, nil
-	}
-
-	for b := startBlock; b <= endBlock; b += blockSize {
-		if b >= chunkEnd {
-			break // tail belongs to the caller's next chunk fetch.
-		}
-		if err := session.registerAndWait(ctx, b); err != nil {
-			return session.Source(), err
-		}
-	}
-
-	return session.Source(), nil
+	return session.waitForRange(ctx, off, length)
 }
 
 // runFetch fetches data from storage into the mmap cache. Runs in a background goroutine.
