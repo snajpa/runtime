@@ -28,6 +28,14 @@ import (
 // block size the NBD transport sets on its device.
 const ublkDeviceBlockSize = 4096
 
+// ublkManager is the provider's control plane; *ublk.Manager implements it,
+// and the narrow interface keeps Start/Close drivable in tests without a real
+// device.
+type ublkManager interface {
+	Open(ctx context.Context, backend ublk.Backend, opts ublk.Options) (*ublk.Device, error)
+	Close() error
+}
+
 // UblkProvider is the NBD transport's counterpart on ublk: the same overlay and
 // writable cache, served to Firecracker as /dev/ublkbN instead of /dev/nbdX.
 //
@@ -41,7 +49,7 @@ const ublkDeviceBlockSize = 4096
 type UblkProvider struct {
 	overlay      *block.Overlay
 	featureFlags *featureflags.Client
-	manager      *ublk.Manager
+	manager      ublkManager
 
 	ready *utils.SetOnce[string]
 
@@ -51,7 +59,18 @@ type UblkProvider struct {
 	cachePath string
 	sealGen   atomic.Int64
 
-	finishedOperations chan struct{}
+	// finishedOperations carries the pause-barrier outcome of the Close that
+	// released the device (nil when the flush succeeded, the flush error
+	// otherwise) so the export paths fail loudly instead of shipping a
+	// silently incomplete diff (S-30 semantics, mirrored from the NBD
+	// provider after the review's ublk barrier finding).
+	finishedOperations chan error
+
+	// lifecycle serializes Start and Close end to end: a Close racing an
+	// in-flight Start waits for the open to settle and then tears the device
+	// down, and a Start that loses the race refuses instead of opening a
+	// device after the control plane is gone (end-to-end review finding).
+	lifecycle sync.Mutex
 
 	mu     sync.Mutex
 	device *ublk.Device
@@ -88,13 +107,27 @@ func NewUblkProvider(ctx context.Context, rootfs block.ReadonlyDevice, cachePath
 		featureFlags:       featureFlags,
 		manager:            manager,
 		ready:              utils.NewSetOnce[string](),
-		finishedOperations: make(chan struct{}, 1),
+		finishedOperations: make(chan error, 1),
 		blockSize:          blockSize,
 		cachePath:          cachePath,
 	}, nil
 }
 
 func (o *UblkProvider) Start(ctx context.Context) error {
+	o.lifecycle.Lock()
+	defer o.lifecycle.Unlock()
+
+	if o.isClosed() {
+		return o.ready.SetError(errors.New("error opening ublk device: provider is closed"))
+	}
+
+	// The selection starts the provider eagerly, so a device that cannot come
+	// up falls back to NBD before Firecracker is configured; this call from
+	// the sandbox wiring is then a no-op rather than a second device.
+	if o.startedDevice() != nil {
+		return nil
+	}
+
 	device, err := o.manager.Open(ctx, o.overlay, o.options(ctx))
 	if err != nil {
 		return o.ready.SetError(fmt.Errorf("error opening ublk device: %w", err))
@@ -105,6 +138,14 @@ func (o *UblkProvider) Start(ctx context.Context) error {
 	o.mu.Unlock()
 
 	return o.ready.SetValue(device.Path())
+}
+
+// isClosed reports whether Close has already run.
+func (o *UblkProvider) isClosed() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.closed
 }
 
 func (o *UblkProvider) options(ctx context.Context) ublk.Options {
@@ -152,9 +193,8 @@ func (o *UblkProvider) ejectAndStopSandbox(
 		}
 	}()
 
-	select {
-	case <-o.finishedOperations:
-	case <-ctx.Done():
+	releaseErr := o.awaitOverlayRelease(ctx)
+	if errors.Is(releaseErr, errOverlayReleaseTimeout) {
 		// Close the cache to avoid leaking the mmaped memory. Log an error
 		// if that failed
 		closeErr := cache.Close()
@@ -162,7 +202,22 @@ func (o *UblkProvider) ejectAndStopSandbox(
 			logger.L().Warn(ctx, "error closing cache", zap.Error(closeErr))
 		}
 
-		return nil, errors.New("timeout waiting for overlay device to be released")
+		return nil, releaseErr
+	}
+	if releaseErr != nil {
+		// The device was released, but its pause barrier reported a failure:
+		// the backend is missing writes the guest was told had landed, so an
+		// exported diff would be silently incomplete. Reclaim the detached
+		// cache (nobody owns it on this path) and fail the pause/export
+		// loudly instead of exporting it (S-30, REQ-E1).
+		closeErr := cache.Close()
+		if closeErr != nil {
+			logger.L().Warn(ctx, "error closing cache", zap.Error(closeErr))
+		}
+
+		o.reportOverlayReleaseFailure(ctx, releaseErr)
+
+		return nil, releaseErr
 	}
 	telemetry.ReportEvent(ctx, "sandbox stopped")
 
@@ -289,18 +344,24 @@ func (o *UblkProvider) FoldSealed(ctx context.Context) (*block.Cache, error) {
 }
 
 func (o *UblkProvider) Close(ctx context.Context) error {
+	o.lifecycle.Lock()
+	defer o.lifecycle.Unlock()
+
 	ctx, span := tracer.Start(ctx, "cow-close")
 	defer span.End()
 
 	var errs []error
 
 	var err error
+	var barrierErr error
+	var deviceCloseErr error
 
 	// A provider that never started a device has nothing to flush; syncing
 	// anyway would report a spurious "no ublk device to flush" on error paths.
 	if o.startedDevice() != nil {
 		err = o.sync(ctx)
 		if err != nil {
+			barrierErr = err
 			errs = append(errs, fmt.Errorf("error flushing cow device: %w", err))
 		}
 	}
@@ -315,6 +376,7 @@ func (o *UblkProvider) Close(ctx context.Context) error {
 	if !alreadyClosed {
 		if device != nil {
 			if err := device.Close(ctx); err != nil {
+				deviceCloseErr = err
 				errs = append(errs, fmt.Errorf("error closing ublk device: %w", err))
 			}
 		}
@@ -325,7 +387,11 @@ func (o *UblkProvider) Close(ctx context.Context) error {
 
 		// The device is gone, so nothing can reach the cache any more; this is
 		// the point the export paths wait for before they read it.
-		o.finishedOperations <- struct{}{}
+		// The barrier is "flush and teardown completed", not just the first
+		// sync: device.Close() performs another Sync and the STOP/delete/owner
+		// teardown, so its failure also means the release did not complete.
+		// Mirrors the NBD provider's syncErr+mountCloseErr join (S-30).
+		o.signalFinishedOperations(barrierOutcome(barrierErr, deviceCloseErr))
 	}
 
 	err = o.overlay.Close()
@@ -336,6 +402,65 @@ func (o *UblkProvider) Close(ctx context.Context) error {
 	logger.L().Info(ctx, "overlay device released")
 
 	return errors.Join(errs...)
+}
+
+// barrierOutcome joins a pause barrier's steps into the outcome the release
+// signal carries: the first sync's error and the ublk device teardown's error,
+// either of which means the release did not complete (the barrier is "flush
+// and teardown completed"). Extracted from Close so the join is pinned by a
+// test; the call-site wiring itself needs the real device and stays
+// inspection-verified, exactly like the NBD provider's syncErr+mountCloseErr
+// join.
+func barrierOutcome(syncErr, deviceCloseErr error) error {
+	return errors.Join(syncErr, deviceCloseErr)
+}
+
+// signalFinishedOperations publishes the overlay-release signal, carrying the
+// pause-barrier outcome (nil when the device flush succeeded, the flush error
+// otherwise), without ever blocking: Close may run twice (or race the eject
+// waiter), and a second blocking send on the buffer-1 channel would hang
+// teardown forever (S-19, INV-5). The first signal is the one a waiter
+// receives, so the outcome of the Close that released the device is enforced.
+func (o *UblkProvider) signalFinishedOperations(barrierErr error) {
+	select {
+	case o.finishedOperations <- barrierErr:
+	default:
+	}
+}
+
+// awaitOverlayRelease waits for the release signal Close publishes and returns
+// the pause-barrier outcome it carries: nil when the device flush succeeded,
+// the flush failure when the backend is missing writes the guest was told had
+// landed, or errOverlayReleaseTimeout when ctx expired first (the caller then
+// closes the ejected cache and abandons the export).
+func (o *UblkProvider) awaitOverlayRelease(ctx context.Context) error {
+	select {
+	case barrierErr := <-o.finishedOperations:
+		if barrierErr != nil {
+			return fmt.Errorf("overlay device released with a failed flush: %w", barrierErr)
+		}
+
+		return nil
+	case <-ctx.Done():
+		return errOverlayReleaseTimeout
+	}
+}
+
+// reportOverlayReleaseFailure records a release that carried a failed device
+// flush: the export fails instead of building a silently incomplete diff, and
+// the counter makes the rate visible (mirrored from the NBD provider, S-30).
+func (o *UblkProvider) reportOverlayReleaseFailure(ctx context.Context, releaseErr error) {
+	devicePath, pathErr := o.Path()
+	if pathErr != nil {
+		devicePath = "unknown"
+	}
+
+	logger.L().Error(ctx, "overlay device released with a failed flush; failing the export",
+		zap.String("device_path", devicePath),
+		zap.Error(releaseErr),
+	)
+
+	overlayReleaseFailureCounter.Add(ctx, 1)
 }
 
 func (o *UblkProvider) Path() (string, error) {

@@ -8,7 +8,11 @@ transport, `pkg/sandbox/ublk`, which serves the same cache through the Linux
 
 Status: implemented and tested behind the `ublk-rootfs` feature flag (default
 off). The NBD transport stays the default and is unchanged; a host with the flag
-on but no usable ublk driver logs the failure and falls back to NBD.
+on but no usable ublk driver logs the failure and falls back to NBD. The
+fallback is decided while the transport is selected: the provider is created
+and its device started there, so a driver that cannot create, start or publish
+a device falls back before Firecracker is configured, not when the sandbox asks
+for the device path.
 See `ARCHITECTURE.md` for where the transport sits in the node.
 
 ## Requirements
@@ -32,7 +36,8 @@ What the rootfs transport has to provide, from the orchestrator's side:
    (sequential and random, read and write), with a per-host tunable for
    concurrency.
 6. **Deployability.** Selectable per host, defaulting to the existing path, and
-   able to fall back when the driver is not there. No new dependencies and no
+   able to fall back when the driver is not there or not usable (control plane,
+   device creation or start, node publication). No new dependencies and no
    cgo: the orchestrator builds as a static host binary and runs as root.
 
 ## Design
@@ -100,7 +105,7 @@ Protocol facts the implementation depends on (verified against
 | 6 | A boolean feature flag, NBD default | side-by-side testing and rollback in one deploy |
 | 7 | Devices created on demand, deleted on teardown | no `nbds_max`-style ceiling and a drop-in replacement for the NBD provider's path |
 | 8 | `DEL_DEV_ASYNC` on teardown | the synchronous delete waits for the last opener |
-| 9 | No write cache advertised (`attrs` zero) | same device semantics as NBD-without-flush: the block layer completes flush requests itself, and `Sync()` is what reports writeback failures |
+| 9 | No write cache advertised (`attrs` zero) | same device semantics as NBD-without-flush ([`nbd-transport.md`](nbd-transport.md)): the block layer completes flush requests itself, and `Sync()` is what reports writeback failures |
 
 Deliberately not implemented: zero-copy, batch I/O (`UBLK_F_BATCH_IO`), user
 recovery, unprivileged mode, zoned devices.

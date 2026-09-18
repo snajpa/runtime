@@ -47,6 +47,17 @@ const (
 
 	// deviceCloseWarnThreshold flags a stalled descriptor release: through a
 	// live data path the flush and close finish well under a second.
+	//
+	// The declared device teardown budget is ioTimeout + deadconnTimeout
+	// (S-30): against a backend that has stopped answering, Close's flush is
+	// deliberately allowed to run to that kernel ceiling instead of abandoning
+	// writes the kernel already acknowledged to the guest (see Close). The
+	// watchdog warns and tags the step in progress long before the ceiling; a
+	// teardown crossing it is counted in orchestrator.nbd.device.close.slow
+	// (by stage) and its full distribution lands in
+	// orchestrator.nbd.device.close.duration. A teardown approaching the
+	// ceiling means the backend is not answering -- alert on the slow-close
+	// counter.
 	deviceCloseWarnThreshold = 5 * time.Second
 )
 
@@ -444,11 +455,12 @@ func (d *DirectPathMount) Close(ctx context.Context) error {
 	// being the device's last opener - it is not whenever a udev probe holds
 	// the device open across Close.
 	//
-	// The intended contract: against a live but unanswering backend this
-	// flush holds the device, its pool slot, and the handlers for up to the
-	// kernel ceiling (ioTimeout + deadconnTimeout), ahead of the cancel below
-	// -- deliberately. Tearing down first was faster only by abandoning
-	// writes the kernel had already acknowledged to the guest.
+	// The declared budget (see deviceCloseWarnThreshold): against a live but
+	// unanswering backend this flush holds the device, its pool slot, and the
+	// handlers for up to the kernel ceiling (ioTimeout + deadconnTimeout),
+	// ahead of the cancel below -- deliberately. Tearing down first was faster
+	// only by abandoning writes the kernel had already acknowledged to the
+	// guest.
 	//
 	// Each event marks a step that can block on the backend, so a stall in a
 	// trace is attributable to one step instead of one interval covering

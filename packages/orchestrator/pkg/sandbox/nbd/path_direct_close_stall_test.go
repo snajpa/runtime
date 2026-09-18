@@ -75,10 +75,13 @@ func TestPathDirect_CloseReturnsWhileTheBackendStalls(t *testing.T) {
 	overlay := setupOverlay(t, 16*1024*1024)
 	hostage := &hostageWriteDevice{Device: overlay, writeDelay: hostageDelay}
 
-	// deadconn is the deadline a regression stalls on; 30s keeps it far from
-	// both the close budget asserted below and the hostage delay. ioTimeout
-	// only has to clear the hostage delay so the live-path writeback is never
-	// timed out.
+	// The injected timeouts are the declared teardown budget this test asserts
+	// against: ioTimeout + deadconnTimeout is the ceiling (against an
+	// unanswering backend a teardown is allowed to run to it, deliberately),
+	// and deadconnTimeout is also the deadline a torn-down data path stalls
+	// on, so it must sit far above the hostage delay and the live-path return.
+	// ioTimeout only has to clear the hostage delay so the live-path writeback
+	// is never timed out.
 	mnt, devicePath := setupNBDMount(t, featureFlags, hostage,
 		WithIOTimeout(20*time.Second),
 		WithDeadconnTimeout(30*time.Second),
@@ -128,8 +131,14 @@ func TestPathDirect_CloseReturnsWhileTheBackendStalls(t *testing.T) {
 	elapsed := time.Since(closeStart)
 	parent.End()
 
-	require.Lessf(t, elapsed, 10*time.Second,
-		"Close took %s: it flushed writeback into a torn-down data path and waited for the kernel to abandon it", elapsed)
+	// Every bound is the declared teardown budget's, not a wall-clock guess:
+	// the live path returns when the backend answers, a torn-down path waits
+	// the kernel's deadlines instead (deadconnTimeout here; the full ceiling
+	// for commands orphaned in flight), and no teardown may exceed the ceiling.
+	require.Lessf(t, elapsed, mnt.ioTimeout,
+		"Close took %s: it must return on the live path, ahead of the kernel's per-request timeout (%s); a torn-down data path waits the kernel's deadlines instead", elapsed, mnt.ioTimeout)
+	require.Lessf(t, elapsed, mnt.ioTimeout+mnt.deadconnTimeout,
+		"Close took %s: no teardown may exceed the declared budget ceiling (%s)", elapsed, mnt.ioTimeout+mnt.deadconnTimeout)
 
 	assertCloseWatchdogFired(t, traceID, deviceIndex)
 	require.GreaterOrEqual(t, slowCloseCount(t, "sync")-slowClosesBefore, int64(1),

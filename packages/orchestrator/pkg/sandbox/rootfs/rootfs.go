@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -19,9 +20,22 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs")
+var (
+	tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs")
+	meter  = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs")
+)
+
+// overlayReleaseFailureCounter counts overlay releases whose pause barrier
+// reported a failed flush: the backend is missing writes the guest was told
+// had landed, so the export fails instead of building a silently incomplete
+// diff. Each count is a pause/export that failed loudly.
+var overlayReleaseFailureCounter = utils.Must(meter.Int64Counter("orchestrator.rootfs.overlay.release.failed",
+	metric.WithDescription("Overlay releases whose pause barrier (device flush) reported a failure. The backend is missing writes the guest was told had landed, so the export fails instead of silently building an incomplete diff; each count is a pause/export that failed loudly."),
+	metric.WithUnit("{release}"),
+))
 
 // ErrDeferredExportNotSupported is returned by PrepareExportDiff on providers
 // that can't defer the rootfs export (e.g. DirectProvider). Callers use it to
@@ -85,7 +99,9 @@ func flush(ctx context.Context, path string) error {
 //
 // A host that has the flag on but no usable ublk driver falls back to NBD with
 // the error logged, so a misconfiguration costs the transport, not the
-// sandboxes.
+// sandboxes. "No usable driver" covers both a control plane that cannot be
+// opened and a device that cannot be created, started or published: the ublk
+// provider is started here, while the fallback is still available.
 func NewOverlayProvider(
 	ctx context.Context,
 	rootfs block.ReadonlyDevice,
@@ -95,12 +111,29 @@ func NewOverlayProvider(
 ) (Provider, error) {
 	if featureFlags.BoolFlag(ctx, featureflags.UblkRootfsFlag) {
 		provider, err := NewUblkProvider(ctx, rootfs, cachePath, featureFlags)
-		if err == nil {
+		if err != nil {
+			logger.L().Error(ctx, "ublk transport unavailable, falling back to NBD", zap.Error(err))
+		} else if startErr := startUblkProvider(ctx, provider); startErr != nil {
+			logger.L().Error(ctx, "ublk transport failed to start, falling back to NBD", zap.Error(startErr))
+
+			// Release the failed provider: no device was published, so this is
+			// the no-device-started path of Close (cache and control plane).
+			_ = provider.Close(ctx)
+		} else {
 			return provider, nil
 		}
-
-		logger.L().Error(ctx, "ublk transport unavailable, falling back to NBD", zap.Error(err))
 	}
 
 	return NewNBDProvider(ctx, rootfs, cachePath, devicePool, featureFlags)
+}
+
+// startUblkProvider starts the provider the selection chose and reports
+// whether its device came up. Start's return value only reports a double
+// start; the failure rides the ready promise, so that is what is checked.
+func startUblkProvider(ctx context.Context, provider Provider) error {
+	_ = provider.Start(ctx)
+
+	_, err := provider.Path()
+
+	return err
 }
