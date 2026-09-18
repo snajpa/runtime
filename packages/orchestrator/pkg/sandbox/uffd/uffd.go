@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -35,6 +36,9 @@ const (
 	uffdMsgListenerTimeout = 10 * time.Second
 	fdSize                 = 4
 	regionMappingsSize     = 1024
+	// uffdSocketMode is the only mode the UFFD socket is ever left in: the
+	// orchestrator's own user is the only legitimate peer.
+	uffdSocketMode = 0o600
 )
 
 type Uffd struct {
@@ -95,6 +99,16 @@ func (u *Uffd) Prefault(ctx context.Context, offset int64, data []byte) (install
 }
 
 func (u *Uffd) Start(ctx context.Context) error {
+	if err := checkSocketDir(filepath.Dir(u.socketPath)); err != nil {
+		return err
+	}
+
+	if _, err := os.Lstat(u.socketPath); err == nil {
+		return fmt.Errorf("uffd socket path %q already exists", u.socketPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to check uffd socket path %q: %w", u.socketPath, err)
+	}
+
 	lis, err := net.ListenUnix("unix", &net.UnixAddr{Name: u.socketPath, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("failed listening on socket: %w", err)
@@ -102,7 +116,7 @@ func (u *Uffd) Start(ctx context.Context) error {
 
 	u.lis = lis
 
-	err = os.Chmod(u.socketPath, 0o777)
+	err = os.Chmod(u.socketPath, uffdSocketMode)
 	if err != nil {
 		closeErr := lis.Close()
 
@@ -154,7 +168,23 @@ func (u *Uffd) handle(ctx context.Context, fdExit *fdexit.FdExit) error {
 		return fmt.Errorf("failed accepting firecracker connection: %w", err)
 	}
 
+	// The connection carries the region description and the fds the serve loop
+	// then owns; this socket endpoint itself is finished once they are read, so
+	// it never outlives this function.
+	defer conn.Close()
+
 	unixConn := conn.(*net.UnixConn)
+
+	ucred, err := peerCreds(unixConn)
+	if err != nil {
+		return fmt.Errorf("failed to read peer credentials: %w", err)
+	}
+
+	if err := checkPeerCreds(ucred); err != nil {
+		u.logger.Warn(ctx, "rejecting uffd socket connection", zap.String("socket_path", u.socketPath), zap.Error(err))
+
+		return err
+	}
 
 	regionMappingsBuf := make([]byte, regionMappingsSize)
 	// Firecracker may send 1 fd (UFFD) or 2 (UFFD + memfd, on newer versions).
@@ -254,6 +284,90 @@ func (u *Uffd) handle(ctx context.Context, fdExit *fdexit.FdExit) error {
 	}
 
 	return nil
+}
+
+// ErrUnexpectedPeer reports a UFFD socket connection that does not come from
+// the orchestrator's own user.
+var ErrUnexpectedPeer = errors.New("unexpected uffd socket peer")
+
+// checkSocketDir verifies that the directory holding the socket cannot be used
+// by another local user to replace the socket path under us.
+//
+// The socket lives under os.TempDir() in every deployment shape today, so the
+// shared sticky directory shape is accepted: the sticky bit stops other users
+// from unlinking or renaming our socket, and the socket itself is mode 0600.
+// Any other directory must be owned by the orchestrator's user and must not be
+// writable by group or other users, so no one else can unlink or rename the
+// socket path.
+func checkSocketDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("failed to stat uffd socket directory %q: %w", dir, err)
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("uffd socket directory %q is not a directory", dir)
+	}
+
+	mode := info.Mode()
+	if mode&os.ModeSticky != 0 {
+		return nil
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("failed to read the ownership of uffd socket directory %q", dir)
+	}
+
+	if uid := int(stat.Uid); uid != os.Getuid() {
+		return fmt.Errorf("uffd socket directory %q is owned by uid %d, expected %d", dir, uid, os.Getuid())
+	}
+
+	if mode.Perm()&0o022 != 0 {
+		return fmt.Errorf("uffd socket directory %q has mode %#o; group or other users could replace the socket path", dir, mode.Perm())
+	}
+
+	return nil
+}
+
+// checkPeerCreds accepts only a peer running as the orchestrator's own user:
+// Firecracker is a child process of the orchestrator, so nothing else may hand
+// the serve loop a region description and fds of its own.
+func checkPeerCreds(ucred *syscall.Ucred) error {
+	if ucred == nil {
+		return fmt.Errorf("%w: missing credentials", ErrUnexpectedPeer)
+	}
+
+	if uid := int(ucred.Uid); uid != os.Getuid() {
+		return fmt.Errorf("%w: uid %d, expected %d", ErrUnexpectedPeer, uid, os.Getuid())
+	}
+
+	return nil
+}
+
+// peerCreds reads the accepted connection's SO_PEERCRED.
+func peerCreds(conn *net.UnixConn) (*syscall.Ucred, error) {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get the raw connection: %w", err)
+	}
+
+	var (
+		ucred   *syscall.Ucred
+		credErr error
+	)
+
+	if err := rawConn.Control(func(fd uintptr) {
+		ucred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+	}); err != nil {
+		return nil, fmt.Errorf("failed to control the raw connection: %w", err)
+	}
+
+	if credErr != nil {
+		return nil, fmt.Errorf("failed to read peer credentials: %w", credErr)
+	}
+
+	return ucred, nil
 }
 
 func (u *Uffd) Stop() error {
