@@ -84,9 +84,33 @@ func (c *cachedSeekable) OpenRangeReader(ctx context.Context, off int64, length 
 
 func (c *cachedSeekable) openReaderUncompressed(ctx context.Context, off, length int64) (RangeReader, Source, error) {
 	chunkPath := c.makeChunkFilename(off)
-
 	start := time.Now()
+
 	fp, err := os.Open(chunkPath)
+
+	var size int64
+
+	if err == nil {
+		var info os.FileInfo
+		if info, err = fp.Stat(); err == nil {
+			size = info.Size()
+		}
+	}
+
+	needed := (off % c.chunkSize) + length
+	if err == nil && size < needed {
+		// The cached chunk is shorter than the requested range: legitimate only
+		// when it is the object's tail. With the object size known (local size
+		// sidecar), a chunk that ends before the object does is a torn write —
+		// evict it and refetch instead of serving short data (REQ-C1).
+		if c.truncatedChunk(ctx, off, size) {
+			_ = fp.Close()
+			_ = os.Remove(chunkPath)
+
+			err = fmt.Errorf("cached chunk %s is torn: %d bytes end before the object end", chunkPath, size)
+		}
+	}
+
 	RecordReadOpen(ctx, time.Since(start), c.objType, SourceNFS, CompressionNone, err)
 	if err == nil {
 		return newSectionReader(fp, 0, length), SourceNFS, nil
@@ -103,6 +127,21 @@ func (c *cachedSeekable) openReaderUncompressed(ctx context.Context, off, length
 	}
 
 	return rc, innerSource, nil
+}
+
+// truncatedChunk reports whether a cached chunk file that is shorter than the
+// requested range ends before the object does — a torn/truncated write — as
+// opposed to a legitimate tail chunk. Without the local size sidecar the
+// object size is unknown, so the chunk is not judged and is served as before.
+func (c *cachedSeekable) truncatedChunk(ctx context.Context, off, size int64) bool {
+	objectSize, err := c.readLocalSize(ctx)
+	if err != nil {
+		return false
+	}
+
+	chunkStart := off - (off % c.chunkSize)
+
+	return chunkStart+size < objectSize
 }
 
 // uncompressedChunkWriteback returns a captureReader callback that persists
