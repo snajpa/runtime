@@ -53,7 +53,11 @@ func (f *headerSource) Stream(ctx context.Context, sender Sender) error {
 		return ErrNotAvailable
 	}
 
-	// Rely on the V5 format on the wire.
+	// Wire promise (REQ-A1, audit §9.2): peer-served headers are always
+	// serialized as V5 with IncompletePendingUpload set, regardless of the
+	// stored format. A peer reader must therefore accept V5 and must not treat
+	// the flag as final — it marks the header as provisional, so the reader
+	// keeps resolving the build instead of serving it as complete.
 	wire := *h
 	meta := *h.Metadata
 	meta.Version = header.MetadataVersionV5
