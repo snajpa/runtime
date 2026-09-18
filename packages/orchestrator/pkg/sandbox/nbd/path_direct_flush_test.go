@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +122,75 @@ func TestPathDirect_FlushPushesBufferedWrites(t *testing.T) {
 	_, err = overlay.ReadAt(t.Context(), readBack, 0)
 	require.NoError(t, err, "failed to read from the backend")
 	require.Equal(t, written, readBack, "backend is missing the flushed write")
+}
+
+// countingWriteDevice counts the writes a flush pushes to the backend, so a
+// test can assert that a healthy barrier moves data instead of rewriting it.
+type countingWriteDevice struct {
+	block.Device
+
+	writes atomic.Int64
+}
+
+func (c *countingWriteDevice) WriteAt(p []byte, off int64) (int, error) {
+	c.writes.Add(1)
+
+	return c.Device.WriteAt(p, off)
+}
+
+func (c *countingWriteDevice) WriteZeroesAt(off, length int64) (int, error) {
+	c.writes.Add(1)
+
+	return c.Device.WriteZeroesAt(off, length)
+}
+
+// TestPathDirect_FlushIsSilentAndCheap pins the happy half of the declared
+// barrier contract beyond the data check above: a healthy flush reports no
+// error, a second flush writes nothing at all (the barrier moves data, it
+// does not rewrite it), and neither flush leaves goroutines behind.
+func TestPathDirect_FlushIsSilentAndCheap(t *testing.T) { //nolint:paralleltest // reads the process goroutine count.
+	featureFlags, err := featureflags.NewClient()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = featureFlags.Close(context.WithoutCancel(t.Context())) })
+
+	overlay := setupOverlay(t, 10*1024*1024)
+	backend := &countingWriteDevice{Device: overlay}
+	mnt, devicePath := setupNBDMount(t, featureFlags, backend)
+
+	deviceFile, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	require.NoError(t, err, "failed to open device")
+	t.Cleanup(func() {
+		deviceFile.Close()
+	})
+
+	written := newPattern(header.RootfsBlockSize)
+	_, err = deviceFile.WriteAt(written, 0)
+	require.NoError(t, err, "failed to write to device")
+
+	before := runtime.NumGoroutine()
+
+	require.NoError(t, mnt.Flush(t.Context()), "a healthy flush reports no error")
+
+	readBack := make([]byte, len(written))
+	_, err = overlay.ReadAt(t.Context(), readBack, 0)
+	require.NoError(t, err, "failed to read from the backend")
+	require.Equal(t, written, readBack, "the flush must push the buffered write")
+
+	afterFirst := backend.writes.Load()
+	require.NoError(t, mnt.Flush(t.Context()), "a healthy flush reports no error")
+	require.Equal(t, afterFirst, backend.writes.Load(),
+		"a second flush must not add backend writes: the barrier moves data, it does not rewrite it")
+
+	// Poll in-line rather than through require.Eventually: testify evaluates
+	// its condition in a fresh goroutine, so a goroutine-count condition would
+	// count its own evaluator and never settle.
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	after := runtime.NumGoroutine()
+	require.LessOrEqual(t, after, before,
+		"the flush must not leave goroutines behind (before=%d after=%d)", before, after)
 }
 
 func setupOverlay(t *testing.T, size int64) *block.Overlay {

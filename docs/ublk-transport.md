@@ -100,7 +100,7 @@ Protocol facts the implementation depends on (verified against
 | 6 | A boolean feature flag, NBD default | side-by-side testing and rollback in one deploy |
 | 7 | Devices created on demand, deleted on teardown | no `nbds_max`-style ceiling and a drop-in replacement for the NBD provider's path |
 | 8 | `DEL_DEV_ASYNC` on teardown | the synchronous delete waits for the last opener |
-| 9 | No write cache advertised (`attrs` zero) | same device semantics as NBD-without-flush: the block layer completes flush requests itself, and `Sync()` is what reports writeback failures |
+| 9 | No write cache advertised (`attrs` zero) | same device semantics as NBD-without-flush ([`nbd-transport.md`](nbd-transport.md)): the block layer completes flush requests itself, and `Sync()` is what reports writeback failures |
 
 Deliberately not implemented: zero-copy, batch I/O (`UBLK_F_BATCH_IO`), user
 recovery, unprivileged mode, zoned devices.

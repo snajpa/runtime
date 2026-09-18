@@ -51,7 +51,12 @@ type UblkProvider struct {
 	cachePath string
 	sealGen   atomic.Int64
 
-	finishedOperations chan struct{}
+	// finishedOperations carries the pause-barrier outcome of the Close that
+	// released the device (nil when the flush succeeded, the flush error
+	// otherwise) so the export paths fail loudly instead of shipping a
+	// silently incomplete diff (S-30 semantics, mirrored from the NBD
+	// provider after the review's ublk barrier finding).
+	finishedOperations chan error
 
 	mu     sync.Mutex
 	device *ublk.Device
@@ -88,7 +93,7 @@ func NewUblkProvider(ctx context.Context, rootfs block.ReadonlyDevice, cachePath
 		featureFlags:       featureFlags,
 		manager:            manager,
 		ready:              utils.NewSetOnce[string](),
-		finishedOperations: make(chan struct{}, 1),
+		finishedOperations: make(chan error, 1),
 		blockSize:          blockSize,
 		cachePath:          cachePath,
 	}, nil
@@ -152,9 +157,8 @@ func (o *UblkProvider) ejectAndStopSandbox(
 		}
 	}()
 
-	select {
-	case <-o.finishedOperations:
-	case <-ctx.Done():
+	releaseErr := o.awaitOverlayRelease(ctx)
+	if errors.Is(releaseErr, errOverlayReleaseTimeout) {
 		// Close the cache to avoid leaking the mmaped memory. Log an error
 		// if that failed
 		closeErr := cache.Close()
@@ -162,7 +166,22 @@ func (o *UblkProvider) ejectAndStopSandbox(
 			logger.L().Warn(ctx, "error closing cache", zap.Error(closeErr))
 		}
 
-		return nil, errors.New("timeout waiting for overlay device to be released")
+		return nil, releaseErr
+	}
+	if releaseErr != nil {
+		// The device was released, but its pause barrier reported a failure:
+		// the backend is missing writes the guest was told had landed, so an
+		// exported diff would be silently incomplete. Reclaim the detached
+		// cache (nobody owns it on this path) and fail the pause/export
+		// loudly instead of exporting it (S-30, REQ-E1).
+		closeErr := cache.Close()
+		if closeErr != nil {
+			logger.L().Warn(ctx, "error closing cache", zap.Error(closeErr))
+		}
+
+		o.reportOverlayReleaseFailure(ctx, releaseErr)
+
+		return nil, releaseErr
 	}
 	telemetry.ReportEvent(ctx, "sandbox stopped")
 
@@ -295,12 +314,15 @@ func (o *UblkProvider) Close(ctx context.Context) error {
 	var errs []error
 
 	var err error
+	var barrierErr error
+	var deviceCloseErr error
 
 	// A provider that never started a device has nothing to flush; syncing
 	// anyway would report a spurious "no ublk device to flush" on error paths.
 	if o.startedDevice() != nil {
 		err = o.sync(ctx)
 		if err != nil {
+			barrierErr = err
 			errs = append(errs, fmt.Errorf("error flushing cow device: %w", err))
 		}
 	}
@@ -315,6 +337,7 @@ func (o *UblkProvider) Close(ctx context.Context) error {
 	if !alreadyClosed {
 		if device != nil {
 			if err := device.Close(ctx); err != nil {
+				deviceCloseErr = err
 				errs = append(errs, fmt.Errorf("error closing ublk device: %w", err))
 			}
 		}
@@ -325,7 +348,11 @@ func (o *UblkProvider) Close(ctx context.Context) error {
 
 		// The device is gone, so nothing can reach the cache any more; this is
 		// the point the export paths wait for before they read it.
-		o.finishedOperations <- struct{}{}
+		// The barrier is "flush and teardown completed", not just the first
+		// sync: device.Close() performs another Sync and the STOP/delete/owner
+		// teardown, so its failure also means the release did not complete.
+		// Mirrors the NBD provider's syncErr+mountCloseErr join (S-30).
+		o.signalFinishedOperations(barrierOutcome(barrierErr, deviceCloseErr))
 	}
 
 	err = o.overlay.Close()
@@ -336,6 +363,65 @@ func (o *UblkProvider) Close(ctx context.Context) error {
 	logger.L().Info(ctx, "overlay device released")
 
 	return errors.Join(errs...)
+}
+
+// barrierOutcome joins a pause barrier's steps into the outcome the release
+// signal carries: the first sync's error and the ublk device teardown's error,
+// either of which means the release did not complete (the barrier is "flush
+// and teardown completed"). Extracted from Close so the join is pinned by a
+// test; the call-site wiring itself needs the real device and stays
+// inspection-verified, exactly like the NBD provider's syncErr+mountCloseErr
+// join.
+func barrierOutcome(syncErr, deviceCloseErr error) error {
+	return errors.Join(syncErr, deviceCloseErr)
+}
+
+// signalFinishedOperations publishes the overlay-release signal, carrying the
+// pause-barrier outcome (nil when the device flush succeeded, the flush error
+// otherwise), without ever blocking: Close may run twice (or race the eject
+// waiter), and a second blocking send on the buffer-1 channel would hang
+// teardown forever (S-19, INV-5). The first signal is the one a waiter
+// receives, so the outcome of the Close that released the device is enforced.
+func (o *UblkProvider) signalFinishedOperations(barrierErr error) {
+	select {
+	case o.finishedOperations <- barrierErr:
+	default:
+	}
+}
+
+// awaitOverlayRelease waits for the release signal Close publishes and returns
+// the pause-barrier outcome it carries: nil when the device flush succeeded,
+// the flush failure when the backend is missing writes the guest was told had
+// landed, or errOverlayReleaseTimeout when ctx expired first (the caller then
+// closes the ejected cache and abandons the export).
+func (o *UblkProvider) awaitOverlayRelease(ctx context.Context) error {
+	select {
+	case barrierErr := <-o.finishedOperations:
+		if barrierErr != nil {
+			return fmt.Errorf("overlay device released with a failed flush: %w", barrierErr)
+		}
+
+		return nil
+	case <-ctx.Done():
+		return errOverlayReleaseTimeout
+	}
+}
+
+// reportOverlayReleaseFailure records a release that carried a failed device
+// flush: the export fails instead of building a silently incomplete diff, and
+// the counter makes the rate visible (mirrored from the NBD provider, S-30).
+func (o *UblkProvider) reportOverlayReleaseFailure(ctx context.Context, releaseErr error) {
+	devicePath, pathErr := o.Path()
+	if pathErr != nil {
+		devicePath = "unknown"
+	}
+
+	logger.L().Error(ctx, "overlay device released with a failed flush; failing the export",
+		zap.String("device_path", devicePath),
+		zap.Error(releaseErr),
+	)
+
+	overlayReleaseFailureCounter.Add(ctx, 1)
 }
 
 func (o *UblkProvider) Path() (string, error) {

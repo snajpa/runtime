@@ -37,7 +37,7 @@ type NBDProvider struct {
 	cachePath string
 	sealGen   atomic.Int64
 
-	finishedOperations chan struct{}
+	finishedOperations chan error
 	devicePool         *nbd.DevicePool
 }
 
@@ -63,7 +63,7 @@ func NewNBDProvider(ctx context.Context, rootfs block.ReadonlyDevice, cachePath 
 		overlay:            overlay,
 		featureFlags:       featureFlags,
 		ready:              utils.NewSetOnce[string](),
-		finishedOperations: make(chan struct{}, 1),
+		finishedOperations: make(chan error, 1),
 		blockSize:          blockSize,
 		cachePath:          cachePath,
 		devicePool:         devicePool,
@@ -83,7 +83,9 @@ func (o *NBDProvider) Start(ctx context.Context) error {
 // sandbox and waits for the overlay device to be released, returning the ejected
 // (now standalone, frozen) cache. The caller owns the returned cache and must
 // Close it. Shared by the synchronous ExportDiff and the deferred
-// PrepareExportDiff.
+// PrepareExportDiff. A release that reports a failed device flush fails here
+// (S-30): the caller must not export a cache whose backend was still missing
+// writes the guest was told had landed.
 func (o *NBDProvider) ejectAndStopSandbox(
 	ctx context.Context,
 	closeSandbox func(ctx context.Context) error,
@@ -101,9 +103,8 @@ func (o *NBDProvider) ejectAndStopSandbox(
 		}
 	}()
 
-	select {
-	case <-o.finishedOperations:
-	case <-ctx.Done():
+	releaseErr := o.awaitOverlayRelease(ctx)
+	if errors.Is(releaseErr, errOverlayReleaseTimeout) {
 		// Close the cache to avoid leaking the mmaped memory. Log an error
 		// if that failed
 		closeErr := cache.Close()
@@ -111,8 +112,26 @@ func (o *NBDProvider) ejectAndStopSandbox(
 			logger.L().Warn(ctx, "error closing cache", zap.Error(closeErr))
 		}
 
-		return nil, errors.New("timeout waiting for overlay device to be released")
+		return nil, releaseErr
 	}
+	if releaseErr != nil {
+		// The device was released, but its pause barrier reported a failure:
+		// the backend is missing writes the guest was told had landed, so an
+		// exported diff would be silently incomplete. Fail the pause/export
+		// loudly instead of exporting it (S-30, REQ-E1).
+		o.reportOverlayReleaseFailure(ctx, releaseErr)
+
+		// The cache was already detached from the overlay (EjectCache) and the
+		// overlay skips ejected caches on Close, so reclaim it here — nobody
+		// else owns it and a failed pause must not leak the mapping/file.
+		closeErr := cache.Close()
+		if closeErr != nil {
+			logger.L().Warn(ctx, "error closing cache", zap.Error(closeErr))
+		}
+
+		return nil, releaseErr
+	}
+
 	telemetry.ReportEvent(ctx, "sandbox stopped")
 
 	return cache, nil
@@ -250,15 +269,59 @@ func (o *NBDProvider) FoldSealed(ctx context.Context) (*block.Cache, error) {
 	return sealed, err
 }
 
-// signalFinishedOperations publishes the overlay-release signal without ever
-// blocking: Close may run twice (or race the eject waiter), and a second
-// blocking send on the buffer-1 channel would hang teardown forever (S-19,
-// INV-5).
-func (o *NBDProvider) signalFinishedOperations() {
+// signalFinishedOperations publishes the overlay-release signal, carrying the
+// pause-barrier outcome (nil when the device flush succeeded, the flush error
+// otherwise), without ever blocking: Close may run twice (or race the eject
+// waiter), and a second blocking send on the buffer-1 channel would hang
+// teardown forever (S-19, INV-5). The first signal is the one a waiter
+// receives, so the outcome of the Close that released the device is the one
+// enforced.
+func (o *NBDProvider) signalFinishedOperations(barrierErr error) {
 	select {
-	case o.finishedOperations <- struct{}{}:
+	case o.finishedOperations <- barrierErr:
 	default:
 	}
+}
+
+// errOverlayReleaseTimeout reports that the wait for the overlay-release
+// signal ended because the caller's ctx expired rather than because the device
+// was released.
+var errOverlayReleaseTimeout = errors.New("timeout waiting for overlay device to be released")
+
+// awaitOverlayRelease waits for the release signal Close publishes and returns
+// the pause-barrier outcome it carries: nil when the device flush succeeded,
+// the flush failure when the backend is missing writes the guest was told had
+// landed, or errOverlayReleaseTimeout when ctx expired first (the caller then
+// closes the ejected cache and abandons the export).
+func (o *NBDProvider) awaitOverlayRelease(ctx context.Context) error {
+	select {
+	case barrierErr := <-o.finishedOperations:
+		if barrierErr != nil {
+			return fmt.Errorf("overlay device released with a failed flush: %w", barrierErr)
+		}
+
+		return nil
+	case <-ctx.Done():
+		return errOverlayReleaseTimeout
+	}
+}
+
+// reportOverlayReleaseFailure records a release that carried a failed device
+// flush: the export fails instead of building a silently incomplete diff, and
+// the counter makes the rate visible: each count is a pause that failed loudly
+// where it previously logged and exported anyway.
+func (o *NBDProvider) reportOverlayReleaseFailure(ctx context.Context, releaseErr error) {
+	devicePath, pathErr := o.Path()
+	if pathErr != nil {
+		devicePath = "unknown"
+	}
+
+	logger.L().Error(ctx, "overlay device released with a failed flush; failing the export",
+		zap.String("device_path", devicePath),
+		zap.Error(releaseErr),
+	)
+
+	overlayReleaseFailureCounter.Add(ctx, 1)
 }
 
 func (o *NBDProvider) Close(ctx context.Context) error {
@@ -267,19 +330,22 @@ func (o *NBDProvider) Close(ctx context.Context) error {
 
 	var errs []error
 
-	err := o.sync(ctx)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("error flushing cow device: %w", err))
+	syncErr := o.sync(ctx)
+	if syncErr != nil {
+		errs = append(errs, fmt.Errorf("error flushing cow device: %w", syncErr))
 	}
 
-	err = o.mnt.Close(ctx)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("error closing overlay mount: %w", err))
+	mountCloseErr := o.mnt.Close(ctx)
+	if mountCloseErr != nil {
+		errs = append(errs, fmt.Errorf("error closing overlay mount: %w", mountCloseErr))
 	}
 
-	o.signalFinishedOperations()
+	// Publish the barrier outcome with the release signal: the export that
+	// waits for the device to be released must not build a diff from a backend
+	// that is missing writes the guest was told had landed (S-30).
+	o.signalFinishedOperations(errors.Join(syncErr, mountCloseErr))
 
-	err = o.overlay.Close()
+	err := o.overlay.Close()
 	if err != nil {
 		errs = append(errs, fmt.Errorf("error closing overlay cache: %w", err))
 	}

@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -19,9 +20,22 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs")
+var (
+	tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs")
+	meter  = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs")
+)
+
+// overlayReleaseFailureCounter counts overlay releases whose pause barrier
+// reported a failed flush: the backend is missing writes the guest was told
+// had landed, so the export fails instead of building a silently incomplete
+// diff. Each count is a pause/export that failed loudly.
+var overlayReleaseFailureCounter = utils.Must(meter.Int64Counter("orchestrator.rootfs.overlay.release.failed",
+	metric.WithDescription("Overlay releases whose pause barrier (device flush) reported a failure. The backend is missing writes the guest was told had landed, so the export fails instead of silently building an incomplete diff; each count is a pause/export that failed loudly."),
+	metric.WithUnit("{release}"),
+))
 
 // ErrDeferredExportNotSupported is returned by PrepareExportDiff on providers
 // that can't defer the rootfs export (e.g. DirectProvider). Callers use it to
