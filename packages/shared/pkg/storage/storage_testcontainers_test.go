@@ -7,9 +7,11 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -107,7 +110,12 @@ func startObjectStoreBackend(t *testing.T) *s3TestBackend {
 			Cmd:          spec.cmd,
 			Env:          spec.env,
 			ExposedPorts: []string{"9000/tcp"},
-			WaitingFor:   wait.ForHTTP(spec.healthPath).WithPort("9000/tcp"),
+			// The listening-port check runs inside the container, so it is
+			// family-agnostic; the readiness probe below then validates the
+			// exact IPv4-pinned endpoint the tests use. testcontainers' own
+			// HTTP wait resolves localhost, whose ::1-first pick missed the
+			// container under concurrent runs (S-54 flake 2026-09-18T21:37:44Z).
+			WaitingFor: wait.ForListeningPort("9000/tcp"),
 		},
 		Started: true,
 	})
@@ -119,21 +127,100 @@ func startObjectStoreBackend(t *testing.T) *s3TestBackend {
 		}
 	})
 
-	host, err := container.Host(t.Context())
-	require.NoError(t, err)
-	port, err := container.MappedPort(t.Context(), "9000")
-	require.NoError(t, err)
+	// Confirm the handle still refers to a running container before using its
+	// endpoint: under concurrent runs an endpoint must never be reused from a
+	// container that has already been removed (S-54).
+	inspected, err := container.Inspect(t.Context())
+	require.NoError(t, err, "inspect %s container", spec.name)
+	require.Equal(t, container.GetContainerID(), inspected.ID, "%s container identity", spec.name)
+	require.True(t, inspected.State != nil && inspected.State.Running,
+		"%s container is not running", spec.name)
+
+	endpoint := containerHTTPEndpoint(t, container, "9000")
+	require.NoError(t, waitForHTTPHealth(t.Context(), endpoint, spec.healthPath),
+		"%s health endpoint", spec.name)
 
 	backend := &s3TestBackend{
-		bucket:   "s3-test-bucket",
-		endpoint: fmt.Sprintf("http://%s:%s", host, port.Port()),
+		// Unique per test: a shared name collides with a concurrent run's
+		// bucket (and with the SDK's retry of a slow but successful create) —
+		// the BucketAlreadyOwnedByYou flake class (S-54).
+		bucket:   fmt.Sprintf("s3-test-%d-%d", time.Now().UnixNano(), testKeySeq.Add(1)),
+		endpoint: "http://" + endpoint,
 	}
 
-	_, err = backend.newClient(t, nil).CreateBucket(t.Context(),
-		&s3.CreateBucketInput{Bucket: aws.String(backend.bucket)})
-	require.NoError(t, err, "create bucket")
+	require.NoError(t, createBucketTolerant(t.Context(), backend.newClient(t, nil), backend.bucket),
+		"create bucket")
 
 	return backend
+}
+
+// containerHTTPEndpoint returns an explicit "host:port" endpoint for
+// containerPort on a container, pinned to the container's IPv4 host binding.
+// Docker publishes separate IPv4 and IPv6 host ports per container and
+// `localhost` resolves to ::1 on dual-stack hosts, so an endpoint built from
+// the wrong family's port can silently reach a *different* container under
+// concurrent runs (the endpoint-reuse flakes, S-54).
+func containerHTTPEndpoint(t *testing.T, container testcontainers.Container, containerPort string) string {
+	t.Helper()
+
+	if inspected, err := container.Inspect(t.Context()); err == nil {
+		for _, bindings := range inspected.NetworkSettings.Ports {
+			for _, b := range bindings {
+				if b.HostIP.Is4() {
+					return "127.0.0.1:" + b.HostPort
+				}
+			}
+		}
+	}
+
+	// Setups without a published IPv4 binding (e.g. host networking) keep the
+	// classic host + mapped-port pair.
+	host, err := container.Host(t.Context())
+	require.NoError(t, err)
+
+	port, err := container.MappedPort(t.Context(), containerPort)
+	require.NoError(t, err)
+
+	return fmt.Sprintf("%s:%s", host, port.Port())
+}
+
+// waitForHTTPHealth polls path on an explicit host:port endpoint until it
+// answers 200 or the deadline passes. Keeping the readiness probe on the same
+// IPv4-pinned address the tests use makes a misaddressed endpoint fail at setup
+// with a clear error instead of mid-test (S-54).
+func waitForHTTPHealth(ctx context.Context, endpoint, path string) error {
+	deadline := time.Now().Add(60 * time.Second)
+
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+endpoint+path, nil)
+		if err != nil {
+			return err
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+
+	return fmt.Errorf("health probe on %s%s: %w", endpoint, path, lastErr)
 }
 
 // newClient builds an S3 client for the backend. httpClient is optional and
@@ -169,7 +256,73 @@ func (b *s3TestBackend) newClient(t *testing.T, httpClient *http.Client, optFns 
 }
 
 func testKey(name string) string {
-	return fmt.Sprintf("s3-test/%d/%s", time.Now().UnixNano(), name)
+	return fmt.Sprintf("s3-test/%d-%d/%s", time.Now().UnixNano(), testKeySeq.Add(1), name)
+}
+
+// testKeySeq keeps object keys unique within a test binary: the timestamp
+// alone can collide between tests running in parallel (S-54).
+var testKeySeq atomic.Uint64
+
+// createBucketTolerant creates the test bucket, treating 409
+// BucketAlreadyOwnedByYou as success: the SDK's default retryer can retry a
+// slow-but-successful CreateBucket, and failing on the retry's 409 made
+// concurrent gate runs flaky (S-54).
+func createBucketTolerant(ctx context.Context, client *s3.Client, bucket string) error {
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	if err == nil {
+		return nil
+	}
+
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "BucketAlreadyOwnedByYou" {
+		return nil
+	}
+
+	return err
+}
+
+// TestCreateBucketTolerant covers the 409 tolerance used by
+// startObjectStoreBackend: a retried create whose first attempt succeeded on
+// the server must not fail the test, while real errors must still surface.
+func TestCreateBucketTolerant(t *testing.T) {
+	t.Parallel()
+
+	clientFor := func(t *testing.T, status int, body string) *s3.Client {
+		t.Helper()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(server.Close)
+
+		return s3.NewFromConfig(aws.Config{
+			Credentials: credentials.NewStaticCredentialsProvider("key", "secret", ""),
+			Region:      "us-east-1",
+		}, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(server.URL)
+			o.UsePathStyle = true
+		})
+	}
+
+	t.Run("already owned is success", func(t *testing.T) {
+		t.Parallel()
+
+		client := clientFor(t, http.StatusConflict,
+			`<?xml version="1.0" encoding="UTF-8"?><Error><Code>BucketAlreadyOwnedByYou</Code><Message>already owned</Message></Error>`)
+
+		require.NoError(t, createBucketTolerant(t.Context(), client, "some-bucket"))
+	})
+
+	t.Run("other errors propagate", func(t *testing.T) {
+		t.Parallel()
+
+		client := clientFor(t, http.StatusForbidden,
+			`<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>denied</Message></Error>`)
+
+		require.Error(t, createBucketTolerant(t.Context(), client, "some-bucket"))
+	})
 }
 
 func writeTempFile(t *testing.T, data []byte) string {

@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"fmt"
 	"net/http"
 	"testing"
 
@@ -64,17 +63,12 @@ func startFakeGCSBackend(t *testing.T) *gcpStorage {
 		}
 	})
 
-	host, err := container.Host(t.Context())
-	require.NoError(t, err)
-	port, err := container.MappedPort(t.Context(), "4443")
-	require.NoError(t, err)
-
 	// fake-gcs-server routes XML-style downloads (used by NewRangeReader) by
 	// Host header, so redirect connections to the emulator while preserving
 	// the original storage.googleapis.com host — the approach fake-gcs-server
 	// recommends for the Go client.
 	httpClient := &http.Client{Transport: emulatorRedirectTransport{
-		emulatorHost: fmt.Sprintf("%s:%s", host, port.Port()),
+		emulatorHost: containerHTTPEndpoint(t, container, "4443"),
 		inner:        http.DefaultTransport,
 	}}
 
