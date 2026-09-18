@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	lz4 "github.com/pierrec/lz4/v4"
@@ -47,66 +46,102 @@ func (z *zstdCompressor) compress(src []byte) ([]byte, error) { //nolint:unparam
 	return z.enc.EncodeAll(src, make([]byte, 0, len(src))), nil
 }
 
-// newCompressorPool returns a pool of compressors for the given config.
-// Both LZ4 and zstd encoders are pooled and reused via Reset/EncodeAll.
-// The config is validated eagerly — if zstd options are invalid, an error
-// is returned immediately rather than deferred to pool.Get().
-func newCompressorPool(cfg CompressConfig) (*sync.Pool, error) {
-	pool := &sync.Pool{}
+// compressorPool is a bounded pool of compressors plus the options used to
+// construct new ones (see codecPool for the bound). Construction errors are
+// returned to the caller: the old sync.Pool.New swallowed zstd.NewWriter's
+// error and handed out a compressor with a nil encoder, whose first EncodeAll
+// would panic.
+type compressorPool struct {
+	pool     *codecPool[compressor]
+	ct       CompressionType
+	zstdOpts []zstd.EOption
+	lz4Opts  []lz4.Option
+}
 
-	switch cfg.CompressionType() {
+// newCompressorPool validates cfg by building one compressor eagerly and
+// pooling it, so a bad config fails here rather than at the first frame.
+func newCompressorPool(cfg CompressConfig) (*compressorPool, error) {
+	p := &compressorPool{
+		pool: newCodecPool[compressor](maxPooledCodecs, discardCompressor),
+		ct:   cfg.CompressionType(),
+	}
+
+	switch p.ct {
 	case CompressionZstd:
-		zstdOpts := []zstd.EOption{
+		p.zstdOpts = []zstd.EOption{
 			zstd.WithEncoderLevel(zstd.EncoderLevel(cfg.Level)),
 			zstd.WithEncoderCRC(true),
 		}
 		if cfg.FrameSize() > 0 {
-			zstdOpts = append(zstdOpts, zstd.WithWindowSize(cfg.FrameSize()))
+			p.zstdOpts = append(p.zstdOpts, zstd.WithWindowSize(cfg.FrameSize()))
 		}
 		if cfg.EncoderConcurrency > 0 {
-			zstdOpts = append(zstdOpts, zstd.WithEncoderConcurrency(cfg.EncoderConcurrency))
-		}
-
-		// Validate options by creating one encoder upfront.
-		first, err := zstd.NewWriter(nil, zstdOpts...)
-		if err != nil {
-			return nil, fmt.Errorf("zstd encoder: %w", err)
-		}
-		pool.Put(&zstdCompressor{enc: first})
-
-		pool.New = func() any {
-			// Options are already validated; NewWriter won't fail.
-			enc, _ := zstd.NewWriter(nil, zstdOpts...)
-
-			return &zstdCompressor{enc: enc}
+			p.zstdOpts = append(p.zstdOpts, zstd.WithEncoderConcurrency(cfg.EncoderConcurrency))
 		}
 	case CompressionLZ4:
-		lz4Opts := []lz4.Option{
+		p.lz4Opts = []lz4.Option{
 			lz4.BlockSizeOption(lz4.Block4Mb),
 			lz4.BlockChecksumOption(true),
 			lz4.ChecksumOption(false),
 			lz4.ConcurrencyOption(1),
 			lz4.CompressionLevelOption(lz4.Fast),
 		}
-
-		// Validate options by creating one encoder upfront.
-		first := lz4.NewWriter(nil)
-		if err := first.Apply(lz4Opts...); err != nil {
-			return nil, fmt.Errorf("lz4 encoder: %w", err)
-		}
-		pool.Put(&lz4Compressor{w: first})
-
-		pool.New = func() any {
-			w := lz4.NewWriter(nil)
-			_ = w.Apply(lz4Opts...) //nolint:errcheck // options validated above
-
-			return &lz4Compressor{w: w}
-		}
 	default:
 		return nil, fmt.Errorf("unsupported compression type: %s", cfg.CompressionType())
 	}
 
-	return pool, nil
+	first, err := p.newCompressor()
+	if err != nil {
+		return nil, err
+	}
+	p.pool.put(first)
+
+	return p, nil
+}
+
+// get returns a pooled compressor, constructing one when the pool is empty.
+func (p *compressorPool) get() (compressor, error) {
+	if c, ok := p.pool.get(); ok {
+		return c, nil
+	}
+
+	return p.newCompressor()
+}
+
+// put returns a compressor for reuse; a full pool closes it instead of
+// retaining it.
+func (p *compressorPool) put(c compressor) {
+	p.pool.put(c)
+}
+
+func (p *compressorPool) newCompressor() (compressor, error) {
+	switch p.ct {
+	case CompressionZstd:
+		enc, err := zstd.NewWriter(nil, p.zstdOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("zstd encoder: %w", err)
+		}
+
+		return &zstdCompressor{enc: enc}, nil
+	case CompressionLZ4:
+		w := lz4.NewWriter(nil)
+		if err := w.Apply(p.lz4Opts...); err != nil {
+			return nil, fmt.Errorf("lz4 encoder: %w", err)
+		}
+
+		return &lz4Compressor{w: w}, nil
+	default:
+		return nil, fmt.Errorf("unsupported compression type: %s", p.ct)
+	}
+}
+
+func discardCompressor(c compressor) {
+	switch v := c.(type) {
+	case *zstdCompressor:
+		v.enc.Close()
+	case *lz4Compressor:
+		_ = v.w.Close()
+	}
 }
 
 func CompressBytes(ctx context.Context, data []byte, cfg CompressConfig) (*FullFrameTable, []byte, [32]byte, error) {

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	lz4 "github.com/pierrec/lz4/v4"
@@ -13,11 +12,12 @@ import (
 
 var _ RangeReader = (*decompressReader)(nil)
 
-var lz4DecoderPool sync.Pool
+// lz4DecoderPool is bounded (see codecPool): an lz4.Reader holds a ~64 KiB hash
+// table, and an unbounded pool would retain one per concurrent decode.
+var lz4DecoderPool = newCodecPool[*lz4.Reader](maxPooledCodecs, nil)
 
 func getLZ4Decoder(r io.Reader) *lz4.Reader {
-	if v := lz4DecoderPool.Get(); v != nil {
-		dec := v.(*lz4.Reader)
+	if dec, ok := lz4DecoderPool.get(); ok {
 		dec.Reset(r)
 
 		return dec
@@ -28,18 +28,21 @@ func getLZ4Decoder(r io.Reader) *lz4.Reader {
 
 func putLZ4Decoder(dec *lz4.Reader) {
 	dec.Reset(nil)
-	lz4DecoderPool.Put(dec)
+	lz4DecoderPool.put(dec)
 }
 
 // zstd concurrency is hardcoded to 1: benchmarks show higher values hurt
 // throughput for single 2MiB frame decodes.
 const zstdDecoderConcurrency = 1
 
-var zstdDecoderPool sync.Pool
+// zstdDecoderPool is bounded (see codecPool): a decoder retains its window and
+// decode buffers, sized by the largest frame decoded, and an unbounded pool
+// would keep them all. Overflowing decoders are closed so the buffers go back
+// to the allocator.
+var zstdDecoderPool = newCodecPool[*zstd.Decoder](maxPooledCodecs, func(dec *zstd.Decoder) { dec.Close() })
 
 func getZstdDecoder(r io.Reader) (*zstd.Decoder, error) {
-	if v := zstdDecoderPool.Get(); v != nil {
-		dec := v.(*zstd.Decoder)
+	if dec, ok := zstdDecoderPool.get(); ok {
 		if err := dec.Reset(r); err != nil {
 			dec.Close()
 
@@ -54,7 +57,7 @@ func getZstdDecoder(r io.Reader) (*zstd.Decoder, error) {
 
 func putZstdDecoder(dec *zstd.Decoder) {
 	dec.Reset(nil)
-	zstdDecoderPool.Put(dec)
+	zstdDecoderPool.put(dec)
 }
 
 // decompressReader meters raw source pulls (meteredIn) separately from decoded

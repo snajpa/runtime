@@ -168,7 +168,7 @@ func newPart(index int, parentCtx context.Context, workers int) (*part, context.
 	return p, ctx
 }
 
-func (p *part) addFrame(ctx context.Context, buf inputBuf, n int, pool *sync.Pool) {
+func (p *part) addFrame(ctx context.Context, buf inputBuf, n int, pool *compressorPool) {
 	frameInPart := &frame{uncompressedSize: n}
 	p.frames = append(p.frames, frameInPart)
 	uncompressedData := buf.Bytes()[:n]
@@ -178,9 +178,14 @@ func (p *part) addFrame(ctx context.Context, buf inputBuf, n int, pool *sync.Poo
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c := pool.Get().(compressor)
+
+		c, err := pool.get()
+		if err != nil {
+			return err
+		}
+
 		out, err := c.compress(uncompressedData)
-		pool.Put(c)
+		pool.put(c)
 		if err != nil {
 			return err
 		}
