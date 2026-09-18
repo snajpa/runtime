@@ -5,6 +5,7 @@ package storage
 // the AWS server tests can share it.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -21,12 +22,68 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-const minioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+// The container-backed storage tests run against an S3-compatible object
+// store. Silo (pgsty/silo, the maintained MinIO fork) is the default backend;
+// the pinned MinIO image stays selectable for one release cycle through
+// E2B_STORAGE_TEST_BACKEND=minio (S-53). Both implement the S3/GCS XML
+// multipart dialect the tests rely on; TestObjectStoreBackendDialect pins the
+// dialect assumptions explicitly so a future swap cannot silently relax them.
+const (
+	siloImage  = "pgsty/silo:latest"
+	minioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+
+	backendEnv = "E2B_STORAGE_TEST_BACKEND"
+)
+
+// objectStoreBackendSpec is one selectable container image for the
+// container-backed tests: image, command, environment and health check are
+// the pieces that differ between S3-compatible servers.
+type objectStoreBackendSpec struct {
+	name       string
+	image      string
+	cmd        []string
+	env        map[string]string
+	healthPath string
+}
+
+var objectStoreBackends = map[string]objectStoreBackendSpec{
+	"silo": {
+		name:       "silo",
+		image:      siloImage,
+		cmd:        []string{"server", "/data"},
+		env:        map[string]string{"MINIO_ROOT_USER": "minioadmin", "MINIO_ROOT_PASSWORD": "minioadmin"},
+		healthPath: "/minio/health/live",
+	},
+	"minio": {
+		name:       "minio",
+		image:      minioImage,
+		cmd:        []string{"server", "/data"},
+		env:        map[string]string{"MINIO_ROOT_USER": "minioadmin", "MINIO_ROOT_PASSWORD": "minioadmin"},
+		healthPath: "/minio/health/live",
+	},
+}
+
+// objectStoreBackend returns the backend selected by E2B_STORAGE_TEST_BACKEND
+// (default: silo).
+func objectStoreBackend(t *testing.T) objectStoreBackendSpec {
+	t.Helper()
+
+	name := strings.ToLower(os.Getenv(backendEnv))
+	if name == "" {
+		return objectStoreBackends["silo"]
+	}
+
+	spec, ok := objectStoreBackends[name]
+	require.Truef(t, ok, "unknown %s %q: want one of silo, minio", backendEnv, name)
+
+	return spec
+}
 
 // s3TestBackend describes where the tests run: a real AWS bucket (endpoint
 // empty) or an S3-compatible container endpoint.
@@ -35,27 +92,30 @@ type s3TestBackend struct {
 	endpoint string
 }
 
-// startMinioBackend starts a per-test MinIO container and creates a bucket in
-// it (same pattern as redis_utils.SetupInstance — Docker required, torn down
-// via t.Cleanup). Also used by the GCS XML multipart tests, which run against
-// MinIO because it implements the S3/GCS XML multipart dialect.
-func startMinioBackend(t *testing.T) *s3TestBackend {
+// startObjectStoreBackend starts a per-test object-store container and
+// creates a bucket in it (same pattern as redis_utils.SetupInstance — Docker
+// required, torn down via t.Cleanup). Also used by the GCS XML multipart
+// tests, which need the S3/GCS XML multipart dialect.
+func startObjectStoreBackend(t *testing.T) *s3TestBackend {
 	t.Helper()
+
+	spec := objectStoreBackend(t)
 
 	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        minioImage,
-			Cmd:          []string{"server", "/data"},
+			Image:        spec.image,
+			Cmd:          spec.cmd,
+			Env:          spec.env,
 			ExposedPorts: []string{"9000/tcp"},
-			WaitingFor:   wait.ForHTTP("/minio/health/live").WithPort("9000/tcp"),
+			WaitingFor:   wait.ForHTTP(spec.healthPath).WithPort("9000/tcp"),
 		},
 		Started: true,
 	})
-	require.NoError(t, err, "start minio container")
+	require.NoError(t, err, "start %s container", spec.name)
 
 	t.Cleanup(func() {
 		if err := container.Terminate(context.WithoutCancel(t.Context())); err != nil {
-			t.Logf("cleanup: failed to terminate minio container: %v", err)
+			t.Logf("cleanup: failed to terminate %s container: %v", spec.name, err)
 		}
 	})
 
@@ -84,6 +144,7 @@ func (b *s3TestBackend) newClient(t *testing.T, httpClient *http.Client, optFns 
 
 	if b.endpoint != "" {
 		cfg := aws.Config{
+			// Credentials match objectStoreBackends' MINIO_ROOT_USER/PASSWORD.
 			Credentials: credentials.NewStaticCredentialsProvider("minioadmin", "minioadmin", ""),
 			Region:      "us-east-1",
 		}
@@ -228,4 +289,105 @@ func (f *faultInjectingTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 
 	return f.inner.RoundTrip(req)
+}
+
+// TestObjectStoreBackendDialect pins the server-side dialect assumptions the
+// storage tests depend on so a backend swap (S-53) cannot silently relax
+// them: out-of-order part uploads must be accepted and reassembled by part
+// number, and a chunked upload without Content-Length must be rejected with
+// 411.
+func TestObjectStoreBackendDialect(t *testing.T) {
+	t.Parallel()
+
+	backend := startObjectStoreBackend(t)
+	client := backend.newClient(t, nil)
+
+	t.Run("out-of-order parts", func(t *testing.T) {
+		t.Parallel()
+
+		key := testKey("dialect-out-of-order")
+		obj := backend.object(t, client, key)
+
+		// Non-final parts must be >= 5 MiB; the final part may be tiny.
+		part1 := bytes.Repeat([]byte{0xA1}, 5*megabyte+1)
+		part2 := []byte("dialect-final-part")
+
+		created, err := client.CreateMultipartUpload(t.Context(), &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(backend.bucket),
+			Key:    aws.String(key),
+		})
+		require.NoError(t, err)
+
+		uploadID := created.UploadId
+
+		// Upload the final part first: the dialect accepts part numbers in any
+		// upload order and reassembles by part number on complete.
+		up2, err := client.UploadPart(t.Context(), &s3.UploadPartInput{
+			Bucket:     aws.String(backend.bucket),
+			Key:        aws.String(key),
+			UploadId:   uploadID,
+			PartNumber: aws.Int32(2),
+			Body:       bytes.NewReader(part2),
+		})
+		require.NoError(t, err, "backend must accept the final part before earlier parts")
+
+		up1, err := client.UploadPart(t.Context(), &s3.UploadPartInput{
+			Bucket:     aws.String(backend.bucket),
+			Key:        aws.String(key),
+			UploadId:   uploadID,
+			PartNumber: aws.Int32(1),
+			Body:       bytes.NewReader(part1),
+		})
+		require.NoError(t, err)
+
+		_, err = client.CompleteMultipartUpload(t.Context(), &s3.CompleteMultipartUploadInput{
+			Bucket:   aws.String(backend.bucket),
+			Key:      aws.String(key),
+			UploadId: uploadID,
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+				{ETag: up1.ETag, PartNumber: aws.Int32(1)},
+				{ETag: up2.ETag, PartNumber: aws.Int32(2)},
+			}},
+		})
+		require.NoError(t, err)
+
+		want := bytes.Join([][]byte{part1, part2}, nil)
+
+		var got bytes.Buffer
+
+		_, err = obj.WriteTo(t.Context(), &got)
+		require.NoError(t, err)
+		require.Equal(t, want, got.Bytes(),
+			"parts must reassemble in part-number order, not upload order")
+	})
+
+	t.Run("chunked upload without content-length", func(t *testing.T) {
+		t.Parallel()
+
+		key := testKey("dialect-chunked")
+
+		signed, err := s3.NewPresignClient(client).PresignPutObject(t.Context(), &s3.PutObjectInput{
+			Bucket: aws.String(backend.bucket),
+			Key:    aws.String(key),
+		})
+		require.NoError(t, err)
+
+		body := "dialect-chunked-body"
+
+		// Hide the concrete reader from http.NewRequest so no Content-Length is
+		// derived, and force chunked transfer encoding explicitly.
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, signed.URL,
+			io.NopCloser(io.LimitReader(strings.NewReader(body), int64(len(body)))))
+		require.NoError(t, err)
+		req.TransferEncoding = []string{"chunked"}
+
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusLengthRequired, resp.StatusCode,
+			"backend must reject a chunked upload without Content-Length with 411: %s", respBody)
+	})
 }

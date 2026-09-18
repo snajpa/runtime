@@ -1249,13 +1249,13 @@ func TestGCPCompleteRetriesTruncatedBody(t *testing.T) {
 	require.Equal(t, int32(3), attempts.Load(), "a failed body read must be retried to the budget")
 }
 
-// gcsXMLBackend starts MinIO and opens its bucket for anonymous access so the
-// GCS XML MultipartUploader (bearer-token auth, unverifiable by MinIO) can
-// upload without request signing.
+// gcsXMLBackend starts the selected object-store container and opens its
+// bucket for anonymous access so the GCS XML MultipartUploader (bearer-token
+// auth, unverifiable by the server) can upload without request signing.
 func gcsXMLBackend(t *testing.T) *s3TestBackend {
 	t.Helper()
 
-	backend := startMinioBackend(t)
+	backend := startObjectStoreBackend(t)
 
 	policy := fmt.Sprintf(`{
 		"Version": "2012-10-17",
@@ -1271,16 +1271,16 @@ func gcsXMLBackend(t *testing.T) *s3TestBackend {
 		Bucket: aws.String(backend.bucket),
 		Policy: aws.String(policy),
 	})
-	require.NoError(t, err, "allow anonymous access on minio bucket")
+	require.NoError(t, err, "allow anonymous access on the test bucket")
 
 	return backend
 }
 
 // authStrippingTransport removes the Authorization header (the uploader's
-// bearer token) so requests reach MinIO as anonymous — MinIO cannot validate
-// Google OAuth tokens. Nothing else is adapted: in particular, MinIO's 411
-// rejection of chunked uploads guards the uploader's explicit Content-Length
-// (via multiSliceReader.Len) against regressions.
+// bearer token) so requests reach the backend as anonymous — it cannot
+// validate Google OAuth tokens. Nothing else is adapted: in particular, the
+// backend's 411 rejection of chunked uploads guards the uploader's explicit
+// Content-Length (via multiSliceReader.Len) against regressions.
 type authStrippingTransport struct {
 	inner http.RoundTripper
 }
@@ -1292,7 +1292,7 @@ func (a authStrippingTransport) RoundTrip(req *http.Request) (*http.Response, er
 	return a.inner.RoundTrip(clone)
 }
 
-// gcsXMLUploader builds a MultipartUploader pointed at the MinIO backend,
+// gcsXMLUploader builds a MultipartUploader pointed at the test backend,
 // bypassing NewMultipartUploaderWithRetryConfig (which requires real Google
 // credentials and hardcodes the production URL). transport is optional and
 // sits between the retryable client and the network (e.g. fault injection).
@@ -1340,7 +1340,7 @@ func anonymousGet(t *testing.T, backend *s3TestBackend, key string) []byte {
 }
 
 // TestGCSXMLPartUploaderContract drives MultipartUploader directly against
-// MinIO's XML multipart implementation: out-of-order part numbers, a
+// the backend's XML multipart implementation: out-of-order part numbers, a
 // multi-slice part body, Content-MD5 validation by a real server, and
 // ordered reassembly on Complete.
 func TestGCSXMLPartUploaderContract(t *testing.T) {
@@ -1390,7 +1390,8 @@ func TestGCSXMLPartUploaderAbortOnClose(t *testing.T) {
 }
 
 // TestGCSXMLCompressedRoundTrip runs the production compressed upload path
-// (storeFileCompressed) with the GCS XML uploader against MinIO, then
+// (storeFileCompressed) with the GCS XML uploader against the container
+// backend, then
 // verifies the stored blob decompresses back to the original.
 func TestGCSXMLCompressedRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -1522,8 +1523,8 @@ func TestGCSXMLRetryOnTransientFailure(t *testing.T) {
 }
 
 // TestGCSXMLUploadFileInParallel exercises the uncompressed >=50MB multipart
-// path (UploadFileInParallel) against MinIO: fixed 50 MB chunks uploaded
-// concurrently, with the overlapped checksum hasher.
+// path (UploadFileInParallel) against the container backend: fixed 50 MB
+// chunks uploaded concurrently, with the overlapped checksum hasher.
 func TestGCSXMLUploadFileInParallel(t *testing.T) {
 	t.Parallel()
 
@@ -1548,8 +1549,8 @@ func TestGCSXMLUploadFileInParallel(t *testing.T) {
 
 // TestGCPUploadFileInParallelEmptyFile verifies the empty-file path ships its
 // single zero-byte part with an explicit Content-Length rather than chunked
-// transfer encoding, which S3-compatible XML backends (MinIO here) reject with
-// 411 MissingContentLength.
+// transfer encoding, which S3-compatible XML backends reject with 411
+// MissingContentLength.
 func TestGCPUploadFileInParallelEmptyFile(t *testing.T) {
 	t.Parallel()
 
