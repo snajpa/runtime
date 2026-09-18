@@ -16,9 +16,11 @@ package build
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -342,7 +344,7 @@ func TestDiffStorePinnedSurvivesScheduledDelete(t *testing.T) {
 	store.Add(diff)
 
 	// Delete scheduled first (as disk pressure would), then the Pin lands.
-	store.scheduleDelete(t.Context(), diff.CacheKey(), 1024)
+	store.scheduleDelete(diff.CacheKey(), 1024)
 	require.True(t, store.isBeingDeleted(diff.CacheKey()))
 	store.Pin(diff.CacheKey())
 
@@ -356,7 +358,7 @@ func TestDiffStorePinnedSurvivesScheduledDelete(t *testing.T) {
 
 	// Unpin → a freshly scheduled delete now evicts it.
 	store.Unpin(diff.CacheKey())
-	store.scheduleDelete(t.Context(), diff.CacheKey(), 1024)
+	store.scheduleDelete(diff.CacheKey(), 1024)
 	require.Eventually(t, func() bool {
 		_, ok := store.Lookup(diff.CacheKey())
 
@@ -572,7 +574,7 @@ func TestDiffStoreResetDeleteRace(t *testing.T) {
 			store.Add(iterDiff)
 
 			// Immediately schedule for deletion to populate pdSizes
-			store.scheduleDelete(t.Context(), iterDiff.CacheKey(), 1024)
+			store.scheduleDelete(iterDiff.CacheKey(), 1024)
 
 			// Small random delay to desynchronize goroutines slightly
 			time.Sleep(time.Duration(iteration%10) * time.Microsecond)
@@ -768,4 +770,107 @@ func TestDiffStoreEvictionSkipsUnsealedDeferredDiff(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.True(t, store.isBeingDeleted(deferred.CacheKey()), "sealed deferred diff must be evictable")
+}
+
+// TestDiffStoreEvictionSizeAccounting pins REQ-C3: a scheduled eviction is
+// accounted with the diff's measured size, never a fallback estimate.
+func TestDiffStoreEvictionSizeAccounting(t *testing.T) {
+	t.Parallel()
+
+	cachePath := t.TempDir()
+
+	c, err := cfg.Parse()
+	require.NoError(t, err)
+
+	store, err := NewDiffStore(c, flagsWithMaxBuildCachePercentage(t, 100), cachePath, 60*time.Second, time.Hour)
+	require.NoError(t, err)
+	t.Cleanup(store.Close)
+
+	diff := newRootFSDiff(t, cachePath, "size-accounting")
+	store.Add(diff)
+
+	want, err := diff.FileSize(t.Context())
+	require.NoError(t, err)
+	require.NotZero(t, want)
+
+	_, err = store.deleteOldestFromCache(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, want, store.getPendingDeletesSize(), "the pending size must be the measured size")
+}
+
+// unmeasurableDiff is a Diff whose on-disk size and cache path cannot be
+// resolved, so eviction accounting has nothing to measure.
+type unmeasurableDiff struct {
+	NoDiff
+
+	key DiffStoreKey
+}
+
+func (d *unmeasurableDiff) CacheKey() DiffStoreKey { return d.key }
+
+func (d *unmeasurableDiff) FileSize(context.Context) (int64, error) {
+	return 0, errors.New("size unavailable")
+}
+
+func (d *unmeasurableDiff) CachePath(context.Context) (string, error) {
+	return "", errors.New("cache path unavailable")
+}
+
+// TestDiffStoreEvictionUnmeasurableSize pins that an entry whose size cannot
+// be measured is accounted as zero — never the old 100 MB estimate — and is
+// still evicted.
+func TestDiffStoreEvictionUnmeasurableSize(t *testing.T) {
+	t.Parallel()
+
+	cachePath := t.TempDir()
+
+	c, err := cfg.Parse()
+	require.NoError(t, err)
+
+	store, err := NewDiffStore(c, flagsWithMaxBuildCachePercentage(t, 100), cachePath, 60*time.Second, 50*time.Millisecond)
+	require.NoError(t, err)
+	t.Cleanup(store.Close)
+
+	diff := &unmeasurableDiff{key: "unmeasurable/size"}
+	store.Add(diff)
+
+	_, err = store.deleteOldestFromCache(t.Context())
+	require.NoError(t, err)
+
+	assert.True(t, store.isBeingDeleted(diff.CacheKey()))
+	assert.Zero(t, store.getPendingDeletesSize(), "an unmeasurable eviction must not invent a size")
+
+	// The entry is still evicted after the delay.
+	require.Eventually(t, func() bool {
+		_, ok := store.Lookup(diff.CacheKey())
+
+		return !ok
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+// TestDiffStoreEvictionBoundedGoroutines pins S-16's scheduler: many pending
+// evictions share one goroutine instead of one goroutine per scheduled
+// deletion.
+func TestDiffStoreEvictionBoundedGoroutines(t *testing.T) { //nolint:paralleltest // reads the process goroutine count.
+	cachePath := t.TempDir()
+
+	c, err := cfg.Parse()
+	require.NoError(t, err)
+
+	// A long delay keeps the deletions pending while the count is read.
+	store, err := NewDiffStore(c, flagsWithMaxBuildCachePercentage(t, 100), cachePath, 60*time.Second, time.Hour)
+	require.NoError(t, err)
+	t.Cleanup(store.Close)
+
+	before := runtime.NumGoroutine()
+
+	const pending = 100
+	for i := range pending {
+		store.scheduleDelete(DiffStoreKey(fmt.Sprintf("bounded/%d", i)), 1)
+	}
+
+	after := runtime.NumGoroutine()
+	assert.Less(t, after-before, pending/2,
+		"pending evictions must not scale goroutines: one scheduler serves them all")
 }

@@ -21,23 +21,21 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
-	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 var (
-	fallbackDiffSize = units.MBToBytes(100)
-
 	meter                   = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build")
 	residenceDurationMetric = utils.Must(meter.Int64Histogram("orchestrator.build.cache.residence_duration",
 		metric.WithDescription("How long a diff was kept in the local build cache before eviction"),
 		metric.WithUnit("s")))
+	evictionUnaccountedMetric = utils.Must(meter.Int64Counter("orchestrator.build.cache.eviction_unaccounted",
+		metric.WithDescription("Scheduled build-cache evictions whose on-disk size could not be measured; accounted as zero")))
 )
 
 type deleteDiff struct {
-	size      int64
-	cancel    chan struct{}
-	closeOnce sync.Once
+	size   int64
+	fireAt time.Time
 }
 
 type DiffStore struct {
@@ -53,6 +51,15 @@ type DiffStore struct {
 	pdSizes map[DiffStoreKey]*deleteDiff
 	pdMu    sync.RWMutex
 	pdDelay time.Duration
+
+	// evictWake nudges the single eviction scheduler; evictOnce starts it on
+	// the first scheduled deletion and evictStopCh ends it (S-16). One
+	// goroutine serves every pending deletion, so the goroutine count does not
+	// grow with the number of scheduled evictions.
+	evictWake   chan struct{}
+	evictOnce   sync.Once
+	evictStopCh chan struct{}
+	evictStop   sync.Once
 
 	insertionTimes sync.Map // map[DiffStoreKey]time.Time — tracks when each diff was cached
 
@@ -85,13 +92,15 @@ func NewDiffStore(
 	)
 
 	ds := &DiffStore{
-		cachePath: cachePath,
-		cache:     cache,
-		cancel:    func() {},
-		config:    config,
-		flags:     flags,
-		pdSizes:   make(map[DiffStoreKey]*deleteDiff),
-		pdDelay:   delay,
+		cachePath:   cachePath,
+		cache:       cache,
+		cancel:      func() {},
+		config:      config,
+		flags:       flags,
+		pdSizes:     make(map[DiffStoreKey]*deleteDiff),
+		pdDelay:     delay,
+		evictWake:   make(chan struct{}, 1),
+		evictStopCh: make(chan struct{}),
 	}
 
 	cache.OnEviction(func(ctx context.Context, _ ttlcache.EvictionReason, item *ttlcache.Item[DiffStoreKey, Diff]) {
@@ -145,6 +154,7 @@ func (s *DiffStore) Start(ctx context.Context) {
 
 func (s *DiffStore) Close() {
 	s.cancel()
+	s.evictStop.Do(func() { close(s.evictStopCh) })
 	s.cache.Stop()
 }
 
@@ -342,13 +352,7 @@ func (s *DiffStore) deleteOldestFromCache(ctx context.Context) (suc bool, e erro
 			return true
 		}
 
-		sfSize, err := item.Value().FileSize(ctx)
-		if err != nil {
-			logger.L().Warn(ctx, "failed to get size of deleted item from cache", zap.Error(err))
-			sfSize = fallbackDiffSize
-		}
-
-		s.scheduleDelete(ctx, item.Key(), sfSize)
+		s.scheduleDelete(item.Key(), s.evictionSize(ctx, item.Value()))
 
 		success = true
 
@@ -362,14 +366,6 @@ func (s *DiffStore) resetDelete(key DiffStoreKey) {
 	s.pdMu.Lock()
 	defer s.pdMu.Unlock()
 
-	dDiff, f := s.pdSizes[key]
-	if !f {
-		return
-	}
-
-	dDiff.closeOnce.Do(func() {
-		close(dDiff.cancel)
-	})
 	delete(s.pdSizes, key)
 }
 
@@ -395,39 +391,145 @@ func (s *DiffStore) isPinned(key DiffStoreKey) bool {
 	return ok
 }
 
-func (s *DiffStore) scheduleDelete(ctx context.Context, key DiffStoreKey, dSize int64) {
+// scheduleDelete records that key becomes evictable once pdDelay elapses: the
+// delay prevents races with exposed slices, pending data fetching or data
+// upload. The single eviction scheduler fires it; Get/GetOrCreate/Add cancel
+// it again via resetDelete.
+func (s *DiffStore) scheduleDelete(key DiffStoreKey, dSize int64) {
+	s.pdMu.Lock()
+	s.pdSizes[key] = &deleteDiff{
+		size:   dSize,
+		fireAt: time.Now().Add(s.pdDelay),
+	}
+	s.pdMu.Unlock()
+
+	s.evictOnce.Do(func() { go s.evictLoop() })
+
+	select {
+	case s.evictWake <- struct{}{}:
+	default:
+	}
+}
+
+// evictLoop is the single goroutine behind delayed evictions (S-16): it sleeps
+// until the nearest deadline or a wake-up, then fires the deletions that are
+// due. The process's goroutine count no longer grows with the number of
+// scheduled evictions.
+func (s *DiffStore) evictLoop() {
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+
+	for {
+		due, next, hasNext := s.dueDeletions(time.Now())
+
+		for _, key := range due {
+			if !s.takeDueDeletion(key) {
+				// Cancelled or rescheduled in the meantime.
+				continue
+			}
+
+			// The entry may have been pinned after this delete was scheduled: a
+			// Pin can race the eviction scan (its isPinned check in
+			// deleteOldestFromCache runs just before scheduleDelete). Re-check
+			// at fire time — the last point before eviction — since deleting a
+			// pinned diff would tear down state an in-flight provisional resume
+			// still needs. The pending record is already cleared, so the entry
+			// becomes eligible for eviction again once it is unpinned.
+			if s.isPinned(key) {
+				continue
+			}
+
+			// Deleting fires the cache's OnEviction callback, which closes the
+			// diff and clears any pending record.
+			s.cache.Delete(key)
+		}
+
+		if !hasNext {
+			select {
+			case <-s.evictStopCh:
+				return
+			case <-s.evictWake:
+			}
+
+			continue
+		}
+
+		if wait := time.Until(next); wait > 0 {
+			timer.Reset(wait)
+		} else {
+			timer.Reset(0)
+		}
+
+		select {
+		case <-s.evictStopCh:
+			return
+		case <-s.evictWake:
+		case <-timer.C:
+		}
+	}
+}
+
+// dueDeletions returns the keys whose delay has elapsed, the next deadline to
+// wait for, and whether any deletion is still pending.
+func (s *DiffStore) dueDeletions(now time.Time) (due []DiffStoreKey, next time.Time, hasNext bool) {
+	s.pdMu.RLock()
+	defer s.pdMu.RUnlock()
+
+	for key, pending := range s.pdSizes {
+		if !pending.fireAt.After(now) {
+			due = append(due, key)
+
+			continue
+		}
+
+		if !hasNext || pending.fireAt.Before(next) {
+			next = pending.fireAt
+			hasNext = true
+		}
+	}
+
+	return due, next, hasNext
+}
+
+// takeDueDeletion claims a due deletion for the scheduler, unless it was
+// cancelled (resetDelete) or replaced in the meantime.
+func (s *DiffStore) takeDueDeletion(key DiffStoreKey) bool {
 	s.pdMu.Lock()
 	defer s.pdMu.Unlock()
 
-	cancelCh := make(chan struct{})
-	s.pdSizes[key] = &deleteDiff{
-		size:   dSize,
-		cancel: cancelCh,
+	pending, ok := s.pdSizes[key]
+	if !ok || pending.fireAt.After(time.Now()) {
+		return false
 	}
 
-	// Delay cache (file close/removal) deletion,
-	// this is to prevent race conditions with exposed slices,
-	// pending data fetching, or data upload
-	go (func() {
-		select {
-		case <-ctx.Done():
-		case <-cancelCh:
-		case <-time.After(s.pdDelay):
-			// The entry may have been pinned after this delete was scheduled: a
-			// Pin can race the eviction scan (its isPinned check in
-			// deleteOldestFromCache runs just before scheduleDelete). Re-check at
-			// fire time — the last point before eviction — since deleting a
-			// pinned diff would tear down state an in-flight provisional resume
-			// still needs. Clear the pending-delete record so the entry becomes
-			// eligible for eviction again once it is unpinned.
-			if s.isPinned(key) {
-				s.resetDelete(key)
+	delete(s.pdSizes, key)
 
-				return
-			}
-			s.cache.Delete(key)
+	return true
+}
+
+// evictionSize returns how many bytes an eviction of diff will free: the
+// diff's own FileSize when the implementation can measure it, otherwise the
+// size of its backing cache file. An entry that cannot be measured at all is
+// accounted as zero and counted — never estimated — because the disk-pressure
+// loop subtracts pending deletions from the measured usage, and a fabricated
+// size would make it believe the space is already free (REQ-C3).
+func (s *DiffStore) evictionSize(ctx context.Context, diff Diff) int64 {
+	size, err := diff.FileSize(ctx)
+	if err == nil {
+		return size
+	}
+
+	logger.L().Warn(ctx, "failed to get size of evicted item from cache", zap.Error(err))
+
+	if path, pathErr := diff.CachePath(ctx); pathErr == nil && path != "" {
+		if info, statErr := os.Stat(path); statErr == nil {
+			return info.Size()
 		}
-	})()
+	}
+
+	evictionUnaccountedMetric.Add(ctx, 1)
+
+	return 0
 }
 
 func diskUsage(path string) (uint64, uint64, error) {
