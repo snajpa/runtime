@@ -350,7 +350,7 @@ if [ "${FLAG_ROLLBACK:-0}" = "1" ]; then
 			failed=1
 		fi
 	else
-		printf '%s\n' '{"phase":"migrate","version":"harness:migrate",outcome:"ok","detail":"checkout has no migrate-builds; used the harness migrate phase"}'
+		printf '%s\n' '{"phase":"migrate","version":"harness:migrate","outcome":"ok","detail":"checkout has no migrate-builds; used the harness migrate phase"}' >>"$OUT"
 		phase "$NEW" migrate --manifest "$MAN/$RUN-v4.json" --header-version 5
 	fi
 
