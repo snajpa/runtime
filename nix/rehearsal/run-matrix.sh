@@ -319,11 +319,16 @@ if [ "${FLAG_ROLLBACK:-0}" = "1" ]; then
 			-storage-url "$STORE" -apply -report "$BASE/migrate-$RUN-report.json" \
 			>"$BASE/migrate-$RUN.out" 2>&1; then
 			tail -n 1 "$BASE/migrate-$RUN-report.json" \
-				| jq -c '{phase:"migrate",version:"product:migrate-builds",outcome:"ok",
+				| jq -c '{phase:"migrate",version:"product:migrate-builds",outcome:(if ((.summary.failed // 0) > 0) then "error" else "ok" end),
 					detail:("product migrate-builds: migrated=" + ((.summary.migrate // 0)|tostring)
 						+ " skipped=" + ((.summary.skip // 0)|tostring)
-						+ " missing=" + ((.summary.missing // 0)|tostring))}' >>"$OUT" \
+						+ " missing=" + ((.summary.missing // 0)|tostring) + " failed=" + ((.summary.failed // 0)|tostring))}' >>"$OUT" \
 				|| printf '%s\n' '{"phase":"migrate","version":"product:migrate-builds","outcome":"ok","detail":"product migrate-builds ran (no summary)"}' >>"$OUT"
+			# A zero exit can still carry per-artifact failures: the tool records them
+			# without failing the run, so the leg checks the summary itself - a
+			# migration with failed artifacts must not pass the battery.
+			migrate_failed=$(tail -n 1 "$BASE/migrate-$RUN-report.json" | jq -r '.summary.failed // 0' 2>/dev/null || echo 0)
+			if [ "$migrate_failed" != "0" ]; then failed=1; fi
 		else
 			printf '%s\n' '{"phase":"migrate","version":"product:migrate-builds","outcome":"error","detail":"product migrate-builds failed; see the VM log"}' >>"$OUT"
 			failed=1
