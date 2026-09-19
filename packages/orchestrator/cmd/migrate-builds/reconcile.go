@@ -145,7 +145,7 @@ func reconcileArtifact(ctx context.Context, opts options, provider storage.Stora
 		return outcome
 	}
 
-	resolution, err := resolvePayload(ctx, provider, paths, kind.name, bd, loaded.GetBuildFrameData(buildID))
+	resolution, err := resolvePayload(ctx, provider, paths, kind.name, bd, loaded.GetBuildFrameData(buildID), false, "")
 	switch {
 	case err != nil:
 		outcome.Action = actionMismatch
@@ -231,7 +231,7 @@ func scanPrefix(ctx context.Context, opts options, spec storage.Spec, provider s
 				continue
 			}
 
-			resolution, resolutionErr := resolvePayload(ctx, provider, paths, kind.name, bd, loaded.GetBuildFrameData(buildID))
+			resolution, resolutionErr := resolvePayload(ctx, provider, paths, kind.name, bd, loaded.GetBuildFrameData(buildID), false, "")
 			if resolution.Path == "" {
 				continue
 			}

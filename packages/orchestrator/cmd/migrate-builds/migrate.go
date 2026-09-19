@@ -68,57 +68,112 @@ func payloadCandidates(paths storage.Paths, name string) []string {
 	}
 }
 
-type bytesBuffer struct{ data []byte }
-
-func (b *bytesBuffer) Write(p []byte) (int, error) {
-	b.data = append(b.data, p...)
-
-	return len(p), nil
-}
-
-func (b *bytesBuffer) Bytes() []byte { return b.data }
-
-var _ io.Writer = (*bytesBuffer)(nil)
-
-// readPayload reads a whole logical payload the way a node does: chunk-aligned
-// range readers whose Close verifies every frame's CRC. A payload that cannot
-// be read this way is never migrated.
-func readPayload(ctx context.Context, provider storage.StorageProvider, path string, size int64, ft *storage.FrameTable) ([]byte, error) {
+// streamPayload reads the logical payload the way a node does - chunk-aligned
+// range readers whose Close verifies every frame's CRC - copying each chunk
+// into w. A range may be served frame-aligned (shorter than requested), so the
+// loop advances by what was actually read, but every range must make progress
+// and must not overrun its requested length. Nothing is accumulated, so memory
+// stays bounded by one chunk no matter the artifact's size. A payload that
+// cannot be read this way is never migrated.
+func streamPayload(ctx context.Context, provider storage.StorageProvider, path string, size int64, ft *storage.FrameTable, w io.Writer) error {
 	seekable, err := provider.OpenSeekable(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
+		return fmt.Errorf("open %s: %w", path, err)
 	}
-
-	out := make([]byte, 0, size)
 
 	for read := int64(0); read < size; {
 		step := min(int64(storage.MemoryChunkSize), size-read)
 
 		reader, _, err := seekable.OpenRangeReader(ctx, read, step, ft)
 		if err != nil {
-			return nil, fmt.Errorf("range at %d: %w", read, err)
+			return fmt.Errorf("range at %d: %w", read, err)
 		}
 
-		var chunk bytesBuffer
-
-		_, copyErr := io.Copy(&chunk, reader)
+		n, copyErr := io.Copy(w, reader)
 
 		_, closeErr := reader.Close(ctx)
 
 		switch {
 		case copyErr != nil:
-			return nil, fmt.Errorf("read at %d: %w", read, copyErr)
+			return fmt.Errorf("read at %d: %w", read, copyErr)
 		case closeErr != nil:
-			return nil, fmt.Errorf("frame verification at %d: %w", read, closeErr)
-		case len(chunk.Bytes()) == 0:
-			return nil, fmt.Errorf("read at %d made no progress", read)
+			return fmt.Errorf("frame verification at %d: %w", read, closeErr)
+		case n == 0:
+			return fmt.Errorf("read at %d made no progress", read)
+		case n > step:
+			return fmt.Errorf("read at %d returned %d bytes for a %d-byte request", read, n, step)
 		}
 
-		out = append(out, chunk.Bytes()...)
-		read += int64(len(chunk.Bytes()))
+		read += n
 	}
 
-	return out, nil
+	return nil
+}
+
+// hashPayload streams the payload through SHA-256 without retaining it.
+func hashPayload(ctx context.Context, provider storage.StorageProvider, path string, size int64, ft *storage.FrameTable) ([32]byte, error) {
+	h := sha256.New()
+
+	if err := streamPayload(ctx, provider, path, size, ft, h); err != nil {
+		return [32]byte{}, err
+	}
+
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+
+	return sum, nil
+}
+
+// scratchPayload streams the payload into a private file under dir (resolved
+// by runMigrate: the explicit -scratch-dir or the system temp default) while
+// hashing it; the caller owns removing the returned file. Re-encodes read the scratch file back, so no stage of the
+// migration holds the payload in memory; each in-flight worker holds at most
+// one logical artifact on disk.
+func scratchPayload(ctx context.Context, provider storage.StorageProvider, path string, size int64, ft *storage.FrameTable, dir string) (string, [32]byte, error) {
+	f, err := os.CreateTemp(dir, "migrate-builds-*")
+	if err != nil {
+		return "", [32]byte{}, fmt.Errorf("scratch file: %w", err)
+	}
+
+	h := sha256.New()
+
+	if err := streamPayload(ctx, provider, path, size, ft, io.MultiWriter(f, h)); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+
+		return "", [32]byte{}, err
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+
+		return "", [32]byte{}, fmt.Errorf("close scratch file: %w", err)
+	}
+
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+
+	return f.Name(), sum, nil
+}
+
+// prepareScratchDir proves the effective scratch directory - the explicit
+// -scratch-dir or the system temp default - can hold re-encode staging before
+// any provider work starts: the directory is created when missing and probed
+// for writability. Peak usage is concurrency x the largest in-flight artifact.
+func prepareScratchDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("-scratch-dir %s: %w", dir, err)
+	}
+
+	probe, err := os.CreateTemp(dir, ".migrate-builds-probe-*")
+	if err != nil {
+		return fmt.Errorf("-scratch-dir %s: not writable: %w", dir, err)
+	}
+
+	_ = probe.Close()
+	_ = os.Remove(probe.Name())
+
+	return nil
 }
 
 // targetCompressConfig resolves the payload encoding a migration writes with.
@@ -193,8 +248,10 @@ func firstExistingCandidate(ctx context.Context, provider storage.StorageProvide
 type payloadResolution struct {
 	// Path is the candidate that exists and verifies; empty when none does.
 	Path string
-	// Data is the verified payload.
-	Data []byte
+	// Scratch is a temporary file holding the verified payload's bytes when the
+	// caller asked for them (a re-encode reads it back); the caller owns
+	// removing it.
+	Scratch string
 	// Superseded are candidates that exist but do not belong to the header any
 	// more - the leftovers a re-encode leaves behind. They are reported, and
 	// removed only when explicitly asked for.
@@ -203,11 +260,13 @@ type payloadResolution struct {
 
 // resolvePayload finds the payload that belongs to the header. The storage
 // abstraction cannot list, and after a migration more than one candidate can
-// exist (the superseded codec plus the new one), so every candidate is read and
-// checked against the header: the one that verifies is the artifact, the others
-// are leftovers. A candidate that exists but cannot be read is reported, never
-// silently ignored.
-func resolvePayload(ctx context.Context, provider storage.StorageProvider, paths storage.Paths, name string, bd header.BuildData, ft *storage.FrameTable) (payloadResolution, error) {
+// exist (the superseded codec plus the new one), so every candidate is streamed
+// and checked against the header: the one that verifies is the artifact, the
+// others are leftovers. A candidate that exists but cannot be read is reported,
+// never silently ignored. With needScratch the verified bytes are left in a
+// scratch file (under scratchDir; "" = the system temp dir) for the re-encode
+// to read back.
+func resolvePayload(ctx context.Context, provider storage.StorageProvider, paths storage.Paths, name string, bd header.BuildData, ft *storage.FrameTable, needScratch bool, scratchDir string) (payloadResolution, error) {
 	var (
 		res     payloadResolution
 		lastErr error
@@ -223,7 +282,17 @@ func resolvePayload(ctx context.Context, provider storage.StorageProvider, paths
 			continue
 		}
 
-		data, err := readPayload(ctx, provider, candidate, bd.Size, ft)
+		var (
+			sum     [32]byte
+			scratch string
+		)
+
+		if needScratch {
+			scratch, sum, err = scratchPayload(ctx, provider, candidate, bd.Size, ft, scratchDir)
+		} else {
+			sum, err = hashPayload(ctx, provider, candidate, bd.Size, ft)
+		}
+
 		if err != nil {
 			res.Superseded = append(res.Superseded, candidate)
 			lastErr = fmt.Errorf("read %s: %w", candidate, err)
@@ -231,7 +300,11 @@ func resolvePayload(ctx context.Context, provider storage.StorageProvider, paths
 			continue
 		}
 
-		if sum := sha256.Sum256(data); sum != bd.Checksum {
+		if sum != bd.Checksum {
+			if scratch != "" {
+				_ = os.Remove(scratch)
+			}
+
 			res.Superseded = append(res.Superseded, candidate)
 			lastErr = fmt.Errorf("%s does not match the header checksum", candidate)
 
@@ -239,7 +312,7 @@ func resolvePayload(ctx context.Context, provider storage.StorageProvider, paths
 		}
 
 		res.Path = candidate
-		res.Data = data
+		res.Scratch = scratch
 
 		return res, nil
 	}
@@ -267,12 +340,12 @@ func verifyArtifact(ctx context.Context, provider storage.StorageProvider, build
 		return errors.New("header no longer describes this build")
 	}
 
-	data, err := readPayload(ctx, provider, payloadPath, bd.Size, loaded.GetBuildFrameData(buildID))
+	sum, err := hashPayload(ctx, provider, payloadPath, bd.Size, loaded.GetBuildFrameData(buildID))
 	if err != nil {
 		return err
 	}
 
-	if sum := sha256.Sum256(data); sum != bd.Checksum {
+	if sum != bd.Checksum {
 		return errors.New("checksum mismatch after rewrite")
 	}
 
@@ -315,7 +388,9 @@ func migrateArtifact(ctx context.Context, provider storage.StorageProvider, stor
 
 	outcome.Bytes = bd.Size
 
-	resolution, err := resolvePayload(ctx, provider, paths, kind.name, bd, loaded.GetBuildFrameData(buildID))
+	// Materialize the payload for a rewrite only when one can happen: -dry-run
+	// reports without writing anything (the scratch file included).
+	resolution, err := resolvePayload(ctx, provider, paths, kind.name, bd, loaded.GetBuildFrameData(buildID), reencode && !opts.dryRun, opts.scratchDir)
 	if err != nil {
 		// Never rewrite what does not verify first: a header that disagrees with
 		// every payload it can see is a finding, not something to migrate over.
@@ -337,7 +412,10 @@ func migrateArtifact(ctx context.Context, provider storage.StorageProvider, stor
 	}
 
 	srcPath := resolution.Path
-	data := resolution.Data
+
+	if resolution.Scratch != "" {
+		defer os.Remove(resolution.Scratch)
+	}
 
 	outcome.FromPath = srcPath
 	outcome.ToPath = srcPath
@@ -410,7 +488,7 @@ func migrateArtifact(ctx context.Context, provider storage.StorageProvider, stor
 	}
 
 	if needPayloadWrite {
-		if err := rewritePayload(ctx, provider, buildID, outcome.ToPath, data, cfg, opts, headerPath, loaded.Metadata.BlockSize); err != nil {
+		if err := rewritePayload(ctx, provider, buildID, outcome.ToPath, resolution.Scratch, bd.Size, cfg, opts, headerPath, loaded.Metadata.BlockSize); err != nil {
 			return outcome, err
 		}
 
@@ -485,40 +563,25 @@ func storeHeaderVersion(ctx context.Context, provider storage.StorageProvider, h
 }
 
 // rewritePayload stores the payload under the target path with the requested
-// codec and writes a header that describes it.
-func rewritePayload(ctx context.Context, provider storage.StorageProvider, buildID uuid.UUID, targetPath string, data []byte, cfg storage.CompressConfig, opts options, headerPath string, blockSize uint64) error {
-	local, err := os.CreateTemp("", "migrate-builds-*")
-	if err != nil {
-		return fmt.Errorf("temp file: %w", err)
-	}
-
-	defer os.Remove(local.Name())
-
-	if _, err := local.Write(data); err != nil {
-		_ = local.Close()
-
-		return fmt.Errorf("write temp file: %w", err)
-	}
-
-	if err := local.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-
+// codec and writes a header that describes it. The bytes come from the scratch
+// file the verifying read left behind, so nothing is buffered in memory here
+// either.
+func rewritePayload(ctx context.Context, provider storage.StorageProvider, buildID uuid.UUID, targetPath string, scratchPath string, size int64, cfg storage.CompressConfig, opts options, headerPath string, blockSize uint64) error {
 	seekable, err := provider.OpenSeekable(ctx, targetPath)
 	if err != nil {
 		return fmt.Errorf("open target %s: %w", targetPath, err)
 	}
 
-	fullFT, checksum, err := seekable.StoreFile(ctx, local.Name(), storage.WithCompressConfig(cfg))
+	fullFT, checksum, err := seekable.StoreFile(ctx, scratchPath, storage.WithCompressConfig(cfg))
 	if err != nil {
 		return fmt.Errorf("store payload %s: %w", targetPath, err)
 	}
 
-	metadata := header.NewTemplateMetadata(buildID, blockSize, uint64(len(data)))
+	metadata := header.NewTemplateMetadata(buildID, blockSize, uint64(size))
 
 	spec, err := header.NewHeader(metadata, []header.BuildMap{{
 		Offset:             0,
-		Length:             uint64(len(data)),
+		Length:             uint64(size),
 		BuildId:            buildID,
 		BuildStorageOffset: 0,
 	}})
@@ -527,7 +590,7 @@ func rewritePayload(ctx context.Context, provider storage.StorageProvider, build
 	}
 
 	spec.SetBuild(buildID, header.BuildData{
-		Size:      int64(len(data)),
+		Size:      size,
 		Checksum:  checksum,
 		FrameData: fullFT.Table(),
 	})
@@ -557,6 +620,20 @@ func runMigrate(ctx context.Context, opts options) error {
 	cfg, reencode, err := targetCompressConfig(opts)
 	if err != nil {
 		return err
+	}
+
+	// Scratch staging is used exactly when a real run may re-encode: resolve
+	// the effective directory - the explicit -scratch-dir or the documented
+	// system-temp default - and prove it can hold staging before any provider
+	// work. Dry runs stay write-free.
+	if reencode && !opts.dryRun {
+		if opts.scratchDir == "" {
+			opts.scratchDir = os.TempDir()
+		}
+
+		if err := prepareScratchDir(opts.scratchDir); err != nil {
+			return err
+		}
 	}
 
 	builds, err := buildIDs(opts)

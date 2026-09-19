@@ -20,6 +20,10 @@
 //     reported, and removed only with -delete-superseded -confirm;
 //   - work is bounded by -concurrency and -rate, and can be resumed: re-running
 //     skips artifacts that are already on the target format (idempotent);
+//   - payloads stream in bounded chunk buffers and re-encodes stage each
+//     in-flight artifact under -scratch-dir (the system temp dir when unset),
+//     so memory stays flat and disk peaks at concurrency x the largest
+//     in-flight artifact;
 //   - a run in which any artifact fails exits non-zero (an artifact that is
 //     simply missing is reported, not fatal).
 package main
@@ -112,6 +116,7 @@ type options struct {
 	scanPrefix       string
 
 	reportPath string
+	scratchDir string
 	timeout    time.Duration
 }
 
@@ -164,6 +169,7 @@ func parseFlags() options {
 
 	flag.IntVar(&opts.concurrency, "concurrency", defaultConcurrency, "artifacts processed in parallel")
 	flag.IntVar(&opts.rate, "rate", 0, "maximum artifacts started per second (0 = unbounded; max 1000000000)")
+	flag.StringVar(&opts.scratchDir, "scratch-dir", "", "directory for re-encode scratch files; default: the system temp dir, which may be small or RAM-backed, so set this explicitly for production backfills; peak usage is concurrency x the largest in-flight artifact")
 	flag.IntVar(&opts.limit, "limit", 0, "stop after this many artifacts (0 = no limit)")
 
 	flag.Uint64Var(&opts.targetHeaderVersion, "target-header-version", defaultTargetHeaderVersion, "header format to migrate to (4 or 5)")
