@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -252,6 +253,39 @@ var (
 		metric.WithDescription("Multipart uploads that ended without commit or abort"),
 	))
 )
+
+// tempResidue counts same-directory temp files whose cleanup failed. The sites
+// that remove them are context-less helpers (the atomic writers and the fs part
+// uploader's abort path), so the count is fed from an atomic and reported
+// through an observable counter rather than a ctx-taking Add. Unlike
+// upload.residue, nothing bounds these: they persist until an operator
+// reclaims them, which is why they get their own series.
+var tempResidue atomic.Int64
+
+// newTempResidueCounter builds the observable counter that reports the atomic
+// above. Tests build their own through this helper, so the series' name, unit
+// and provider attribute have a single definition.
+func newTempResidueCounter(m metric.Meter) metric.Int64ObservableCounter {
+	return utils.Must(m.Int64ObservableCounter(
+		"orchestrator.upload.temp_residue",
+		metric.WithDescription("Same-directory temp files left behind because their removal failed"),
+		metric.WithUnit("{file}"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(tempResidue.Load(), metric.WithAttributes(attribute.String(AttrProvider, tempResidueProvider)))
+
+			return nil
+		}),
+	))
+}
+
+var tempResidueCounter = newTempResidueCounter(meter)
+
+// tempResidueProvider is the provider these temp files belong to: only the fs
+// backend stages them next to their target object.
+const tempResidueProvider = "fs"
+
+// recordTempResidue counts one temp file that could not be removed.
+func recordTempResidue() { tempResidue.Add(1) }
 
 // RecordReadOpen records one layer's own open attempt (not the delegated inner
 // call), so a slow peer/NFS open isn't misattributed to the resolved source.
