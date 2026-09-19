@@ -236,45 +236,78 @@ func TestLoudRejectionOfUnknownArtifacts(t *testing.T) {
 	})
 }
 
+// forgedClaimedSize rewrites the uncompressed-size prefix of a framed artifact
+// (V4 and V5 share [metadata][flags][uint32 size][LZ4 block]) to the claimed
+// size and replaces the body with bytes that cannot decompress, so an artifact
+// that passes the cap guard fails later, loudly.
+func forgedClaimedSize(t *testing.T, raw []byte, claimed uint32) []byte {
+	t.Helper()
+
+	artifact := make([]byte, metadataSize+v4FlagsLen+v4SizePrefixLen+len("not-lz4!"))
+	copy(artifact, raw[:metadataSize])
+	artifact[metadataSize] = 0
+	binary.LittleEndian.PutUint32(artifact[metadataSize+v4FlagsLen:], claimed)
+	copy(artifact[metadataSize+v4FlagsLen+v4SizePrefixLen:], "not-lz4!")
+
+	return artifact
+}
+
 // TestHeaderCapBoundary pins the 64→256 MiB cap semantics that stranded
-// already-uploaded artifacts: an artifact above the historical cap must be
-// accepted by the current reader, and the cap must still reject sizes above the
-// current limit loudly.
-//
-//nolint:paralleltest // mutates the package-global cap; must not run in parallel
+// already-uploaded artifacts: a block above the historical cap must not be
+// rejected by the current per-format caps, above the current cap it must be
+// rejected loudly, and the historical cap must be reproducible per format
+// without mutating process state (S-41: caps are immutable and versioned).
 func TestHeaderCapBoundary(t *testing.T) {
-	raw, err := os.ReadFile(compatFixtureFile("v4-header.bin"))
-	require.NoError(t, err)
+	t.Parallel()
 
-	artifactWithClaimedSize := func(size uint32) []byte {
-		artifact := make([]byte, metadataSize+v4FlagsLen+v4SizePrefixLen+len("not-lz4!"))
-		copy(artifact, raw[:metadataSize])
-		artifact[metadataSize] = 0
-		binary.LittleEndian.PutUint32(artifact[metadataSize+v4FlagsLen:], size)
-		copy(artifact[metadataSize+v4FlagsLen+v4SizePrefixLen:], "not-lz4!")
+	const historicalCap = 64 << 20
 
-		return artifact
+	t.Run("historical cap no longer applies to stored artifacts", func(t *testing.T) {
+		t.Parallel()
+
+		// 64 MiB + 1 was rejected while the cap was 64 MiB, stranding uploaded
+		// snapshots; the current per-format caps must let it through so the
+		// artifact may only fail later, in decompression.
+		require.ErrorContains(t, checkUncompressedHeaderBlock("v4", historicalCap+1, historicalCap), "exceeds cap")
+		require.ErrorContains(t, checkUncompressedHeaderBlock("v5", historicalCap+1, historicalCap), "exceeds cap")
+		require.NoError(t, checkUncompressedHeaderBlock("v4", historicalCap+1, v4MaxUncompressedHeaderSize))
+		require.NoError(t, checkUncompressedHeaderBlock("v5", historicalCap+1, v5MaxUncompressedHeaderSize))
+	})
+
+	for _, tc := range []struct {
+		fixture string
+		label   string
+		cap     uint32
+		read    func(*Metadata, []byte, int64) (*Header, error)
+	}{
+		{fixture: "v4-header.bin", label: "v4", cap: v4MaxUncompressedHeaderSize, read: deserializeV4WithCap},
+		{fixture: "v5-header.bin", label: "v5", cap: v5MaxUncompressedHeaderSize, read: deserializeV5WithCap},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := os.ReadFile(compatFixtureFile(tc.fixture))
+			require.NoError(t, err)
+
+			metadata, err := deserializeMetadata(raw[:metadataSize])
+			require.NoError(t, err)
+
+			t.Run("above the current cap is rejected loudly", func(t *testing.T) {
+				t.Parallel()
+
+				_, err := DeserializeBytes(forgedClaimedSize(t, raw, tc.cap+1))
+				require.ErrorContains(t, err, "exceeds cap")
+			})
+
+			t.Run("exactly at the cap passes the guard", func(t *testing.T) {
+				t.Parallel()
+
+				const size = uint32(64 << 10)
+				block := forgedClaimedSize(t, raw, size)[metadataSize:]
+				_, err := tc.read(metadata, block, int64(size))
+				require.Error(t, err, "the forged body cannot decompress")
+				require.NotContains(t, err.Error(), "exceeds cap", "a block exactly at the cap is legal")
+			})
+		})
 	}
-
-	t.Run("above the old 64 MiB cap is no longer rejected by the cap", func(t *testing.T) {
-		_, err := DeserializeBytes(artifactWithClaimedSize(64<<20 + 1))
-		require.Error(t, err)
-		require.NotContains(t, err.Error(), "exceeds cap",
-			"the historical 64 MiB limit must not apply any more; the artifact may only fail later (decompression)")
-	})
-
-	t.Run("above the current cap is rejected loudly", func(t *testing.T) {
-		_, err := DeserializeBytes(artifactWithClaimedSize(256<<20 + 1))
-		require.ErrorContains(t, err, "exceeds cap")
-	})
-
-	t.Run("the historical cap rejected the same artifact", func(t *testing.T) {
-		original := v4MaxUncompressedHeaderSize
-		v4MaxUncompressedHeaderSize = 64 << 20
-		t.Cleanup(func() { v4MaxUncompressedHeaderSize = original })
-
-		_, err := DeserializeBytes(artifactWithClaimedSize(64<<20 + 1))
-		require.ErrorContains(t, err, "exceeds cap",
-			"with the historical cap restored the artifact is rejected on read — the exact incident class this suite pins")
-	})
 }

@@ -42,36 +42,71 @@ func fragmentedHeader(t *testing.T, n int) *Header {
 	return h
 }
 
-//nolint:paralleltest // mutates the package-global cap; must not run in parallel
-func TestStoreHeader_RejectsOversizeOnWrite(t *testing.T) {
-	orig := v4MaxUncompressedHeaderSize
-	v4MaxUncompressedHeaderSize = 1024
-	t.Cleanup(func() { v4MaxUncompressedHeaderSize = orig })
+// TestHeaderCapsAreVersionedAndImmutable pins the per-format caps. A change to
+// either value is a format-affecting compatibility event (S-41, REQ-F2/NFR-6):
+// the caps are constants, nothing can lower them at runtime, and this test
+// fails until a deliberate change updates it.
+func TestHeaderCapsAreVersionedAndImmutable(t *testing.T) {
+	t.Parallel()
 
-	// The guard returns before the storage provider is used, so a nil provider
-	// is fine for the rejection path.
-	h := fragmentedHeader(t, 100)
-	_, _, _, err := StoreHeader(t.Context(), nil, "header", h) //nolint:dogsled // only err matters
-	require.ErrorContains(t, err, "exceeds cap")
+	require.Equal(t, int64(256<<20), int64(v4MaxUncompressedHeaderSize))
+	require.Equal(t, int64(256<<20), int64(v5MaxUncompressedHeaderSize))
+
+	v4, ok := uncompressedHeaderCap(MetadataVersionV4)
+	require.True(t, ok)
+	require.Equal(t, int64(v4MaxUncompressedHeaderSize), v4)
+
+	v5, ok := uncompressedHeaderCap(MetadataVersionV5)
+	require.True(t, ok)
+	require.Equal(t, int64(v5MaxUncompressedHeaderSize), v5)
+
+	// V3 has no size prefix, so there is no cap to report.
+	_, ok = uncompressedHeaderCap(MetadataVersionV3)
+	require.False(t, ok)
 }
 
-//nolint:paralleltest // mutates the package-global cap; must not run in parallel
-func TestDeserialize_AboveOldCapRoundTrips(t *testing.T) {
-	// A header above a lowered cap is rejected on read; raising the cap lets it
-	// round-trip. Mirrors raising the production cap so already-uploaded large
-	// headers become resumable again.
-	orig := v4MaxUncompressedHeaderSize
-	v4MaxUncompressedHeaderSize = 4096
-	t.Cleanup(func() { v4MaxUncompressedHeaderSize = orig })
+// TestUncompressedHeaderBlockGuard pins the boundary shared by the write guard
+// in StoreHeader and the read guards in deserializeV4/deserializeV5: exactly at
+// the cap is legal, one byte over is rejected, and the message names the format.
+func TestUncompressedHeaderBlockGuard(t *testing.T) {
+	t.Parallel()
 
-	h := fragmentedHeader(t, 1000) // ~40 KiB uncompressed block, over the 4 KiB cap
+	for _, tc := range []struct {
+		format string
+		cap    int64
+	}{
+		{"v4", v4MaxUncompressedHeaderSize},
+		{"v5", v5MaxUncompressedHeaderSize},
+	} {
+		t.Run(tc.format, func(t *testing.T) {
+			t.Parallel()
+
+			require.NoError(t, checkUncompressedHeaderBlock(tc.format, tc.cap, tc.cap))
+			require.NoError(t, checkUncompressedHeaderBlock(tc.format, tc.cap-1, tc.cap))
+
+			err := checkUncompressedHeaderBlock(tc.format, tc.cap+1, tc.cap)
+			require.ErrorContains(t, err, "exceeds cap")
+			require.ErrorContains(t, err, tc.format)
+		})
+	}
+}
+
+// TestDeserialize_AboveOldCapRoundTrips pins the 64→256 MiB incident: an
+// artifact whose block exceeds an old, lower cap is rejected on read, and the
+// same bytes round-trip again under the artifact's own (current) cap.
+func TestDeserialize_AboveOldCapRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	h := fragmentedHeader(t, 1000) // ~40 KiB uncompressed block, over a 4 KiB cap
 	data, err := SerializeHeader(h)
 	require.NoError(t, err)
 
-	_, err = DeserializeBytes(data)
+	metadata, err := deserializeMetadata(data[:metadataSize])
+	require.NoError(t, err)
+
+	_, err = deserializeV4WithCap(metadata, data[metadataSize:], 4096)
 	require.ErrorContains(t, err, "exceeds cap")
 
-	v4MaxUncompressedHeaderSize = orig
 	got, err := DeserializeBytes(data)
 	require.NoError(t, err)
 	require.Equal(t, 1000, got.Mapping.Len())

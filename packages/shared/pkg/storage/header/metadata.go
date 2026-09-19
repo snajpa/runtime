@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	// metadataVersion is used by template-manager for uncompressed builds (V3 headers).
-	metadataVersion = 3
+	// MetadataVersionV3 is used by template-manager for uncompressed builds
+	// (V3 headers: [Metadata] followed by fixed-size mapping records).
+	MetadataVersionV3 = 3
 	// MetadataVersionV4 is used for compressed builds (V4 headers with FrameTables).
 	MetadataVersionV4 = 4
 	// MetadataVersionV5 is V4 with a columnar, varint-encoded mapping section.
@@ -30,6 +31,8 @@ const (
 )
 
 type Metadata struct {
+	// Version is the on-disk format version (MetadataVersionV3/V4/V5); the
+	// build lineage generation is a separate field (Generation).
 	Version    uint64
 	BlockSize  uint64
 	Size       uint64
@@ -41,7 +44,7 @@ type Metadata struct {
 
 func NewTemplateMetadata(buildId uuid.UUID, blockSize, size uint64) *Metadata {
 	return &Metadata{
-		Version:     metadataVersion,
+		Version:     MetadataVersionV3,
 		Generation:  0,
 		BlockSize:   blockSize,
 		Size:        size,

@@ -25,11 +25,13 @@ import (
 	headers "github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
-func newV4HeaderFF(t *testing.T, on bool) *featureflags.Client {
+// newBoolFlagFF builds a feature-flags client whose given bool flag is forced
+// on or off.
+func newBoolFlagFF(t *testing.T, flag featureflags.BoolFlag, on bool) *featureflags.Client {
 	t.Helper()
 
 	td := ldtestdata.DataSource()
-	td.Update(td.Flag(featureflags.V4HeaderForUncompressedFlag.Key()).VariationForAll(on))
+	td.Update(td.Flag(flag.Key()).VariationForAll(on))
 
 	ff, err := featureflags.NewClientWithDatasource(td)
 	require.NoError(t, err)
@@ -39,6 +41,12 @@ func newV4HeaderFF(t *testing.T, on bool) *featureflags.Client {
 	})
 
 	return ff
+}
+
+func newV4HeaderFF(t *testing.T, on bool) *featureflags.Client {
+	t.Helper()
+
+	return newBoolFlagFF(t, featureflags.V4HeaderForUncompressedFlag, on)
 }
 
 func resolveV4(t *testing.T, ff *featureflags.Client) bool {
@@ -67,6 +75,32 @@ func TestResolveCompressConfig_V4_FlagOn(t *testing.T) {
 
 	ff := newV4HeaderFF(t, true)
 	require.True(t, resolveV4(t, ff))
+}
+
+// TestHeaderWriteVersion pins the single write-format decision point: V5 once
+// the rollout flag is on, the pre-rollout format otherwise (S-41, REQ-F2).
+func TestHeaderWriteVersion(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil client keeps the pre-rollout format", func(t *testing.T) {
+		t.Parallel()
+
+		require.Equal(t, uint64(headers.MetadataVersionV4), headerWriteVersion(t.Context(), nil))
+	})
+
+	t.Run("flag off keeps V4", func(t *testing.T) {
+		t.Parallel()
+
+		ff := newBoolFlagFF(t, featureflags.HeaderV5WriteFlag, false)
+		require.Equal(t, uint64(headers.MetadataVersionV4), headerWriteVersion(t.Context(), ff))
+	})
+
+	t.Run("flag on selects V5 as the only write format", func(t *testing.T) {
+		t.Parallel()
+
+		ff := newBoolFlagFF(t, featureflags.HeaderV5WriteFlag, true)
+		require.Equal(t, uint64(headers.MetadataVersionV5), headerWriteVersion(t.Context(), ff))
+	})
 }
 
 // compressFF builds a feature-flags client whose compress-config flag carries

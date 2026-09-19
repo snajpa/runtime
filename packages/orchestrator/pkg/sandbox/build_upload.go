@@ -30,8 +30,28 @@ type Upload struct {
 	useCase        string
 	objectMetadata storage.ObjectMetadata
 	future         *utils.ErrorOnce
-	useV4          bool
-	headerVersion  uint64
+	// framed forces the framed header path (V4/V5) for uncompressed uploads:
+	// the per-file V4-for-uncompressed flags or V5 write selection set it.
+	framed        bool
+	headerVersion uint64
+}
+
+// headerWriteVersion selects the header format new uploads are written with.
+//
+// Policy (S-41, REQ-F2 "one write format going forward"): V5 is the write
+// format. It ships behind the header-v5-write rollout flag so every reader in
+// a mixed fleet understands V5 before writers produce it (read before write);
+// until the flag is on, writes stay on the older formats — V4 for framed
+// uploads, V3 when nothing is compressed and no framed flag is set. Enabling
+// the flag makes V5 the only header format this writer emits. This function is
+// the single decision point: flipping the default is a migration event, never
+// an incidental change (see the S-41 roadmap note and S-55's matrix).
+func headerWriteVersion(ctx context.Context, ff *featureflags.Client) uint64 {
+	if ff != nil && ff.BoolFlag(ctx, featureflags.HeaderV5WriteFlag) {
+		return headers.MetadataVersionV5
+	}
+
+	return headers.MetadataVersionV4
 }
 
 func NewUpload(
@@ -64,10 +84,7 @@ func NewUpload(
 	if useCase != "" {
 		ctx = featureflags.AddToContext(ctx, featureflags.CompressUseCaseContext(useCase))
 	}
-	headerVersion := uint64(headers.MetadataVersionV4)
-	if ff != nil && ff.BoolFlag(ctx, featureflags.HeaderV5WriteFlag) {
-		headerVersion = headers.MetadataVersionV5
-	}
+	headerVersion := headerWriteVersion(ctx, ff)
 
 	u := &Upload{
 		buildID:        snap.BuildID,
@@ -79,7 +96,7 @@ func NewUpload(
 		root:           root,
 		useCase:        useCase,
 		objectMetadata: objectMetadata,
-		useV4:          memV4 || rootV4 || headerVersion == headers.MetadataVersionV5,
+		framed:         memV4 || rootV4 || headerVersion == headers.MetadataVersionV5,
 		headerVersion:  headerVersion,
 	}
 
@@ -122,7 +139,9 @@ func (u *Upload) Run(ctx context.Context) error {
 	// Attach the upload use case so flag reads can target it (e.g. write-through only for builds).
 	ctx = featureflags.AddToContext(ctx, featureflags.CompressUseCaseContext(u.useCase))
 
-	if !u.mem.IsCompressionEnabled() && !u.root.IsCompressionEnabled() && !u.useV4 {
+	// runV3 is the legacy unframed write path (V3); it remains only as the
+	// rollback window and is a removal target per the S-41 roadmap.
+	if !u.mem.IsCompressionEnabled() && !u.root.IsCompressionEnabled() && !u.framed {
 		return u.runV3(ctx)
 	}
 

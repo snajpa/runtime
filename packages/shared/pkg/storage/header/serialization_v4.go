@@ -23,11 +23,15 @@ const v4FlagsLen = 1
 
 // v4MaxUncompressedHeaderSize caps the uncompressed V4 header block as an
 // anti-decompression-bomb guard (decompressLZ4 keeps the actual overrun bound).
-// Raised from 64 MiB to 256 MiB: a page-granular memfile diff can legitimately
-// produce a header above 64 MiB, and the old cap rejected such headers only on
-// read, permanently stranding already-uploaded snapshots whose data files are
-// intact. A var (not const) so tests can lower it cheaply.
-var v4MaxUncompressedHeaderSize = 256 << 20
+//
+// Caps are immutable and per-format (S-41, REQ-F2): each format consults its
+// own constant and nothing may change a cap at runtime. Cap history is format
+// history — this one was raised from 64 MiB to 256 MiB because a page-granular
+// memfile diff can legitimately produce a header above 64 MiB, and the old cap
+// rejected such headers only on read, permanently stranding already-uploaded
+// snapshots whose data files were intact. Lowering it again would strand stored
+// artifacts; changing it is a deliberate, compatibility-tested event.
+const v4MaxUncompressedHeaderSize = 256 << 20
 
 // v4FlagIncomplete is bit 0 of the V4 flags byte: when set, the header
 // describes a build whose upload has not yet finalized (an in-flight diff).
@@ -109,16 +113,22 @@ func serializeV4(metadata *Metadata, builds map[uuid.UUID]BuildData, mappings Ma
 	return result, int64(len(blockBytes)), nil
 }
 
-// deserializeV4 decompresses and reads the V4 block.
+// deserializeV4 decompresses and reads the V4 block under the V4 cap.
 func deserializeV4(metadata *Metadata, blockData []byte) (*Header, error) {
+	return deserializeV4WithCap(metadata, blockData, v4MaxUncompressedHeaderSize)
+}
+
+// deserializeV4WithCap is deserializeV4 with an explicit cap, so tests can
+// exercise cap boundaries without the production cap being mutable (S-41).
+func deserializeV4WithCap(metadata *Metadata, blockData []byte, limit int64) (*Header, error) {
 	if len(blockData) < v4FlagsLen+v4SizePrefixLen {
 		return nil, fmt.Errorf("v4 header block too short for flags + size prefix: %d bytes", len(blockData))
 	}
 
 	flags := blockData[0]
 	size := binary.LittleEndian.Uint32(blockData[v4FlagsLen:])
-	if uint64(size) > uint64(v4MaxUncompressedHeaderSize) {
-		return nil, fmt.Errorf("v4 header uncompressed size %d exceeds cap %d", size, v4MaxUncompressedHeaderSize)
+	if err := checkUncompressedHeaderBlock("v4", int64(size), limit); err != nil {
+		return nil, err
 	}
 
 	decompressed, err := decompressLZ4(blockData[v4FlagsLen+v4SizePrefixLen:], int(size))

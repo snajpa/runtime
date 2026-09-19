@@ -12,6 +12,13 @@ import (
 
 const maxV5MappingEntries = 8 << 20
 
+// v5MaxUncompressedHeaderSize caps the uncompressed V5 header block. V5 owns
+// its own cap (S-41, REQ-F2): caps are immutable and per-format, so a change
+// for one format can neither retroactively widen nor narrow acceptance for
+// another. The value matches V4's today — the formats share the framing — and
+// may diverge only by a deliberate, compatibility-tested change.
+const v5MaxUncompressedHeaderSize = 256 << 20
+
 // V5 keeps V4's framing — [Metadata][uint8 flags][uint32 uncompressedSize]
 // [LZ4(block)] — and an identical Builds section. Only the mapping section
 // changes: instead of N fixed 40-byte records, it is columnar and varint-coded.
@@ -132,8 +139,14 @@ func writeV5MappingSection(block *bytes.Buffer, m Mapping) error {
 	return nil
 }
 
-// deserializeV5 decompresses and reads the V5 block.
+// deserializeV5 decompresses and reads the V5 block under the V5 cap.
 func deserializeV5(metadata *Metadata, blockData []byte) (*Header, error) {
+	return deserializeV5WithCap(metadata, blockData, v5MaxUncompressedHeaderSize)
+}
+
+// deserializeV5WithCap is deserializeV5 with an explicit cap, so tests can
+// exercise cap boundaries without the production cap being mutable (S-41).
+func deserializeV5WithCap(metadata *Metadata, blockData []byte, limit int64) (*Header, error) {
 	if metadata.BlockSize == 0 {
 		return nil, errors.New("v5 header has zero block size")
 	}
@@ -143,8 +156,8 @@ func deserializeV5(metadata *Metadata, blockData []byte) (*Header, error) {
 
 	flags := blockData[0]
 	size := binary.LittleEndian.Uint32(blockData[v4FlagsLen:])
-	if uint64(size) > uint64(v4MaxUncompressedHeaderSize) {
-		return nil, fmt.Errorf("v5 header uncompressed size %d exceeds cap %d", size, v4MaxUncompressedHeaderSize)
+	if err := checkUncompressedHeaderBlock("v5", int64(size), limit); err != nil {
+		return nil, err
 	}
 
 	decompressed, err := decompressLZ4(blockData[v4FlagsLen+v4SizePrefixLen:], int(size))
@@ -227,7 +240,7 @@ func readV5MappingSection(reader *bytes.Reader, blockSize, size uint64) (Mapping
 	// encoded entry. Bound the crafted count before allocating either form.
 	maxEntriesByBytes := uint64(reader.Len()) / 4
 	const compactEntryBytes = 3*4 + 2
-	maxEntriesByMemory := uint64(v4MaxUncompressedHeaderSize) / (compactEntryBytes + 2*compactEntryBytes)
+	maxEntriesByMemory := uint64(v5MaxUncompressedHeaderSize) / (compactEntryBytes + 2*compactEntryBytes)
 	if maxEntriesByBytes > maxEntriesByMemory {
 		maxEntriesByBytes = maxEntriesByMemory
 	}
