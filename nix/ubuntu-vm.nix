@@ -167,7 +167,7 @@ let
         up      create the disk if needed and start QEMU in the foreground
         ssh     ssh into the running VM (dev@127.0.0.1, password e2b-dev)
         status  print image/seed/disk paths and whether QEMU is running
-        stop    power the VM off (SIGTERM to its QEMU process)
+        stop    power this state directory's VM off (SIGTERM to its recorded QEMU pid)
         reset   delete the VM disk (asks for confirmation)
         help    this text
 
@@ -201,6 +201,10 @@ let
         if [ -n "''${E2B_DEV_VM_SHARE:-}" ]; then
           set -- "$@" -virtfs "local,path=$E2B_DEV_VM_SHARE,mount_tag=host,security_model=none,multidevs=remap"
         fi
+        # Record this VM's pid and its start time before the exec (both survive
+        # it): stop and status act on this identity only, never on a
+        # process-wide pattern.
+        echo "$$ $(awk '{print $22}' "/proc/$$/stat")" >"$DIR/qemu.pid"
         echo "e2b-dev-vm: starting; ssh with 'e2b-dev-vm ssh' (Ctrl-A X quits QEMU)"
         exec qemu-system-x86_64 "$@" -nographic
       }
@@ -210,29 +214,70 @@ let
           -o LogLevel=ERROR -p "$SSH_PORT" dev@127.0.0.1
       }
 
+      # Prints the pid of this state directory's QEMU, or nothing. The pid file
+      # records the pid and its start time; both are re-verified against the
+      # live process (rejecting PID reuse), whose executable must be
+      # qemu-system-x86_64 itself or the Nix wrapper .qemu-system-x86_64-wrapped
+      # (only those terminal basenames) and whose argv must carry this VM's exact
+      # -drive
+      # file= argument (delimiter included). Anything else is stale or foreign
+      # and is refused.
+      vm_pid() {
+        [ -f "$DIR/qemu.pid" ] || return 1
+        pid=""
+        start=""
+        read -r pid start <"$DIR/qemu.pid" || return 1
+        case "$pid" in
+          *[!0-9]*|"") return 1 ;;
+        esac
+        case "$start" in
+          *[!0-9]*|"") return 1 ;;
+        esac
+        [ -r "/proc/$pid/stat" ] || return 1
+        live=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null) || return 1
+        [ "$live" = "$start" ] || return 1
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+        case "$exe" in
+          */qemu-system-x86_64|*/.qemu-system-x86_64-wrapped) ;;
+          *) return 1 ;;
+        esac
+        tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | awk -v disk="$DISK" '
+          NR == 1 && $0 !~ /^(.*\/)?qemu-system-x86_64$/ { exit 1 }
+          prev == "-drive" && index($0, "file=" disk ",") == 1 { found = 1 }
+          { prev = $0 }
+          END { exit(found ? 0 : 1) }
+        ' || return 1
+        printf '%s\n' "$pid"
+      }
+
       cmd_status() {
         echo "image: $IMAGE"
         echo "seed:  $SEED"
         echo "dir:   $DIR"
         if [ -f "$DISK" ]; then echo "disk:  $DISK (present)"; else echo "disk:  $DISK (not created yet)"; fi
-        pgrep -af "qemu-system-x86_64.*$DISK" || echo "qemu:  not running"
+        if pid=$(vm_pid); then echo "qemu:  running (pid $pid)"; else echo "qemu:  not running"; fi
       }
 
       cmd_stop() {
-        if ! pgrep -f "qemu-system-x86_64.*$DISK" >/dev/null 2>&1; then
+        if ! pid=$(vm_pid); then
+          if [ -f "$DIR/qemu.pid" ]; then
+            echo "e2b-dev-vm: $DIR/qemu.pid does not name this VM's live QEMU; refusing to signal anything (stale or foreign state - inspect it or run reset)"
+            return 1
+          fi
           echo "e2b-dev-vm: not running"
           return 0
         fi
-        pkill -f "qemu-system-x86_64.*$DISK" || true
+        kill -TERM "$pid" || { echo "e2b-dev-vm: cannot signal pid $pid"; return 1; }
         i=0
-        while [ "$i" -lt 20 ] && pgrep -f "qemu-system-x86_64.*$DISK" >/dev/null 2>&1; do
+        while [ "$i" -lt 40 ] && [ -d "/proc/$pid" ]; do
           i=$((i + 1))
-          sleep 0.5
+          sleep 0.25
         done
-        if pgrep -f "qemu-system-x86_64.*$DISK" >/dev/null 2>&1; then
+        if [ -d "/proc/$pid" ]; then
           echo "e2b-dev-vm: still running after SIGTERM"
           return 1
         fi
+        rm -f "$DIR/qemu.pid"
         echo "e2b-dev-vm: stopped"
       }
 

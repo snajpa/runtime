@@ -78,7 +78,7 @@ vm_running() {
 		return 0
 	fi
 
-	vm status 2>/dev/null | grep -q qemu-system
+	vm status 2>/dev/null | grep -qE 'qemu: +running'
 }
 
 ssh_vm() {
