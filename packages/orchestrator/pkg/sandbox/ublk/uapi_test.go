@@ -183,6 +183,11 @@ func TestBuildParams(t *testing.T) {
 		if got := getU32(params, paramsDiscardOffset+12); got != maxDiscardSectors {
 			t.Errorf("max_write_zeroes_sectors = %d, want %d", got, maxDiscardSectors)
 		}
+		// The advertised discard bound must keep the completion result
+		// representable: the result is a signed 32-bit byte count.
+		if maxDiscardSectors*512 > maxCompletionBytes {
+			t.Errorf("max_discard_sectors %d (%d bytes) overflows the signed 32-bit completion result", maxDiscardSectors, maxDiscardSectors*512)
+		}
 		// The kernel rejects a discard type whose granularity is zero or
 		// whose max_discard_segments is not 1.
 		if got := getU16(params, paramsDiscardOffset+16); got != 1 {

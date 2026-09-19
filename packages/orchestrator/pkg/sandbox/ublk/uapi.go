@@ -73,10 +73,17 @@ const (
 	// requires it.
 	queueIDNone = 0xffff
 
-	// maxDiscardSectors is UINT_MAX>>9, the limit the NBD transport exposes
-	// for discard and write zeroes. Discards carry no payload, so it is not
-	// tied to max_io_buf_bytes.
-	maxDiscardSectors = 0x7fffff
+	// maxCompletionBytes is the largest byte count a ublk completion result
+	// can carry: the result field is a signed 32-bit value, and negative
+	// values are read as errnos.
+	maxCompletionBytes = 1<<31 - 1
+
+	// maxDiscardSectors bounds the discard and write-zeroes requests the
+	// device advertises. It is bounded by maxCompletionBytes rather than the
+	// NBD transport's UINT_MAX>>9: the completion reports the served byte
+	// count, so a longer request would overflow the result into an errno.
+	// The block layer splits requests to the advertised bound.
+	maxDiscardSectors = maxCompletionBytes / 512
 )
 
 // ublk user-copy buffer address encoding: ublk_pos() in the kernel.

@@ -185,6 +185,13 @@ func (o *queueOwner) handle(tag uint16) int32 {
 		// no-op: every request is applied before it is committed.
 		return 0
 	case ioOpDiscard, ioOpWriteZeroes:
+		if length > maxCompletionBytes {
+			// A completion carries the served byte count in a signed 32-bit
+			// result; a longer request cannot be answered truthfully. The
+			// advertised limit keeps this unreachable; fail loudly instead
+			// of returning an overflowed, errno-shaped result.
+			return -int32(unix.EINVAL)
+		}
 		if _, err := o.backendWriteZeroesAt(pos, length); err != nil {
 			return errnoResult(err)
 		}

@@ -119,6 +119,39 @@ func newTestQueue(op uint8, nrSectors uint32, startSector uint64) (*queueOwner, 
 	return &queueOwner{dev: dev, tags: []uint16{0, 1}, desc: desc}, backend
 }
 
+// zeroAcceptingBackend accepts any zeroes range, so the discard path's own
+// guard decides the result: fakeBackend's range check would otherwise return
+// EINVAL for the same oversized request and mask a missing guard.
+type zeroAcceptingBackend struct{ fakeBackend }
+
+func (b *zeroAcceptingBackend) WriteZeroesAt(_, length int64) (int, error) {
+	return int(length), nil
+}
+
+// TestHandleRejectsUnrepresentableDiscard pins the completion bound: a
+// discard whose byte count does not fit the signed 32-bit result is refused
+// loudly instead of returning an overflowed, errno-shaped success.
+func TestHandleRejectsUnrepresentableDiscard(t *testing.T) {
+	t.Parallel()
+
+	const nrSectors = maxCompletionBytes/512 + 1
+
+	backend := &zeroAcceptingBackend{fakeBackend{data: make([]byte, 1<<20)}}
+	dev := &Device{backend: backend, opts: DefaultOptions(), size: nrSectors * 512}
+	dev.ctx = t.Context()
+
+	desc := make([]byte, ioDescSize*2)
+	putU32(desc, ioDescOffOpFlags, uint32(ioOpDiscard))
+	putU32(desc, ioDescOffNrSectors, nrSectors)
+	putU64(desc, ioDescOffStartSector, 0)
+
+	owner := &queueOwner{dev: dev, tags: []uint16{0, 1}, desc: desc}
+
+	if got, want := owner.handle(0), -int32(unix.EINVAL); got != want {
+		t.Errorf("oversized discard result = %d, want %d", got, want)
+	}
+}
+
 func TestHandleOps(t *testing.T) {
 	t.Parallel()
 
