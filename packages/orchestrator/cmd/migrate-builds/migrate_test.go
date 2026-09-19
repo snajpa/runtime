@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -359,6 +360,73 @@ func TestMigrateRefusesFramelessSourceWithoutReencode(t *testing.T) {
 
 	if got := headerVersionOf(t, provider, buildID, kind); got != 3 {
 		t.Fatalf("header version changed to %d despite the refusal", got)
+	}
+}
+
+func TestRunMigrateFailsOnFailedArtifacts(t *testing.T) {
+	t.Parallel()
+
+	provider, _, dir := testProvider(t)
+	buildID := uuid.New()
+	kind := artifactKind{name: storage.RootfsName, label: "rootfs"}
+
+	// The rootfs payload is tampered behind its header (a failed artifact); the
+	// memfile is simply absent (a missing one). Only the failure may fail the run.
+	payloadKey := writeArtifact(t, provider, buildID, kind, blockAligned(1, 0x5A), header.MetadataVersionV4, true)
+
+	tampered := filepath.Join(t.TempDir(), "tampered")
+	if err := os.WriteFile(tampered, blockAligned(1, 0x6B), 0o600); err != nil {
+		t.Fatalf("write tampered: %v", err)
+	}
+
+	seekable, err := provider.OpenSeekable(t.Context(), payloadKey)
+	if err != nil {
+		t.Fatalf("open seekable: %v", err)
+	}
+
+	if _, _, err := seekable.StoreFile(t.Context(), tampered, storage.WithCompressConfig(testCompressConfig(storage.CompressionZstd.String()))); err != nil {
+		t.Fatalf("store tampered: %v", err)
+	}
+
+	reportPath := filepath.Join(t.TempDir(), "report.json")
+
+	opts := migrateOptions()
+	opts.builds = buildList{buildID.String()}
+	opts.storageURL = "file://" + dir
+	opts.reportPath = reportPath
+
+	err = runMigrate(t.Context(), opts)
+	if err == nil || !strings.Contains(err.Error(), "1 artifact(s) failed") {
+		t.Fatalf("runMigrate = %v, want the failed-artifact error", err)
+	}
+
+	report, readErr := os.ReadFile(reportPath)
+	if readErr != nil {
+		t.Fatalf("read report: %v", readErr)
+	}
+
+	if !strings.Contains(string(report), `"failed":1`) {
+		t.Fatalf("report does not carry the failed outcome:\n%s", report)
+	}
+}
+
+func TestRunMigrateExitsCleanWithoutFailures(t *testing.T) {
+	t.Parallel()
+
+	provider, _, dir := testProvider(t)
+	buildID := uuid.New()
+	kind := artifactKind{name: storage.RootfsName, label: "rootfs"}
+
+	// A healthy artifact (migrated) plus an absent one (missing): nothing
+	// failed, so the run must exit successfully.
+	writeArtifact(t, provider, buildID, kind, blockAligned(1, 0x7C), header.MetadataVersionV4, true)
+
+	opts := migrateOptions()
+	opts.builds = buildList{buildID.String()}
+	opts.storageURL = "file://" + dir
+
+	if err := runMigrate(t.Context(), opts); err != nil {
+		t.Fatalf("runMigrate = %v, want success", err)
 	}
 }
 

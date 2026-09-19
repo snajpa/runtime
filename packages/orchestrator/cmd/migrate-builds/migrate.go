@@ -609,5 +609,13 @@ func runMigrate(ctx context.Context, opts options) error {
 
 	log.Printf("migrate-builds: done (%s)", rep.summary())
 
+	// Per-artifact failures are outcomes, not run errors: without this check a
+	// run whose artifacts all failed would still exit clean. Reconcile already
+	// fails on incomplete artifacts; the migrate path must match it, and the
+	// rehearsal leg reads the summary either way.
+	if n := rep.count(actionFailed); n > 0 {
+		return fmt.Errorf("%d artifact(s) failed", n)
+	}
+
 	return nil
 }

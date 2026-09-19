@@ -19,7 +19,9 @@
 //   - source objects are never deleted implicitly: superseded paths are
 //     reported, and removed only with -delete-superseded -confirm;
 //   - work is bounded by -concurrency and -rate, and can be resumed: re-running
-//     skips artifacts that are already on the target format (idempotent).
+//     skips artifacts that are already on the target format (idempotent);
+//   - a run in which any artifact fails exits non-zero (an artifact that is
+//     simply missing is reported, not fatal).
 package main
 
 import (
@@ -296,6 +298,14 @@ func (r *reporter) close() {
 	}
 
 	_ = r.out.Close()
+}
+
+// count returns how many outcomes of the given action were recorded.
+func (r *reporter) count(action string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.counts[action]
 }
 
 func (r *reporter) summary() string {
