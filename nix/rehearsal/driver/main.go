@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -1112,6 +1113,7 @@ func write(args []string) {
 	builds := fs.Int("builds", 0, "number of builds (overrides the profile)")
 	payload := fs.Int64("bytes", 0, "payload bytes per build (overrides the profile)")
 	headerVersion := fs.Uint64("header-version", header.MetadataVersionV5, "header format version to write (4 or 5)")
+	layout := fs.String("layout", layoutFlat, "flat (harness paths) | product (storage.Paths layout)")
 	_ = fs.Parse(args)
 
 	started := time.Now()
@@ -1146,76 +1148,26 @@ func write(args []string) {
 			return
 		}
 
-		objectPath := fmt.Sprintf("%s/builds/%s/rootfs.ext4", *prefix, id)
-		headerPath := objectPath + ".header"
-
-		seekable, err := provider.OpenSeekable(ctx, objectPath)
+		plans, err := artifactPlans(*layout, *prefix, id)
 		if err != nil {
-			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: "open: " + err.Error()})
+			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: err.Error()})
 
 			return
 		}
 
-		fullFT, checksum, err := seekable.StoreFile(ctx, localPayload, storage.WithCompressConfig(compressConfig()))
-		if err != nil {
-			emit(result{
-				Phase: "write", Version: version, Outcome: "error",
-				Detail: fmt.Sprintf("store build %d: %v", i, err),
-			})
+		for _, plan := range plans {
+			written, err := writeArtifactPlan(ctx, provider, id, plan, localPayload, data, prof.payload, *headerVersion)
+			if err != nil {
+				emit(result{
+					Phase: "write", Version: version, Outcome: "error",
+					Detail: fmt.Sprintf("store build %d %s: %v", i, plan.name, err),
+				})
 
-			return
+				return
+			}
+
+			m.Entries = append(m.Entries, written)
 		}
-
-		if checksum != sha256.Sum256(data) {
-			emit(result{
-				Phase: "write", Version: version, Outcome: "misread",
-				Detail: fmt.Sprintf("storefile checksum mismatch for build %d", i),
-			})
-
-			return
-		}
-
-		metadata := header.NewTemplateMetadata(id, blockSize, uint64(prof.payload))
-
-		spec, err := header.NewHeader(metadata, []header.BuildMap{{
-			Offset:             0,
-			Length:             uint64(prof.payload),
-			BuildId:            id,
-			BuildStorageOffset: 0,
-		}})
-		if err != nil {
-			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: "header: " + err.Error()})
-
-			return
-		}
-
-		spec.SetBuild(id, header.BuildData{
-			Size:      prof.payload,
-			Checksum:  checksum,
-			FrameData: fullFT.Table(),
-		})
-
-		// A compressed artifact carries its frame tables in the header, and only
-		// the V4/V5 formats serialize them: production promotes the header to the
-		// write version before storing it.
-		upload := spec.CloneForUpload(*headerVersion)
-
-		if _, _, _, err := header.StoreHeader(ctx, provider, headerPath, upload); err != nil {
-			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: "store header: " + err.Error()})
-
-			return
-		}
-
-		m.Entries = append(m.Entries, entry{
-			Build:     id.String(),
-			Payload:   objectPath,
-			Header:    headerPath,
-			Size:      prof.payload,
-			Checksum:  hex.EncodeToString(checksum[:]),
-			Codec:     codecZstd,
-			WrittenBy: version,
-			WrittenAt: time.Now(),
-		})
 	}
 
 	encoded, err := json.MarshalIndent(m, "", "  ")
@@ -1233,13 +1185,114 @@ func write(args []string) {
 
 	emit(result{
 		Phase: "write", Version: version, Outcome: "ok",
-		Detail: fmt.Sprintf("wrote %d builds, %.1f MiB each, to %s", len(m.Entries),
-			float64(prof.payload)/float64(1<<20), *prefix),
+		Detail: fmt.Sprintf("wrote %d artifacts (%d builds, %.1f MiB each, %s) to %s",
+			len(m.Entries), prof.builds, float64(prof.payload)/float64(1<<20), *layout, *prefix),
 		Objects:  2 * len(m.Entries),
 		Bytes:    int64(len(m.Entries)) * prof.payload,
 		Seconds:  time.Since(started).Seconds(),
 		Protocol: fmt.Sprintf("zstd/%dKB frames", frameSizeKB),
 	})
+}
+
+// Layouts the rehearsal can write artifacts in.
+const (
+	// layoutFlat is the harness's own shape: one artifact per build under the
+	// run prefix.
+	layoutFlat = "flat"
+	// layoutProduct is what the runtime's storage.Paths describe, so the
+	// runtime's own tooling (migrate-builds) can operate on the artifacts the
+	// rehearsal produced.
+	layoutProduct = "product"
+)
+
+// artifactPlan is where one artifact's payload and header live.
+type artifactPlan struct {
+	name    string
+	payload string
+	header  string
+}
+
+// artifactPlans returns the artifacts to write for one build.
+func artifactPlans(layout, prefix string, id uuid.UUID) ([]artifactPlan, error) {
+	switch layout {
+	case layoutFlat:
+		payload := fmt.Sprintf("%s/builds/%s/%s", prefix, id, storage.RootfsName)
+
+		return []artifactPlan{{name: storage.RootfsName, payload: payload, header: payload + storage.HeaderSuffix}}, nil
+	case layoutProduct:
+		paths := storage.Paths{BuildID: id.String()}
+
+		names := []string{storage.RootfsName, storage.MemfileName}
+		plans := make([]artifactPlan, 0, len(names))
+
+		for _, name := range names {
+			plans = append(plans, artifactPlan{
+				name:    name,
+				payload: paths.DataFile(name, storage.CompressionZstd),
+				header:  paths.HeaderFile(name),
+			})
+		}
+
+		return plans, nil
+	default:
+		return nil, fmt.Errorf("unknown layout %q (want %s or %s)", layout, layoutFlat, layoutProduct)
+	}
+}
+
+// writeArtifactPlan stores one artifact's payload and header and returns the
+// manifest entry describing it.
+func writeArtifactPlan(ctx context.Context, provider storage.StorageProvider, id uuid.UUID, plan artifactPlan, localPayload string, data []byte, size int64, headerVersion uint64) (entry, error) {
+	seekable, err := provider.OpenSeekable(ctx, plan.payload)
+	if err != nil {
+		return entry{}, fmt.Errorf("open: %w", err)
+	}
+
+	fullFT, checksum, err := seekable.StoreFile(ctx, localPayload, storage.WithCompressConfig(compressConfig()))
+	if err != nil {
+		return entry{}, err
+	}
+
+	if checksum != sha256.Sum256(data) {
+		return entry{}, errors.New("storefile checksum mismatch")
+	}
+
+	metadata := header.NewTemplateMetadata(id, blockSize, uint64(size))
+
+	spec, err := header.NewHeader(metadata, []header.BuildMap{{
+		Offset:             0,
+		Length:             uint64(size),
+		BuildId:            id,
+		BuildStorageOffset: 0,
+	}})
+	if err != nil {
+		return entry{}, fmt.Errorf("header: %w", err)
+	}
+
+	spec.SetBuild(id, header.BuildData{
+		Size:      size,
+		Checksum:  checksum,
+		FrameData: fullFT.Table(),
+	})
+
+	// A compressed artifact carries its frame tables in the header, and only the
+	// V4/V5 formats serialize them: production promotes the header to the write
+	// version before storing it.
+	upload := spec.CloneForUpload(headerVersion)
+
+	if _, _, _, err := header.StoreHeader(ctx, provider, plan.header, upload); err != nil {
+		return entry{}, fmt.Errorf("store header: %w", err)
+	}
+
+	return entry{
+		Build:     id.String(),
+		Payload:   plan.payload,
+		Header:    plan.header,
+		Size:      size,
+		Checksum:  hex.EncodeToString(checksum[:]),
+		Codec:     codecZstd,
+		WrittenBy: version,
+		WrittenAt: time.Now(),
+	}, nil
 }
 
 func read(args []string) {
