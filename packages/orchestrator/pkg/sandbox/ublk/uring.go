@@ -175,7 +175,7 @@ func (r *ioUring) close() {
 		_ = unix.Munmap(r.sqRing)
 		r.sqRing = nil
 	}
-	if r.fd > 0 {
+	if r.fd >= 0 {
 		_ = unix.Close(r.fd)
 		r.fd = -1
 	}
