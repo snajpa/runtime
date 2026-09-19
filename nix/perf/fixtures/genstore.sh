@@ -15,6 +15,18 @@ BIN="$BIN_DIR/perf-genstore"
 
 mkdir -p "$BIN_DIR"
 
-(cd "$ROOT" && go build -o "$BIN" ./packages/orchestrator/cmd/perf-genstore)
+log="$BIN_DIR/build.log"
+tmp="$BIN.tmp.$$"
+if ! (cd "$ROOT" && go build -o "$tmp" ./packages/orchestrator/cmd/perf-genstore) >"$log" 2>&1; then
+	echo "genstore: build failed (log: $log)" >&2
+	if [ -s "$log" ]; then
+		tail -n 20 "$log" >&2
+	else
+		echo "genstore: (build produced no output)" >&2
+	fi
+	rm -f "$tmp"
+	exit 1
+fi
+mv -f "$tmp" "$BIN"
 
 exec "$BIN" "$@"

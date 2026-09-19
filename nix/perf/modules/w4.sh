@@ -20,7 +20,7 @@ TREES=${PERF_TREES_DIR:-/root/ai/worktrees/e2b}
 DRY=${PERF_W4_DRY:-0}
 ENV_CLASS=${PERF_ENV_CLASS:-quiet}
 
-say() { echo "+ $*"; }
+say() { echo "+ $*" >&2; }
 
 # profile -> "<store class> <compress|-> <concurrency> <tool mode>"
 profile_params() {
@@ -29,7 +29,7 @@ profile_params() {
 	zstd-c1)         echo "large zstd 1 migrate" ;;
 	zstd-c4)         echo "large zstd 4 migrate" ;;
 	latency-zstd-c1) echo "latency zstd 1 migrate" ;;
-	reconcile-c1)    echo "large - 1 reconcile" ;;
+	reconcile-c1)    echo "latency - 1 reconcile" ;;
 	*) return 1 ;;
 	esac
 }
@@ -49,8 +49,15 @@ ensure_store() {
 	fi
 
 	say "fixture: generating $class at $FIXTURES/$class"
-	sh "$HERE/../fixtures/genstore.sh" --class "$class" \
-		--out "$FIXTURES/$class" --ids "$FIXTURES/$class.ids"
+	if ! sh "$HERE/../fixtures/genstore.sh" --class "$class" \
+		--out "$FIXTURES/$class" --ids "$FIXTURES/$class.ids"; then
+		echo "w4: fixture generation failed for $class" >&2
+		return 1
+	fi
+	[ -f "$FIXTURES/$class.ids" ] || {
+		echo "w4: fixture generation incomplete for $class (no ids file)" >&2
+		return 1
+	}
 }
 
 resolve_tool() {
@@ -67,15 +74,24 @@ resolve_tool() {
 	fi
 
 	bin="$FIXTURES/.bin/migrate-builds-$leg"
+	log="$FIXTURES/.bin/build-$leg.log"
 	mkdir -p "$FIXTURES/.bin"
 
 	if [ ! -x "$bin" ]; then
 		say "tool: building migrate-builds from $tree"
-		if ! (cd "$tree" && go build -o "$bin" ./packages/orchestrator/cmd/migrate-builds) \
-			>"$FIXTURES/.bin/build-$leg.log" 2>&1; then
-			echo "w4: tool build failed for $leg (see $FIXTURES/.bin/build-$leg.log)" >&2
+		tmp="$bin.tmp.$$"
+		if ! (cd "$tree" && go build -o "$tmp" ./packages/orchestrator/cmd/migrate-builds) \
+			>"$log" 2>&1; then
+			echo "w4: tool build failed for $leg (log: $log)" >&2
+			if [ -s "$log" ]; then
+				tail -n 20 "$log" >&2
+			else
+				echo "w4: (build produced no output)" >&2
+			fi
+			rm -f "$tmp"
 			return 1
 		fi
+		mv -f "$tmp" "$bin"
 	fi
 
 	echo "$bin"
@@ -160,7 +176,7 @@ cmd_profile() {
 
 	tool=$(resolve_tool "${PERF_LEG:-candidate}") || exit 40
 
-	exec sh "$cap" run diagnostic w4 "$legdir" --lock -- \
+	exec sh "$cap" run diagnostic w4 "$legdir" -- \
 		python3 "$PY/w4-block.py" --tool "$tool" --store "$FIXTURES/$class" \
 		--ids "$FIXTURES/$class.ids" --kinds "$(kinds_of "$class")" --out "$legdir" \
 		--profile "$profile" --leg "${PERF_LEG:-candidate}" --block diag \

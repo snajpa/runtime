@@ -206,15 +206,64 @@ def main():
             "max": max(lat),
         }
 
+    # Rich block summary stays an artifact; the T1 stream shape is per-metric
+    # sample records (perf/2), envelope stamped by the harness emitter.
+    with open(os.path.join(a.out, "block.json"), "w") as f:
+        json.dump(record, f, indent=1)
+        f.write("\n")
+
+    stage = os.environ.get("PERF_STAGE", "measure")
+    samples = []
+
+    def add(metric_id, unit, unit_id, values):
+        if values is None:
+            return
+
+        samples.append({
+            "record": "sample", "workload": "W4", "profile": a.profile,
+            "side": "candidate", "leg": a.leg, "block": a.block, "stage": stage,
+            "metric": {"id": metric_id, "unit": unit}, "unit_id": unit_id,
+            "chunk": {"i": 1, "n": 1}, "samples": values,
+        })
+
+    add("wall_s", "s", "block", [record["wall_s"]])
+    add("user_cpu_s", "s", "block", [record["user_s"]])
+    add("sys_cpu_s", "s", "block", [record["sys_s"]])
+    add("peak_rss_mib", "MiB", "block", [round(record["peak_rss_kib"] / 1024.0, 3)])
+    add("scratch_peak_mib", "MiB", "block",
+        [round(record["scratch_peak_bytes"] / (1024.0 * 1024.0), 3)])
+
+    if lat:
+        nchunks = max(1, (len(lat) + 1023) // 1024)
+        for i in range(0, len(lat), 1024):
+            samples.append({
+                "record": "sample", "workload": "W4", "profile": a.profile,
+                "side": "candidate", "leg": a.leg, "block": a.block, "stage": stage,
+                "metric": {"id": "migrate_latency_ms", "unit": "ms"},
+                "unit_id": "artifact", "chunk": {"i": i // 1024 + 1, "n": nchunks},
+                "samples": lat[i:i + 1024],
+            })
+
+    for mid, key in (("migrated", "migrate"), ("skipped", "skip"),
+                     ("missing", "missing"), ("failed", "failed")):
+        add(mid, "count", "artifact", [counters[key]] if key in counters else None)
+
     with open(os.path.join(a.out, "samples.jsonl"), "a") as f:
-        f.write(json.dumps(record) + "\n")
+        for rec in samples:
+            f.write(json.dumps(rec) + "\n")
 
     shutil.rmtree(store, ignore_errors=True)
     shutil.rmtree(scratch, ignore_errors=True)
 
     print(f"w4: block {a.block} leg {a.leg} profile {a.profile}: rc={record['rc']} "
           f"wall={record['wall_s']:.3f}s rss_kib={record['peak_rss_kib']} "
-          f"scratch={record['scratch_peak_bytes']} counters={counters}")
+          f"scratch={record['scratch_peak_bytes']} counters={counters} "
+          f"sample_records={len(samples)}")
+
+    if record["rc"] != 0:
+        print(f"w4: tool rc={record['rc']} (records retained; block inconclusive)", file=sys.stderr)
+
+        return 30
 
     return 0
 
