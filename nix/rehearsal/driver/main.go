@@ -1,0 +1,873 @@
+// Command s3-rehearsal drives one e2b version's storage layer against a shared
+// object store, so a fleet of two versions can be rehearsed on live storage:
+// write with one, read with the other, and prove nothing is stranded.
+//
+// It is built once per version of the runtime (see ../build.sh): the same
+// source linked against an old checkout and a new checkout *is* the
+// mixed-version fleet, with the storage and header code the only difference
+// between the binaries.
+//
+// Every phase prints one JSON object on stdout so a caller can tell the
+// outcomes apart:
+//
+//	ok        the phase did what the matrix expects
+//	rejected  the version refused data it does not understand (loud, allowed)
+//	misread   data came back wrong — the failure this rehearsal exists to catch
+//	error     anything else (transport, credentials, disk)
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/google/uuid"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+)
+
+// version is stamped at build time with
+// -ldflags "-X main.version=<checkout>@<revision>".
+var version = "dev"
+
+const (
+	blockSize = 4096
+	codecZstd = "zstd"
+	// production default frame size (2 MiB) and the S3 minimum part size, from
+	// the storage tests; multipart uploads are part of what is rehearsed.
+	frameSizeKB   = 2 * 1024
+	minPartSizeMB = 5
+)
+
+type result struct {
+	Phase    string  `json:"phase"`
+	Version  string  `json:"version"`
+	Outcome  string  `json:"outcome"`
+	Detail   string  `json:"detail,omitempty"`
+	Objects  int     `json:"objects,omitempty"`
+	Bytes    int64   `json:"bytes,omitempty"`
+	Seconds  float64 `json:"seconds,omitempty"`
+	Protocol string  `json:"protocol,omitempty"`
+}
+
+type entry struct {
+	Build     string    `json:"build"`
+	Payload   string    `json:"payload"`
+	Header    string    `json:"header"`
+	Size      int64     `json:"size"`
+	Checksum  string    `json:"checksum"`
+	Codec     string    `json:"codec"`
+	WrittenBy string    `json:"written_by"`
+	WrittenAt time.Time `json:"written_at"`
+}
+
+type manifest struct {
+	Version    string    `json:"version"`
+	StorageURL string    `json:"storage_url"`
+	Prefix     string    `json:"prefix"`
+	Entries    []entry   `json:"entries"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+	}
+
+	args := os.Args[2:]
+
+	switch os.Args[1] {
+	case "ensure-bucket":
+		ensureBucket(args)
+	case "probe":
+		probe(args)
+	case "write":
+		write(args)
+	case "read":
+		read(args)
+	case "exists":
+		exists(args)
+	case "prune":
+		prune(args)
+	case "versions":
+		emit(result{
+			Phase: "versions", Version: version, Outcome: "ok",
+			Detail: fmt.Sprintf("go=%s cores=%d", runtime.Version(), runtime.NumCPU()),
+		})
+	default:
+		usage()
+	}
+}
+
+// readObject reads a whole logical payload the way a node does: chunk-aligned
+// ranges through the cache layer's range reader, one reader per range so every
+// frame's CRC is verified on Close. A reader may serve less than the requested
+// range (a frame boundary), so the loop advances by what it actually read; the
+// caller still checks the total length and the hash.
+func readObject(ctx context.Context, provider storage.StorageProvider, path string, size int64, ft *storage.FrameTable) ([]byte, error) {
+	seekable, err := provider.OpenSeekable(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, 0, size)
+
+	for off := int64(0); off < size; {
+		length := min(int64(storage.MemoryChunkSize), size-off)
+
+		reader, _, err := seekable.OpenRangeReader(ctx, off, length, ft)
+		if err != nil {
+			return nil, fmt.Errorf("range at %d: %w", off, err)
+		}
+
+		var chunk bytesBuffer
+		_, copyErr := io.Copy(&chunk, reader)
+		_, closeErr := reader.Close(ctx)
+
+		switch {
+		case copyErr != nil:
+			return nil, fmt.Errorf("read at %d: %w", off, copyErr)
+		case closeErr != nil:
+			return nil, fmt.Errorf("frame verification at %d: %w", off, closeErr)
+		case len(chunk.Bytes()) == 0:
+			return nil, fmt.Errorf("read at %d made no progress", off)
+		}
+
+		out = append(out, chunk.Bytes()...)
+		off += int64(len(chunk.Bytes()))
+	}
+
+	return out, nil
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `usage: s3-rehearsal <phase> [flags]
+
+phases:
+  probe     write and read back one small object
+  write     publish a set of artifacts and write a manifest
+  read      read and verify every artifact in a manifest
+  exists    check every artifact in a manifest still exists
+  prune     delete the artifacts of a manifest (rollback/GC leg)
+  versions  print the stamped version
+
+flags: --storage-url, --prefix, --manifest, --profile, --builds, --bytes, --codec
+`)
+	os.Exit(2)
+}
+
+type profile struct {
+	builds  int
+	payload int64
+}
+
+// pickProfile sizes a run for the box it is on: the same harness has to be
+// meaningful on a small dev machine and on a big node, so "auto" scales with
+// cores and memory and the explicit profiles pin a shape for comparisons.
+func pickProfile(name string, builds int, payload int64) profile {
+	var p profile
+
+	switch name {
+	case "tiny":
+		p = profile{builds: 2, payload: 4 << 20}
+	case "small":
+		p = profile{builds: 4, payload: 16 << 20}
+	case "big":
+		p = profile{builds: 16, payload: 256 << 20}
+	default: // auto
+		p = profile{
+			builds:  min(max(runtime.NumCPU()/2, 2), 32),
+			payload: min(max((totalMemGB()/4)<<20, 4<<20), 256<<20),
+		}
+	}
+
+	if builds > 0 {
+		p.builds = builds
+	}
+
+	if payload > 0 {
+		p.payload = payload
+	}
+
+	return p
+}
+
+func totalMemGB() int64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 8
+	}
+
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			break
+		}
+
+		if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+			return kb / 1024 / 1024
+		}
+
+		break
+	}
+
+	return 8
+}
+
+// openProvider builds the provider a node runs with: the object store wrapped
+// in the NFS chunk cache. The wrapping matters for correctness of the
+// rehearsal, not just for fidelity — the cache layer's range reader walks
+// frame tables, the raw provider's reader does not. The cache directory is per
+// invocation unless S3_REHEARSAL_CACHE_DIR says otherwise, so a warm local
+// cache cannot mask a store problem.
+func openProvider(rawURL string) (storage.StorageProvider, error) {
+	spec, err := storage.ParseStorageURL(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse storage url: %w", err)
+	}
+
+	ctx := context.Background()
+
+	inner, err := storage.NewProvider(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	cacheDir := os.Getenv("S3_REHEARSAL_CACHE_DIR")
+	if cacheDir == "" {
+		cacheDir, err = os.MkdirTemp("", "s3-rehearsal-cache")
+		if err != nil {
+			return nil, err
+		}
+	} else if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return nil, err
+	}
+
+	flags, err := featureflags.NewClient()
+	if err != nil {
+		return nil, fmt.Errorf("feature flags: %w", err)
+	}
+
+	return storage.WrapInNFSCache(ctx, cacheDir, inner, flags), nil
+}
+
+// ensureBucket creates the bucket if it is missing. The storage layer assumes
+// the bucket exists (the repo's own tests create it explicitly), and a
+// rehearsal should not need hand-run setup, so this uses the SDK directly
+// against the same spec the provider gets.
+func ensureBucket(args []string) {
+	fs := flag.NewFlagSet("ensure-bucket", flag.ExitOnError)
+	storageURL := fs.String("storage-url", "", "storage URL (required)")
+	_ = fs.Parse(args)
+
+	spec, err := storage.ParseStorageURL(*storageURL)
+	if err != nil {
+		emit(result{Phase: "ensure-bucket", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	if spec.Provider != storage.AWSStorageProvider {
+		emit(result{
+			Phase: "ensure-bucket", Version: version, Outcome: "ok",
+			Detail: fmt.Sprintf("provider %s manages its own buckets", spec.Provider),
+		})
+
+		return
+	}
+
+	region := spec.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	cfg := aws.Config{
+		Credentials: credentials.NewStaticCredentialsProvider(
+			os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"), ""),
+		Region: region,
+	}
+
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if spec.Endpoint != "" {
+			o.BaseEndpoint = aws.String(spec.Endpoint)
+		}
+
+		o.UsePathStyle = spec.UsePathStyle
+	})
+
+	_, err = client.CreateBucket(context.Background(), &s3.CreateBucketInput{Bucket: aws.String(spec.Bucket)})
+	if err != nil {
+		exists, headErr := client.HeadBucket(context.Background(), &s3.HeadBucketInput{Bucket: aws.String(spec.Bucket)})
+
+		if headErr != nil || exists == nil {
+			emit(result{Phase: "ensure-bucket", Version: version, Outcome: "error", Detail: err.Error()})
+
+			return
+		}
+	}
+
+	emit(result{
+		Phase: "ensure-bucket", Version: version, Outcome: "ok",
+		Detail: fmt.Sprintf("bucket %s ready at %s", spec.Bucket, spec.Endpoint),
+	})
+}
+
+func compressConfig() storage.CompressConfig {
+	return storage.CompressConfig{
+		Enabled:            true,
+		Type:               codecZstd,
+		Level:              2,
+		FrameSizeKB:        frameSizeKB,
+		MinPartSizeMB:      minPartSizeMB,
+		FrameEncodeWorkers: max(runtime.NumCPU()/4, 1),
+		EncoderConcurrency: 1,
+	}
+}
+
+// payloadData generates deterministic, semi-compressible bytes so a mismatch is
+// detectable and the frame tables look like real data.
+func payloadData(seed int64, size int64) []byte {
+	rng := rand.New(rand.NewSource(seed))
+	buf := make([]byte, size)
+
+	for i := range buf {
+		if i%64 < 48 {
+			buf[i] = byte(rng.Intn(16))
+		} else {
+			buf[i] = byte(rng.Intn(256))
+		}
+	}
+
+	return buf
+}
+
+func buildID(prefix string, index int) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(prefix+"/"+strconv.Itoa(index)))
+}
+
+func probe(args []string) {
+	fs := flag.NewFlagSet("probe", flag.ExitOnError)
+	storageURL := fs.String("storage-url", "", "storage URL (required)")
+	prefix := fs.String("prefix", "probe", "object prefix")
+	_ = fs.Parse(args)
+
+	started := time.Now()
+
+	provider, err := openProvider(*storageURL)
+	if err != nil {
+		emit(result{Phase: "probe", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	ctx := context.Background()
+	objectPath := *prefix + "/probe.bin"
+	payload := payloadData(1, 1<<20)
+	want := sha256.Sum256(payload)
+
+	local := filepath.Join(os.TempDir(), "s3-rehearsal-probe.bin")
+	if err := os.WriteFile(local, payload, 0o600); err != nil {
+		emit(result{Phase: "probe", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+	defer os.Remove(local)
+
+	seekable, err := provider.OpenSeekable(ctx, objectPath)
+	if err != nil {
+		emit(result{Phase: "probe", Version: version, Outcome: "error", Detail: "open: " + err.Error()})
+
+		return
+	}
+
+	fullFT, _, err := seekable.StoreFile(ctx, local, storage.WithCompressConfig(compressConfig()))
+	if err != nil {
+		emit(result{Phase: "probe", Version: version, Outcome: "error", Detail: "store: " + err.Error()})
+
+		return
+	}
+
+	data, err := readObject(ctx, provider, objectPath, int64(len(payload)), fullFT.Table())
+	if err != nil {
+		emit(result{Phase: "probe", Version: version, Outcome: "misread", Detail: "read back: " + err.Error()})
+
+		return
+	}
+
+	var got bytesBuffer
+	_, _ = got.Write(data)
+
+	gotSum := sha256.Sum256(got.Bytes())
+	outcome, detail := "ok", "round trip verified"
+
+	if gotSum != want {
+		outcome = "misread"
+		detail = fmt.Sprintf("payload mismatch: wrote %s, read %s",
+			hex.EncodeToString(want[:8]), hex.EncodeToString(gotSum[:8]))
+	}
+
+	if measure, err := provider.OpenSeekable(ctx, objectPath); err == nil {
+		if size, sizeErr := measure.Size(ctx); sizeErr == nil && size != int64(len(payload)) {
+			outcome = "misread"
+			detail = fmt.Sprintf("size mismatch: wrote %d, read %d", len(payload), size)
+		}
+	}
+
+	emit(result{
+		Phase: "probe", Version: version, Outcome: outcome, Detail: detail,
+		Objects: 1, Bytes: int64(len(payload)), Seconds: time.Since(started).Seconds(),
+		Protocol: "zstd",
+	})
+}
+
+func write(args []string) {
+	fs := flag.NewFlagSet("write", flag.ExitOnError)
+	storageURL := fs.String("storage-url", "", "storage URL (required)")
+	prefix := fs.String("prefix", "", "object prefix (required)")
+	manifestPath := fs.String("manifest", "", "where to write the manifest (required)")
+	profileName := fs.String("profile", "auto", "tiny|small|big|auto")
+	builds := fs.Int("builds", 0, "number of builds (overrides the profile)")
+	payload := fs.Int64("bytes", 0, "payload bytes per build (overrides the profile)")
+	headerVersion := fs.Uint64("header-version", header.MetadataVersionV5, "header format version to write (4 or 5)")
+	_ = fs.Parse(args)
+
+	started := time.Now()
+	prof := pickProfile(*profileName, *builds, *payload)
+
+	provider, err := openProvider(*storageURL)
+	if err != nil {
+		emit(result{Phase: "write", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	ctx := context.Background()
+	m := manifest{Version: version, StorageURL: *storageURL, Prefix: *prefix, CreatedAt: time.Now()}
+
+	workDir, err := os.MkdirTemp("", "s3-rehearsal")
+	if err != nil {
+		emit(result{Phase: "write", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+	defer os.RemoveAll(workDir)
+
+	for i := range prof.builds {
+		id := buildID(*prefix, i)
+		localPayload := filepath.Join(workDir, fmt.Sprintf("payload-%d.bin", i))
+		data := payloadData(int64(i)+1, prof.payload)
+
+		if err := os.WriteFile(localPayload, data, 0o600); err != nil {
+			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: err.Error()})
+
+			return
+		}
+
+		objectPath := fmt.Sprintf("%s/builds/%s/rootfs.ext4", *prefix, id)
+		headerPath := objectPath + ".header"
+
+		seekable, err := provider.OpenSeekable(ctx, objectPath)
+		if err != nil {
+			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: "open: " + err.Error()})
+
+			return
+		}
+
+		fullFT, checksum, err := seekable.StoreFile(ctx, localPayload, storage.WithCompressConfig(compressConfig()))
+		if err != nil {
+			emit(result{
+				Phase: "write", Version: version, Outcome: "error",
+				Detail: fmt.Sprintf("store build %d: %v", i, err),
+			})
+
+			return
+		}
+
+		if checksum != sha256.Sum256(data) {
+			emit(result{
+				Phase: "write", Version: version, Outcome: "misread",
+				Detail: fmt.Sprintf("storefile checksum mismatch for build %d", i),
+			})
+
+			return
+		}
+
+		metadata := header.NewTemplateMetadata(id, blockSize, uint64(prof.payload))
+
+		spec, err := header.NewHeader(metadata, []header.BuildMap{{
+			Offset:             0,
+			Length:             uint64(prof.payload),
+			BuildId:            id,
+			BuildStorageOffset: 0,
+		}})
+		if err != nil {
+			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: "header: " + err.Error()})
+
+			return
+		}
+
+		spec.SetBuild(id, header.BuildData{
+			Size:      prof.payload,
+			Checksum:  checksum,
+			FrameData: fullFT.Table(),
+		})
+
+		// A compressed artifact carries its frame tables in the header, and only
+		// the V4/V5 formats serialize them: production promotes the header to the
+		// write version before storing it.
+		upload := spec.CloneForUpload(*headerVersion)
+
+		if _, _, _, err := header.StoreHeader(ctx, provider, headerPath, upload); err != nil {
+			emit(result{Phase: "write", Version: version, Outcome: "error", Detail: "store header: " + err.Error()})
+
+			return
+		}
+
+		m.Entries = append(m.Entries, entry{
+			Build:     id.String(),
+			Payload:   objectPath,
+			Header:    headerPath,
+			Size:      prof.payload,
+			Checksum:  hex.EncodeToString(checksum[:]),
+			Codec:     codecZstd,
+			WrittenBy: version,
+			WrittenAt: time.Now(),
+		})
+	}
+
+	encoded, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		emit(result{Phase: "write", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	if err := os.WriteFile(*manifestPath, append(encoded, '\n'), 0o600); err != nil {
+		emit(result{Phase: "write", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	emit(result{
+		Phase: "write", Version: version, Outcome: "ok",
+		Detail: fmt.Sprintf("wrote %d builds, %.1f MiB each, to %s", len(m.Entries),
+			float64(prof.payload)/float64(1<<20), *prefix),
+		Objects:  2 * len(m.Entries),
+		Bytes:    int64(len(m.Entries)) * prof.payload,
+		Seconds:  time.Since(started).Seconds(),
+		Protocol: fmt.Sprintf("zstd/%dKB frames", frameSizeKB),
+	})
+}
+
+func read(args []string) {
+	fs := flag.NewFlagSet("read", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "manifest to read (required)")
+	_ = fs.Parse(args)
+
+	started := time.Now()
+
+	m, err := loadManifest(*manifestPath)
+	if err != nil {
+		emit(result{Phase: "read", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	provider, err := openProvider(m.StorageURL)
+	if err != nil {
+		emit(result{Phase: "read", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	ctx := context.Background()
+
+	var (
+		ok, rejected, misread int
+		rejectDetail          string
+		misreadDetail         string
+		bytes                 int64
+		headerVersions        = map[uint64]int{}
+		writtenBy             = map[string]struct{}{}
+	)
+
+	for _, e := range m.Entries {
+		writtenBy[e.WrittenBy] = struct{}{}
+
+		loaded, _, err := header.LoadHeader(ctx, provider, e.Header)
+		if err != nil {
+			rejected++
+			if rejectDetail == "" {
+				rejectDetail = fmt.Sprintf("%s: %v", e.Build, err)
+			}
+
+			continue
+		}
+
+		buildUUID, err := uuid.Parse(e.Build)
+		if err != nil {
+			misread++
+			misreadDetail = "bad build id in manifest: " + err.Error()
+
+			continue
+		}
+
+		seekable, err := provider.OpenSeekable(ctx, e.Payload)
+		if err != nil {
+			rejected++
+			if rejectDetail == "" {
+				rejectDetail = fmt.Sprintf("%s: %v", e.Build, err)
+			}
+
+			continue
+		}
+
+		// Reads go through the frame table the header carries, which is what
+		// production does for compressed artifacts.
+		ft := loaded.GetBuildFrameData(buildUUID)
+		frameSummary := "no frame table"
+		if ft != nil {
+			frameSummary = fmt.Sprintf("%d frames, uncompressed=%d, compressed=%d",
+				ft.NumFrames(), ft.UncompressedSize(), ft.CompressedSize())
+		}
+
+		objectSize, sizeErr := seekable.Size(ctx)
+		if sizeErr != nil {
+			objectSize = -1
+		}
+
+		data, err := readObject(ctx, provider, e.Payload, e.Size, ft)
+		if err != nil {
+			rejected++
+			if rejectDetail == "" {
+				rejectDetail = fmt.Sprintf("%s: %v", e.Build, err)
+			}
+
+			continue
+		}
+
+		var buf bytesBuffer
+		_, _ = buf.Write(data)
+
+		want, err := hex.DecodeString(e.Checksum)
+		if err != nil {
+			misread++
+			misreadDetail = "bad manifest checksum: " + err.Error()
+
+			continue
+		}
+
+		got := sha256.Sum256(buf.Bytes())
+		if string(got[:]) != string(want) || int64(len(buf.Bytes())) != e.Size {
+			misread++
+			if misreadDetail == "" {
+				misreadDetail = fmt.Sprintf("%s: wrote %d bytes %s, read %d bytes %s "+
+					"(header v%d, %s, object size=%d)",
+					e.Build, e.Size, e.Checksum[:16], len(buf.Bytes()), hex.EncodeToString(got[:8]),
+					loaded.Metadata.Version, frameSummary, objectSize)
+			}
+
+			continue
+		}
+
+		headerVersions[loaded.Metadata.Version]++
+		bytes += int64(len(buf.Bytes()))
+		ok++
+	}
+
+	writers := make([]string, 0, len(writtenBy))
+	for w := range writtenBy {
+		writers = append(writers, w)
+	}
+	slices.Sort(writers)
+
+	versionList := make([]string, 0, len(headerVersions))
+	for v, n := range headerVersions {
+		versionList = append(versionList, fmt.Sprintf("v%d×%d", v, n))
+	}
+	slices.Sort(versionList)
+
+	outcome := "ok"
+	detail := fmt.Sprintf("read %d/%d artifacts written by %s (header versions %s)",
+		ok, len(m.Entries), strings.Join(writers, ","), strings.Join(versionList, " "))
+
+	switch {
+	case misread > 0:
+		outcome = "misread"
+		detail = fmt.Sprintf("%d of %d MISREAD: %s", misread, len(m.Entries), misreadDetail)
+	case rejected == len(m.Entries) && rejected > 0:
+		outcome = "rejected"
+		detail = fmt.Sprintf("all %d refused: %s", rejected, rejectDetail)
+	case rejected > 0:
+		detail = fmt.Sprintf("%d read, %d refused loudly: %s", ok, rejected, rejectDetail)
+	}
+
+	emit(result{
+		Phase: "read", Version: version, Outcome: outcome, Detail: detail,
+		Objects: ok, Bytes: bytes, Seconds: time.Since(started).Seconds(),
+	})
+}
+
+func exists(args []string) {
+	fs := flag.NewFlagSet("exists", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "manifest to check (required)")
+	_ = fs.Parse(args)
+
+	m, err := loadManifest(*manifestPath)
+	if err != nil {
+		emit(result{Phase: "exists", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	provider, err := openProvider(m.StorageURL)
+	if err != nil {
+		emit(result{Phase: "exists", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	ctx := context.Background()
+
+	var (
+		count   int
+		missing []string
+	)
+
+	for _, e := range m.Entries {
+		for _, objectPath := range []string{e.Payload, e.Header} {
+			blob, err := provider.OpenBlob(ctx, objectPath)
+			if err != nil {
+				missing = append(missing, objectPath)
+
+				continue
+			}
+
+			found, err := blob.Exists(ctx)
+			if err != nil || !found {
+				missing = append(missing, objectPath)
+
+				continue
+			}
+
+			count++
+		}
+	}
+
+	outcome := "ok"
+	detail := fmt.Sprintf("%d of %d objects present", count, 2*len(m.Entries))
+
+	if len(missing) > 0 {
+		outcome = "error"
+		detail = fmt.Sprintf("%d objects missing, first: %s", len(missing), missing[0])
+	}
+
+	emit(result{Phase: "exists", Version: version, Outcome: outcome, Detail: detail, Objects: count})
+}
+
+func prune(args []string) {
+	fs := flag.NewFlagSet("prune", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "manifest to delete (required)")
+	_ = fs.Parse(args)
+
+	m, err := loadManifest(*manifestPath)
+	if err != nil {
+		emit(result{Phase: "prune", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	provider, err := openProvider(m.StorageURL)
+	if err != nil {
+		emit(result{Phase: "prune", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	ctx := context.Background()
+
+	for _, e := range m.Entries {
+		prefix := strings.TrimSuffix(e.Payload, "/rootfs.ext4")
+		if err := provider.DeleteObjectsWithPrefix(ctx, prefix); err != nil {
+			emit(result{
+				Phase: "prune", Version: version, Outcome: "error",
+				Detail: fmt.Sprintf("delete %s: %v", prefix, err),
+			})
+
+			return
+		}
+	}
+
+	emit(result{
+		Phase: "prune", Version: version, Outcome: "ok",
+		Detail: fmt.Sprintf("deleted %d builds", len(m.Entries)), Objects: 2 * len(m.Entries),
+	})
+}
+
+func loadManifest(path string) (manifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return manifest{}, fmt.Errorf("read manifest: %w", err)
+	}
+
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return manifest{}, fmt.Errorf("parse manifest: %w", err)
+	}
+
+	return m, nil
+}
+
+func emit(r result) {
+	encoded, err := json.Marshal(r)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "marshal result: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(string(encoded))
+
+	if r.Outcome == "misread" {
+		os.Exit(3)
+	}
+
+	if r.Outcome == "error" {
+		os.Exit(1)
+	}
+}
+
+// bytesBuffer accumulates what WriteTo hands over so the rehearsal can hash it.
+type bytesBuffer struct {
+	data []byte
+}
+
+func (b *bytesBuffer) Write(p []byte) (int, error) {
+	b.data = append(b.data, p...)
+
+	return len(p), nil
+}
+
+func (b *bytesBuffer) Bytes() []byte { return b.data }
+
+var _ io.Writer = (*bytesBuffer)(nil)

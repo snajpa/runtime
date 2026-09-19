@@ -12,6 +12,7 @@ use (
 	./packages/nomad-nodepool-apm
 	./packages/orchestrator
 	./packages/shared
+	./nix/rehearsal
 
 	./tests/integration
 )
