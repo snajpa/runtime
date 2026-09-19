@@ -24,6 +24,15 @@ VM_PASSWORD=${E2B_VM_PASSWORD:-e2b-dev}
 VM_BIN=${E2B_DEV_VM_BIN:-$DIR/result/bin/e2b-dev-vm}
 SILO_IMAGE=${E2B_SILO_IMAGE:-pgsty/silo:latest}
 
+# The Firecracker guest tests need a firecracker binary and a kernel inside the
+# VM. The kernel must carry ublk_drv for the ublk guest tests, so the known-good
+# pair is kept on the host and restored into fresh VMs; E2B_FC_ARTIFACTS_DIR
+# points somewhere else, and the stock e2b artifacts (public bucket) are the
+# fallback for machines that never had a copy.
+ARTIFACT_DIR=${E2B_FC_ARTIFACTS_DIR:-$HOME/ai/artifacts/e2b-ublk-fc}
+FC_VERSION=${E2B_FC_VERSION:-v1.12.1_717921c}
+FC_KERNEL=${E2B_FC_KERNEL:-vmlinux-6.1.102/amd64/vmlinux.bin}
+
 log() { printf '%s\n' "$*" >&2; }
 
 have_nix() { command -v nix >/dev/null 2>&1; }
@@ -112,6 +121,34 @@ provision_services() {
 	"
 }
 
+provision_artifacts() {
+	if ssh_vm 'test -x /home/dev/ublk-fc/firecracker && test -f /home/dev/ublk-fc/vmlinux.bin' 2>/dev/null; then
+		return 0
+	fi
+
+	ssh_vm 'mkdir -p /home/dev/ublk-fc' 2>/dev/null || return 1
+
+	if [ -x "$ARTIFACT_DIR/firecracker" ] && [ -f "$ARTIFACT_DIR/vmlinux.bin" ]; then
+		log "dev: restoring Firecracker test artifacts from $ARTIFACT_DIR"
+		# POSIX sh: stream a tar over ssh (no process substitution here).
+		if (cd "$ARTIFACT_DIR" && tar -cf - firecracker vmlinux.bin) | ssh_vm 'tar -C /home/dev/ublk-fc -xf -' 2>/dev/null; then
+			:
+		else
+			log "dev: artifact copy failed; set E2B_FC_ARTIFACTS_DIR or fetch with 'make download-public-firecrackers'"
+		fi
+
+		return 0
+	fi
+
+	log "dev: fetching stock Firecracker artifacts into the VM (no host copies in $ARTIFACT_DIR)"
+	ssh_vm "
+		set -eu
+		curl -fsSL -o /home/dev/ublk-fc/firecracker 			https://storage.googleapis.com/e2b-artifact-binaries/firecrackers/$FC_VERSION/amd64/firecracker
+		curl -fsSL -o /home/dev/ublk-fc/vmlinux.bin 			https://storage.googleapis.com/e2b-artifact-binaries/kernels/$FC_KERNEL
+		chmod +x /home/dev/ublk-fc/firecracker
+	" 2>/dev/null || log "dev: artifact fetch failed; the ublk guest tests need a kernel with ublk_drv (see the ublk subproject note)"
+}
+
 print_status() {
 	printf 'dev environment\n'
 	printf '  vm:        '
@@ -126,6 +163,8 @@ print_status() {
 	ssh_vm 'sudo -n docker ps --filter name=silo --format "{{.Status}}" 2>/dev/null | head -1' 2>/dev/null || printf 'unknown\n'
 	printf '  nfs:       '
 	ssh_vm 'sudo -n exportfs 2>/dev/null | grep /srv/nfs-cache | head -1' 2>/dev/null || printf 'unknown\n'
+	printf '  artifacts: '
+	ssh_vm 'test -x /home/dev/ublk-fc/firecracker && echo "firecracker + vmlinux.bin present" || echo missing' 2>/dev/null || printf 'unknown\n'
 	printf '  store:     s3://e2b-rehearsal?endpoint=http://127.0.0.1:9000&s3ForcePathStyle=true&region=us-east-1\n'
 	printf '  next:      make tests      validate changes (host + Ubuntu VM suites)\n'
 	printf '             make rehearsal  S3 mixed-version storage rehearsal on Silo\n'
@@ -138,11 +177,13 @@ case "$MODE" in
 --services)
 	ensure_vm || exit 1
 	provision_services
+	provision_artifacts
 	print_status
 	;;
 --ensure|--shell)
 	ensure_vm || exit 1
 	provision_services
+	provision_artifacts
 	print_status
 	;;
 *)

@@ -153,9 +153,20 @@ make tests      # validate changes: host build/format/lint/tests, then the VM su
 | Silo (`pgsty/silo`) | the S3-compatible object store the storage code and the rehearsal use (S-53) |
 | NFS export `/srv/nfs-cache` | the chunk-cache path (`WrapInNFSCache`) can be pointed at it |
 | `busybox-static` | the guest rootfs the Firecracker tests build |
+| Firecracker + guest kernel (`/home/dev/ublk-fc`) | the guest tests boot it; `dev.sh` restores the known-good pair from `$E2B_FC_ARTIFACTS_DIR` (default `~/ai/artifacts/e2b-ublk-fc`) and falls back to the stock public artifacts. The ublk guest tests need a kernel carrying `ublk_drv`, which the stock kernels do not, so keep the pair that works |
 
 State lives on the VM disk (`e2b-dev-vm/disk.qcow2`); `./result/bin/e2b-dev-vm
-reset` is the explicit way to start from scratch.
+reset` is the explicit way to start from scratch. The runner is configurable
+through the environment, which is also how a second, smaller instance is run
+next to the first one:
+
+```sh
+E2B_DEV_VM_DIR=/root/ai/state/e2b-dev-vm-fresh \
+E2B_DEV_VM_SSH_PORT=2223 E2B_DEV_VM_CPUS=8 E2B_DEV_VM_MEM=16384 \
+  ./result/bin/e2b-dev-vm up
+```
+
+Point `nix/scripts/dev.sh` and the rehearsal at it with `E2B_VM_PORT=2223`.
 
 ## S3 rehearsal (mixed versions on one store)
 
