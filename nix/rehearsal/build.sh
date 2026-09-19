@@ -32,6 +32,7 @@ WORKSPACE=$(mktemp -d)
 trap 'rm -rf "$WORKSPACE"' EXIT
 
 cp -r "$DIR/driver" "$WORKSPACE/driver"
+cp -r "$DIR/peer" "$WORKSPACE/peer"
 cp "$DIR/go.mod" "$DIR/go.sum" "$WORKSPACE/"
 
 cat > "$WORKSPACE/go.work" <<EOF
@@ -49,6 +50,10 @@ cd "$WORKSPACE"
 # with that checkout stamped into the binary. CGO_ENABLED=0: this binary runs
 # inside the Ubuntu VM, where a Nix-linked binary would not start.
 go mod tidy >/dev/null 2>&1 || true
-CGO_ENABLED=0 go build -ldflags "-X main.version=$VERSION" -o "$DIR/$OUTDIR/s3-rehearsal-$NAME" ./driver
 
-echo "built $OUTDIR/s3-rehearsal-$NAME ($VERSION)"
+# Two binaries from the same checkout: the storage rehearsal driver and the
+# peer-prefetch harness. Both run inside the Ubuntu VM, hence CGO_ENABLED=0.
+CGO_ENABLED=0 go build -ldflags "-X main.version=$VERSION" -o "$DIR/$OUTDIR/s3-rehearsal-$NAME" ./driver
+CGO_ENABLED=0 go build -ldflags "-X main.version=$VERSION" -o "$DIR/$OUTDIR/s3-rehearsal-peer-$NAME" ./peer
+
+echo "built $OUTDIR/s3-rehearsal-$NAME and $OUTDIR/s3-rehearsal-peer-$NAME ($VERSION)"

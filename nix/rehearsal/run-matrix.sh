@@ -29,7 +29,18 @@ NFS=${E2B_REHEARSAL_NFS:-0}
 # E2B_REHEARSAL_SOAK=K repeats the whole matrix K times.
 NODES=${E2B_REHEARSAL_NODES:-0}
 SPRAY=${E2B_REHEARSAL_SPRAY:-0}
+SPRAY_CONCURRENCY=${E2B_REHEARSAL_SPRAY_CONCURRENCY:-0}
+# E2B_REHEARSAL_FLAG_ROLLBACK=1 rehearses a format-affecting setting: the old
+# binary writes the older header format, the new one reads it, the new one
+# writes the current format, the old one reads it, and then a backfill rewrites
+# the old artifacts in the current format - after which both readers must still
+# work and nothing may be stranded.
+FLAG_ROLLBACK=${E2B_REHEARSAL_FLAG_ROLLBACK:-0}
 FAULT=${E2B_REHEARSAL_FAULT:-0}
+# E2B_REHEARSAL_PEER=1 runs the peer-prefetch leg: an old-build peer process
+# serves, a new-build client fetches (and the other way around), verifying every
+# range against the store and reporting both latencies.
+PEER=${E2B_REHEARSAL_PEER:-0}
 SOAK=${E2B_REHEARSAL_SOAK:-1}
 STORE=${E2B_STORAGE_URL:-s3://e2b-rehearsal?endpoint=http://127.0.0.1:9000&s3ForcePathStyle=true&region=us-east-1}
 RUN=${E2B_RUN_ID:-run-$(date +%Y%m%dT%H%M%S)}
@@ -46,10 +57,12 @@ E2B_CHECKOUT=$NEW "$DIR/build.sh" bin >/dev/null
 
 OLD_BIN=s3-rehearsal-$(basename "$OLD")
 NEW_BIN=s3-rehearsal-$(basename "$NEW")
+OLD_PEER_BIN=s3-rehearsal-peer-$(basename "$OLD")
+NEW_PEER_BIN=s3-rehearsal-peer-$(basename "$NEW")
 
 echo "== shipping to $VM ==" >&2
 $SSH 'mkdir -p ~/s3-rehearsal/bin ~/s3-rehearsal/manifests' >/dev/null
-$SCP "$DIR/bin/$OLD_BIN" "$DIR/bin/$NEW_BIN" "$VM:~/s3-rehearsal/bin/" >/dev/null
+$SCP "$DIR/bin/$OLD_BIN" "$DIR/bin/$NEW_BIN" "$DIR/bin/$OLD_PEER_BIN" "$DIR/bin/$NEW_PEER_BIN" "$VM:~/s3-rehearsal/bin/" >/dev/null
 
 # The remote script runs the phases inside the VM, where Silo and the box are:
 # it is the mixed-version matrix and it records one JSON result per phase.
@@ -174,10 +187,52 @@ fi
 
 if [ "${SPRAY:-0}" -gt 0 ]; then
 	echo "== object-count shape: $SPRAY small objects =="
-	phase "$NEW" spray --storage-url "$STORE" --prefix "$RUN/objects" --count "$SPRAY"
+	phase "$NEW" spray --storage-url "$STORE" --prefix "$RUN/objects" --count "$SPRAY" --concurrency "$SPRAY_CONCURRENCY"
 	phase "$NEW" count --storage-url "$STORE" --prefix "$RUN/objects"
-	phase "$NEW" spray --storage-url "$STORE" --prefix "$RUN/objects" --count "$SPRAY" --cleanup
+	# A destructive operation gets a dry run first: it must report the same
+	# objects and bytes the purge then removes.
+	phase "$NEW" purge --dry-run --storage-url "$STORE" --prefix "$RUN/objects"
+	phase "$NEW" purge --storage-url "$STORE" --prefix "$RUN/objects"
 	phase "$NEW" count --storage-url "$STORE" --prefix "$RUN/objects"
+fi
+
+if [ "${PEER:-0}" = "1" ]; then
+	echo "== peer prefetch: two node processes, mixed versions =="
+	PEER_OLD=$BASE/bin/$OLD_PEER_BIN
+	PEER_NEW=$BASE/bin/$NEW_PEER_BIN
+
+	# The old build serves, the new build fetches (upgrade direction).
+	"$PEER_OLD" serve --addr 127.0.0.1:9101 --manifest "$MAN/$RUN-new.json" >>"$OUT" 2>&1 &
+	server_old=$!
+	sleep 2
+	"$PEER_NEW" fetch --peer 127.0.0.1:9101 --manifest "$MAN/$RUN-new.json" >>"$OUT" 2>&1
+	kill "$server_old" 2>/dev/null || true
+	wait "$server_old" 2>/dev/null || true
+
+	# The new build serves, the old build fetches (rollback direction).
+	"$PEER_NEW" serve --addr 127.0.0.1:9102 --manifest "$MAN/$RUN-old.json" >>"$OUT" 2>&1 &
+	server_new=$!
+	sleep 2
+	"$PEER_OLD" fetch --peer 127.0.0.1:9102 --manifest "$MAN/$RUN-old.json" >>"$OUT" 2>&1
+	kill "$server_new" 2>/dev/null || true
+	wait "$server_new" 2>/dev/null || true
+fi
+
+if [ "${FLAG_ROLLBACK:-0}" = "1" ]; then
+	echo "== flag rollback: older write format, then backfill, read back by both =="
+	# 1) the old binary writes the older header format; the new binary must read it
+	phase "$OLD" write --storage-url "$STORE" --prefix "$RUN/flagroll/v4" --manifest "$MAN/$RUN-v4.json" --profile "$PROFILE" --header-version 4
+	phase "$NEW" read --manifest "$MAN/$RUN-v4.json"
+	# 2) the new binary writes the current format; the old binary must read that too
+	phase "$NEW" write --storage-url "$STORE" --prefix "$RUN/flagroll/v5" --manifest "$MAN/$RUN-v5.json" --profile "$PROFILE"
+	phase "$OLD" read --manifest "$MAN/$RUN-v5.json"
+	# 3) backfill the older artifacts onto the current format
+	phase "$NEW" migrate --manifest "$MAN/$RUN-v4.json" --header-version 5
+	# 4) after the rewrite both readers must still read them, and nothing may be stranded
+	phase "$OLD" read --manifest "$MAN/$RUN-v4.json"
+	phase "$NEW" read --manifest "$MAN/$RUN-v4.json"
+	phase "$OLD" exists --manifest "$MAN/$RUN-v4.json"
+	phase "$NEW" exists --manifest "$MAN/$RUN-v4.json"
 fi
 
 if [ "${FAULT:-0}" = "1" ]; then
@@ -211,7 +266,7 @@ while [ "$i" -le "$SOAK" ]; do
 		run_id="$RUN-$i"
 	fi
 
-	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' FAULT='$FAULT' sh ~/s3-rehearsal/remote-matrix.sh"
+	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' SPRAY_CONCURRENCY='$SPRAY_CONCURRENCY' FAULT='$FAULT' FLAG_ROLLBACK='$FLAG_ROLLBACK' PEER='$PEER' OLD_PEER_BIN='$OLD_PEER_BIN' NEW_PEER_BIN='$NEW_PEER_BIN' sh ~/s3-rehearsal/remote-matrix.sh"
 
 	i=$((i + 1))
 done
