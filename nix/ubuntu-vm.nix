@@ -30,6 +30,7 @@ let
     package_upgrade: false
     packages:
       - build-essential
+      - busybox-static
       - ca-certificates
       - curl
       - docker.io
@@ -42,6 +43,7 @@ let
       - iproute2
       - jq
       - linux-generic-hwe-24.04
+      - nfs-kernel-server
       - pkg-config
       - python3-venv
       - rsync
@@ -77,6 +79,27 @@ let
           vm.nr_hugepages=2048
           net.ipv4.tcp_max_syn_backlog=65535
           vm.max_map_count=1048576
+      - path: /etc/modules-load.d/e2b-ublk.conf
+        content: |
+          ublk_drv
+      - path: /etc/systemd/system/silo.service
+        content: |
+          [Unit]
+          Description=Silo object store (S3-compatible) for e2b dev/test work
+          After=docker.service
+          Requires=docker.service
+
+          [Service]
+          Restart=always
+          ExecStartPre=-/usr/bin/docker rm -f silo
+          ExecStart=/usr/bin/docker run --rm --name silo -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin -v /srv/silo-data:/data pgsty/silo:latest server /data
+          ExecStop=/usr/bin/docker stop silo
+
+          [Install]
+          WantedBy=multi-user.target
+      - path: /etc/exports.d/e2b.exports
+        content: |
+          /srv/nfs-cache 127.0.0.1(rw,sync,no_subtree_check,no_root_squash)
       - path: /usr/local/bin/e2b-dev-vm-boot-check
         permissions: '0755'
         content: |
@@ -100,6 +123,9 @@ let
       - [sh, -c, "sysctl --system"]
       - [sh, -c, "udevadm control --reload && udevadm trigger"]
       - [sh, -c, "usermod -aG docker,kvm dev"]
+      - [sh, -c, "mkdir -p /srv/silo-data /srv/nfs-cache && chown 1000:1000 /srv/silo-data"]
+      - [sh, -c, "systemctl enable --now silo.service"]
+      - [sh, -c, "systemctl enable --now nfs-kernel-server && exportfs -ra"]
       - [sh, -c, "curl -fsSL https://go.dev/dl/go1.26.8.linux-amd64.tar.gz -o /tmp/go.tgz && tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz && printf 'export PATH=$PATH:/usr/local/go/bin\n' > /etc/profile.d/go.sh"]
       - [/usr/local/bin/e2b-dev-vm-boot-check]
     power_state:
