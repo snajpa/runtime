@@ -222,7 +222,8 @@ rec = {"record": "env", "env_class": "busy",
        "disk_guard": {"path": sys.argv[5], "free_gb": float(sys.argv[3]),
                       "floor_gb": 40, "tmpfs": False},
        "busy_load": {"recipe": j.get("recipe", "fio-fixed+stressng"),
-                     "params_digest": j.get("params_digest", "")}}
+                     "params_digest": j.get("params_digest", ""),
+                     "params": j.get("params", {})}}
 if sys.argv[4]:
     rec["invalid_reason"] = sys.argv[4]
 print(json.dumps(rec))
