@@ -20,3 +20,7 @@ go.work.sum
 # `go build ./nix/rehearsal/...` (and the push gate's build step) writes the
 # rehearsal driver's binary into the working directory.
 /driver
+
+# `go build ./cmd/migrate-builds` from packages/orchestrator drops a binary
+# inside the package directory; it is a build artifact, never a source file.
+/packages/orchestrator/cmd/migrate-builds/migrate-builds
