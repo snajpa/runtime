@@ -38,6 +38,12 @@ func (o *queueOwner) run() {
 	defer runtime.UnlockOSThread()
 	defer o.dev.ownersDone.Done()
 
+	// The ring belongs to this task: releasing it here, before ownersDone
+	// fires, means a teardown that gave up on a stuck task still gets the
+	// ring's descriptor and mappings back whenever the task finally unwinds,
+	// and the normal path's close is then the same call once.
+	defer o.ring.close()
+
 	if err := o.arm(); err != nil {
 		o.dev.ownersReady.Done()
 		o.dev.fail(fmt.Errorf("ublk: queue %d: arming fetches: %w", o.qid, err))

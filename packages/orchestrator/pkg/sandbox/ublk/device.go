@@ -52,7 +52,17 @@ const (
 	queueReadyTimeout = 30 * time.Second
 	deviceNodeTimeout = 5 * time.Second
 	ownerExitGrace    = 2 * time.Second
-	waitPollInterval  = time.Millisecond
+
+	// flushGrace bounds the whole barrier Sync performs before the teardown's
+	// cancel path: the writeback flush and the wait for in-flight requests
+	// share it. Neither Fsync/BLKFLSBUF nor a request an owner is stuck on
+	// observes a context, so without a budget a data path in a backend call
+	// would hold Close without bound. The NBD transport's declared teardown
+	// budget is its kernel ceiling, ioTimeout + deadconnTimeout (90s + 30s);
+	// the ublk transport keeps the same deliberate flush-before-abort step and
+	// bounds the whole barrier at that ceiling.
+	flushGrace       = 120 * time.Second
+	waitPollInterval = time.Millisecond
 )
 
 // DefaultOptions are the settings a device is created with unless a feature
@@ -462,31 +472,80 @@ func (d *Device) Sync(ctx context.Context) error {
 		return nil
 	}
 
+	// The barrier is bounded as a whole: the flush and the in-flight drain
+	// share flushGrace, so a data path stuck in a backend call cannot hold the
+	// close past the declared ceiling.
+	deadline := time.Now().Add(flushGrace)
+
 	// The descriptor opened at start is the one whose mapping records
 	// writeback errors, so it is the one to sync, like the NBD transport's.
-	syncErr := unix.Fsync(d.blockFD)
+	// The dup is taken here, before the flush starts: neither call observes
+	// ctx, and teardown closes the node while the flush may still be inside
+	// the kernel, so a descriptor duplicated later could pick up a
+	// closed-and-reused number. The private descriptor keeps every call on
+	// this device; it is released when the flush finishes, or kept by a
+	// syscall that never returns, which is the case the budget exists for. A
+	// descriptor that cannot be taken fails the barrier loudly instead of
+	// flushing on the shared number.
+	dup, dupErr := unix.Dup(d.blockFD)
+	if dupErr != nil {
+		return fmt.Errorf("ublk: flushing %s: duplicating the node descriptor: %w", d.path, dupErr)
+	}
 
-	// Invalidate even when the sync failed: the device is about to be exported
-	// or reused, and stale pages must not outlive the error.
-	invalidateErr := unix.IoctlSetInt(d.blockFD, unix.BLKFLSBUF, 0)
+	done := make(chan error, 1)
+	go func() {
+		defer func() { _ = unix.Close(dup) }()
 
-	if err := d.waitInFlight(ctx); err != nil {
-		return err
+		var errs []error
+
+		if err := unix.Fsync(dup); err != nil {
+			errs = append(errs, fmt.Errorf("ublk: syncing %s: %w", d.path, err))
+		}
+
+		// Invalidate even when the sync failed: the device is about to be
+		// exported or reused, and stale pages must not outlive the error.
+		if err := unix.IoctlSetInt(dup, unix.BLKFLSBUF, 0); err != nil {
+			errs = append(errs, fmt.Errorf("ublk: invalidating %s: %w", d.path, err))
+		}
+
+		done <- errors.Join(errs...)
+	}()
+
+	// A barrier that misses its budget is reported, never waited on forever:
+	// the caller has to know the acknowledged writes did not reach the backend
+	// before the device goes away, and the teardown's stop/cancel then releases
+	// whatever is stuck. Both halves join into what the release signal carries.
+	flushErr := waitFlushBudget(ctx, d.path, time.Until(deadline), done)
+	drainErr := d.waitInFlight(ctx, time.Until(deadline))
+
+	if drainErr != nil {
+		return errors.Join(flushErr, drainErr)
 	}
 
 	if err := d.Failure(); err != nil {
 		return err
 	}
 
-	var errs []error
-	if syncErr != nil {
-		errs = append(errs, fmt.Errorf("ublk: syncing %s: %w", d.path, syncErr))
-	}
-	if invalidateErr != nil {
-		errs = append(errs, fmt.Errorf("ublk: invalidating %s: %w", d.path, invalidateErr))
-	}
+	return flushErr
+}
 
-	return errors.Join(errs...)
+// errBarrierBudget reports a barrier step that outlived flushGrace, so a stuck
+// kernel is distinguishable from a writeback failure.
+var errBarrierBudget = errors.New("the barrier did not complete within its budget")
+
+// waitFlushBudget waits for a flush that observes no context: Fsync and
+// BLKFLSBUF can block until the teardown's cancel releases the data path, so
+// the wait is what bounds the flush (see flushGrace). A flush that misses its
+// budget fails loudly rather than holding the close.
+func waitFlushBudget(ctx context.Context, path string, budget time.Duration, done <-chan error) error {
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("ublk: flushing %s: %w", path, ctx.Err())
+	case <-time.After(budget):
+		return fmt.Errorf("ublk: flushing %s: %w", path, errBarrierBudget)
+	}
 }
 
 // Close syncs, stops and deletes the device.
@@ -541,7 +600,10 @@ func (d *Device) teardown(ctx context.Context, barrier bool) error {
 			errs = append(errs, fmt.Errorf("ublk: queue tasks of device %d did not exit", d.id))
 
 			// The device must not be stranded, and deleting it cancels what
-			// the tasks are stuck on. Their descriptors stay open.
+			// the tasks are stuck on, but their rings and buffers cannot be
+			// closed under them, so the remains are handed to a reaper that
+			// finishes once the tasks unwind.
+			go d.reapAfterOwners()
 			if err := d.delete(); err != nil {
 				errs = append(errs, err)
 			}
@@ -578,6 +640,34 @@ func (d *Device) teardown(ctx context.Context, barrier bool) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// reapAfterOwners finishes a teardown whose queue tasks outlived both grace
+// periods. Their rings and the queue buffers cannot be released under a task
+// that is still inside a backend call, so this waits for every task to unwind
+// (deleting the device cancels what they are stuck on) and only then releases
+// the rings, the buffers and the character device. A task that never unwinds
+// keeps this goroutine and its descriptors alive: the alternative is
+// unmapping memory a live task may still touch.
+func (d *Device) reapAfterOwners() {
+	d.ownersDone.Wait()
+
+	for _, owner := range d.owners {
+		owner.ring.close()
+	}
+
+	for _, buf := range d.queueBufs {
+		_ = unix.Munmap(buf)
+	}
+	d.queueBufs = nil
+
+	_ = d.closeCdev()
+
+	if d.path != "" {
+		// The node goes away with the deleted device; the next device should
+		// not have to race the old node.
+		_ = waitNodeGone(d.path, deviceNodeTimeout)
+	}
 }
 
 func (d *Device) claim() bool {
@@ -671,8 +761,13 @@ func (d *Device) waitOwners(timeout time.Duration) bool {
 }
 
 // waitInFlight waits until no request is being served, which is what makes the
-// sync a barrier for requests already inside the data path.
-func (d *Device) waitInFlight(ctx context.Context) error {
+// sync a barrier for requests already inside the data path. The wait shares the
+// barrier's budget: an owner stuck in a backend call keeps requests in flight
+// until the teardown's stop/cancel reaches it, so a drain that outlives the
+// budget fails the sync loudly instead of holding the close.
+func (d *Device) waitInFlight(ctx context.Context, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+
 	for {
 		if d.inFlight.Load() == 0 {
 			return nil
@@ -682,6 +777,9 @@ func (d *Device) waitInFlight(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(waitPollInterval):
+			if time.Now().After(deadline) {
+				return fmt.Errorf("ublk: waiting for in-flight requests: %w", errBarrierBudget)
+			}
 		}
 	}
 }
