@@ -1,0 +1,16 @@
+{
+  "schema": "perf/bands/1",
+  "status": "v0 defaults - design §5 (thresholds v0; reviewers own the final table). warn/fail are signed fractions of the A->B change in the metric's own convention; severity s = -change for higher_better, +change for lower_better.",
+  "defaults": {"direction": "lower_better", "warn": 0.05, "fail": 0.10, "gate": false},
+  "metrics": {
+    "throughput_mib_s": {"direction": "higher_better", "warn": -0.01, "fail": -0.03, "gate": true},
+    "iops": {"direction": "higher_better", "warn": -0.01, "fail": -0.03, "gate": false},
+    "lat_p50_us": {"direction": "lower_better", "warn": 0.05, "fail": 0.10, "gate": false},
+    "lat_p95_us": {"direction": "lower_better", "warn": 0.05, "fail": 0.10, "gate": false},
+    "lat_p99_us": {"direction": "lower_better", "warn": 0.05, "fail": 0.10, "gate": false},
+    "lat_max_us": {"direction": "lower_better", "warn": 0.05, "fail": 0.10, "gate": false},
+    "cpu_us_per_op": {"direction": "lower_better", "warn": 0.05, "fail": 0.10, "gate": false},
+    "drain_latency_ms": {"direction": "lower_better", "warn": 0.075, "fail": 0.15, "gate": false},
+    "migrate_latency_ms": {"direction": "lower_better", "warn": 0.05, "fail": 0.10, "gate": false}
+  }
+}

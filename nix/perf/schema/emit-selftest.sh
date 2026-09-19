@@ -28,6 +28,10 @@ run 0 'valid W8 sample with evidence' \
   '{"block":1,"chunk":{"i":1,"n":1},"class":"warm","leg":"B1","metric":{"id":"post_resume_lat_p95_us","unit":"us"},"op_class":"read","profile":"post-resume-read","profile_digest":"abc1234","record":"sample","samples":[123.0],"side":"candidate","snapshot_id":"snap-1","stage":"measure","unit_id":"window","window":"steady","workload":"W8","workload_digest":"beef1234"}'
 run 0 'valid snapshot record' \
   '{"cache_state_evidence":{"page_cache":"warm"},"class":"warm","config":{"cmdline":"console=ttyS0"},"content_sha256":"deadbeef","cpu_template":"none","firecracker":{"version":"1.12.1"},"init":{"binary":"/init"},"kernel":{"image":"vmlinux-6.1.102"},"memory_mib":1024,"network":{"mode":"tap"},"object_store_state":{"local":true},"ports":[80],"quiesced_marker":{"rw":"ok","sha256":"abc1234"},"record":"snapshot","reset_procedure":{"drop_caches":true},"restore_state_dir":"/state","rootfs":{"path":"/rootfs"},"snapshot_id":"snap-1","source_tree":{"ref":"5eb54defe"},"uffd":{"mode":"lazy"},"vcpu":2}'
+run 0  'valid W7 runtime oracle' \
+  '{"class":"warm","kind":"W7/restore","passed":true,"profile_digest":"abc1234","record":"oracle","role":"ready","side":"baseline","snapshot_id":"snap-1","workload":"W7"}'
+run 40 'runtime oracle missing role' \
+  '{"class":"warm","kind":"W7/restore","passed":true,"profile_digest":"abc1234","record":"oracle","side":"baseline","snapshot_id":"snap-1","workload":"W7"}'
 run 40 'chunk must be an object' \
   '{"record":"sample","workload":"W1","profile":"p","side":"baseline","leg":"A","block":1,"stage":"measure","metric":{"id":"iops","unit":"count/s"},"unit_id":"u","chunk":0,"samples":[1]}'
 run 40 'missing chunk' \
@@ -53,7 +57,7 @@ EOF
 run 0  'note ok' '{"record":"note","text":"x"}'
 
 n=$(wc -l < "$S" 2>/dev/null || echo 0)
-if [ "$n" = 5 ]; then ok 'stream has only the valid lines (5)'; else bad "stream lines=$n want 5"; fi
+if [ "$n" = 6 ]; then ok 'stream has only the valid lines (6)'; else bad "stream lines=$n want 6"; fi
 
 rm -rf "$TMP"
 if [ "$fails" = 0 ]; then echo 'selftest ok'; exit 0; fi

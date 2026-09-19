@@ -129,6 +129,7 @@
     "samples": {"type": "array", "items": {"type": "number"}},
     "snapshot_id": {"type": "string"},
     "class": {"enum": ["cold", "warm"]},
+    "role": {"enum": ["pre_identity", "ready", "post_integrity"]},
     "window": {"enum": ["first_io", "steady"]},
     "op_class": {"enum": ["read", "write", "modify", "mixed"]},
     "scope": {"enum": ["host", "guest"]},
@@ -154,7 +155,13 @@
   "oneOf": [
     {"properties": {"record": {"const": "env"}}, "required": ["env_class", "host", "tools", "disk_guard"]},
     {"properties": {"record": {"const": "capability"}}, "required": ["name", "status", "requirement"]},
-    {"properties": {"record": {"const": "oracle"}}, "required": ["kind", "passed"]},
+    {"properties": {"record": {"const": "oracle"}}, "required": ["kind", "passed"],
+     "allOf": [
+       {"if": {"properties": {"workload": {"enum": ["W7", "W8"]}}},
+        "then": {"required": ["workload", "side", "snapshot_id", "class", "role", "profile_digest"]}},
+       {"if": {"properties": {"workload": {"const": "W8"}}},
+        "then": {"required": ["workload_digest"]}}
+     ]},
     {"properties": {"record": {"const": "resolution"}}, "required": ["metric", "sample_count", "bands", "method", "fitted", "discriminability"]},
     {"properties": {"record": {"const": "block"}}, "required": ["index", "warmup", "order", "namespace", "seed"]},
     {"properties": {"record": {"const": "sample"}}, "required": ["workload", "profile", "side", "leg", "block", "stage", "metric", "unit_id", "chunk", "samples"]},

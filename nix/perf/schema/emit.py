@@ -44,6 +44,7 @@ ENUMS = {
     "window": ["first_io", "steady"],
     "op_class": ["read", "write", "modify", "mixed"],
     "scope": ["host", "guest"],
+    "role": ["pre_identity", "ready", "post_integrity"],
 }
 PHASES = ENUMS["phase"]
 MODES = ENUMS["mode"]
@@ -165,6 +166,16 @@ def main(argv):
                 if m["id"] == mid and unit and m.get("unit") and m["unit"] != unit:
                     print("emit: warning: unit %r differs from registry %r for %s"
                           % (unit, m.get("unit"), mid), file=sys.stderr)
+    if rkind == "oracle":
+        wl = rec.get("workload") or ""
+        kind = rec.get("kind") or ""
+        if wl in ("W7", "W8") or kind.startswith(("W7", "W8")):
+            for key in ("workload", "side", "snapshot_id", "class", "role",
+                        "kind", "profile_digest"):
+                if key not in rec:
+                    fail("runtime oracle requires %s (section 11 linkage)" % key)
+            if (wl or kind[:2]) == "W8" and "workload_digest" not in rec:
+                fail("W8 runtime oracle requires workload_digest")
 
     line = json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n"
     try:
