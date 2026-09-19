@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
 func TestPayloadDataIsDeterministicAndSized(t *testing.T) {
@@ -275,6 +277,41 @@ func TestHumanBytes(t *testing.T) {
 	for _, tc := range cases {
 		if got := humanBytes(tc.in); got != tc.want {
 			t.Errorf("humanBytes(%d) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestSprayConcurrency(t *testing.T) {
+	t.Parallel()
+
+	if got := sprayConcurrency(0); got < 4 || got > 32 {
+		t.Errorf("default = %d, want 4..32", got)
+	}
+
+	if got := sprayConcurrency(8); got != 8 {
+		t.Errorf("explicit = %d, want 8", got)
+	}
+
+	if got := sprayConcurrency(1000); got != 256 {
+		t.Errorf("cap = %d, want 256", got)
+	}
+}
+
+func TestMigrateTargetVersion(t *testing.T) {
+	t.Parallel()
+
+	if got := migrateTargetVersion(header.MetadataVersionV4); got != header.MetadataVersionV4 {
+		t.Errorf("v4 request = %d, want 4", got)
+	}
+
+	if got := migrateTargetVersion(header.MetadataVersionV5); got != header.MetadataVersionV5 {
+		t.Errorf("v5 request = %d, want 5", got)
+	}
+
+	// Anything else (including a zero flag) means the current write version.
+	for _, requested := range []uint64{0, 3, 99} {
+		if got := migrateTargetVersion(requested); got != header.MetadataVersionV5 {
+			t.Errorf("requested %d -> %d, want the current write version %d", requested, got, header.MetadataVersionV5)
 		}
 	}
 }

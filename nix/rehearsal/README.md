@@ -101,12 +101,20 @@ same profiles (`tiny`/`small`/`big`/`auto`):
 | switch | leg |
 |--------|-----|
 | `E2B_REHEARSAL_NODES=n` | `n` concurrent nodes *mixing versions*: even nodes write with the new binary, odd with the old, then each node reads its neighbour's artifacts with the opposite version, plus existence checks |
-| `E2B_REHEARSAL_SPRAY=n` | object-count shape: `n` small objects (4 KiB) with p50/p95/p99 latencies, an inventory (`count`) of the prefix, a rewrite with `--cleanup`, and a second inventory proving the delete |
+| `E2B_REHEARSAL_SPRAY=n` | object-count shape: `n` small objects (4 KiB) written by `E2B_REHEARSAL_SPRAY_CONCURRENCY` workers (default cores/2, 4..32), with throughput and p50/p95/p99; then the inventory (`count`), a **dry run** of the destructive step (`purge --dry-run`), the real `purge` (the GC/delete cost) and a second inventory proving the prefix is empty |
+| `E2B_REHEARSAL_FLAG_ROLLBACK=1` | format-affecting setting rehearsed end to end: the old build writes the older header format, the new build reads it, the new build writes the current format, the old build reads that, then `migrate` backfills the older artifacts onto the current format — after which both readers must still read them and nothing may be stranded |
+| `E2B_REHEARSAL_PEER=1` | peer prefetch with two node processes: an old-build peer serves over the repository's chunk service, a new-build client fetches ranges (and the other way around), every range is byte-compared against the store and hashed, and both latencies are reported |
 | `E2B_REHEARSAL_FAULT=1` | fault injection: overwrite one artifact with different bytes, then read it with the other version; the verdict is `ok` only if the tampering is *detected* (loud refusal or misread) |
 | `E2B_REHEARSAL_NFS=1` | put every node's chunk cache on the VM's NFS export (`/mnt/nfs-cache`) instead of a local temp dir |
 | `E2B_REHEARSAL_SOAK=k` | repeat the whole matrix `k` times (drift/soak) |
 
 ## Evidence (2026-09-19, dev VM, Silo)
+
+Object-count ramp (first scale numbers, 32 writers): 100,000 x 4 KiB written in
+5m46s (**289 objects/s**, p50 89 ms, p95 191 ms, p99 649 ms); the inventory
+counted exactly 100,000 objects / 390.6 MiB in **16.0 s**; the prefix purge
+took **1m16.6 s**; the inventory afterwards read 0 in 17 ms. The 1M run and the
+migration/peer legs are recorded below as they complete.
 
 - sequential matrix: green — 8/8 artifacts each way, v5 headers, 16/16 objects
   present on both sides
