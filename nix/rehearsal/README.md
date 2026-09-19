@@ -122,14 +122,23 @@ same profiles (`tiny`/`small`/`big`/`auto`):
     p95 191 ms, p99 649 ms); inventory counted exactly 100,000 objects /
     390.6 MiB in **16.0 s**; prefix purge **1m16.6 s**; count afterwards 0 in
     17 ms
-  - **725k (first 1M attempt)** — the spray stopped at 725,090 objects with
-    `PutObject ... context deadline exceeded`: the repository's own write budget
-    (`awsWriteTimeout`, 30 s, `packages/shared/pkg/storage/storage_aws.go`)
-    firing once the single node had accumulated ~725k objects / 2.8 GiB. The
-    ramp now retries writes (bounded, reported as "N retries (x% of writes)") so
-    that saturation stays visible instead of killing a multi-hour run. The
-    inventory of those 725,090 objects took **145.2 s** and the purge
-    **12m31.7 s** (≈1.04 ms/object, about 5× the per-object listing cost)
+  - **725k (first 1M attempt, 64 writers)** — the spray stopped at 725,090
+    objects with `PutObject ... context deadline exceeded`: the repository's own
+    write budget (`awsWriteTimeout`, 30 s,
+    `packages/shared/pkg/storage/storage_aws.go`) firing. The ramp now retries
+    writes (bounded, reported as "N retries (x% of writes)"). The inventory of
+    those 725,090 objects took **145.2 s** and the purge **12m31.7 s**
+    (≈1.04 ms/object, about 5× the per-object listing cost)
+  - **1M (re-run with 32 writers, completed)** — 1,000,000 × 4 KiB written in
+    50m59s (**327 objects/s, zero retries**, p50 84.9 ms, p95 175.1 ms,
+    p99 290.4 ms); the inventory counted exactly 1,000,000 objects / 3.8 GiB in
+    **119.2 s**; the dry run reported 1,000,000 objects / 3.8 GiB in **93.6 s**;
+    the real purge took **16m28.5 s** (≈0.99 ms/object); the count afterwards
+    read 0 in 14 ms. **The 725k wall was concurrency-induced, not
+    object-count-induced**: the same 1M workload at 32 writers needed no
+    retries at all, while 64 writers saturated the single node past the 30 s
+    write budget — what this store cannot take is concurrent writer pressure,
+    and the retry reporting is what makes that visible.
 - small-shape object-count (1500 × 4 KiB): p50 18 ms / p95 34 ms / p99 50 ms;
   inventory exactly 1500 (5.9 MiB); prefix delete 1.7 s; count afterwards 0
 - flag rollback (`E2B_REHEARSAL_FLAG_ROLLBACK=1`): the old build wrote v4
