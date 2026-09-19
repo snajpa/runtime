@@ -8,6 +8,8 @@ import (
 	"runtime"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 )
 
 // queueOwner serves every tag of one hardware queue. The kernel requires the
@@ -183,7 +185,7 @@ func (o *queueOwner) handle(tag uint16) int32 {
 		// no-op: every request is applied before it is committed.
 		return 0
 	case ioOpDiscard, ioOpWriteZeroes:
-		if _, err := o.dev.backend.WriteZeroesAt(pos, length); err != nil {
+		if _, err := o.backendWriteZeroesAt(pos, length); err != nil {
 			return errnoResult(err)
 		}
 
@@ -201,7 +203,7 @@ func (o *queueOwner) transferIn(tag uint16, off, length int64) int32 {
 	for done := int64(0); done < length; {
 		buf := o.chunk(length - done)
 
-		n, err := o.dev.backend.ReadAt(o.dev.ctx, buf, off+done)
+		n, err := o.backendReadAt(buf, off+done)
 		if err != nil {
 			return errnoResult(err)
 		}
@@ -231,7 +233,7 @@ func (o *queueOwner) transferOut(tag uint16, off, length int64) int32 {
 			return errnoResult(err)
 		}
 
-		n, err := o.dev.backend.WriteAt(buf, off+done)
+		n, err := o.backendWriteAt(buf, off+done)
 		if err != nil {
 			return errnoResult(err)
 		}
@@ -312,4 +314,51 @@ func pwriteFullWith(writeAt func(fd int, p []byte, off int64) (int, error), fd i
 	}
 
 	return nil
+}
+
+// The backend is mmap-backed, so an I/O fault on its backing file behaves like
+// a fatal signal inside the queue owner goroutine. RunFaultSafe converts that
+// fault into an error (EIO to the kernel here) while unrelated programming
+// panics still propagate - the same fault-only guard the NBD dispatcher uses
+// for the equivalent operations (reviewer0 P1: the ublk path bypassed it).
+func (o *queueOwner) backendReadAt(buf []byte, off int64) (int, error) {
+	var n int
+
+	err := block.RunFaultSafe(o.dev.ctx, func() error {
+		var rerr error
+
+		n, rerr = o.dev.backend.ReadAt(o.dev.ctx, buf, off)
+
+		return rerr
+	})
+
+	return n, err
+}
+
+func (o *queueOwner) backendWriteAt(buf []byte, off int64) (int, error) {
+	var n int
+
+	err := block.RunFaultSafe(o.dev.ctx, func() error {
+		var werr error
+
+		n, werr = o.dev.backend.WriteAt(buf, off)
+
+		return werr
+	})
+
+	return n, err
+}
+
+func (o *queueOwner) backendWriteZeroesAt(pos, length int64) (int, error) {
+	var n int
+
+	err := block.RunFaultSafe(o.dev.ctx, func() error {
+		var zerr error
+
+		n, zerr = o.dev.backend.WriteZeroesAt(pos, length)
+
+		return zerr
+	})
+
+	return n, err
 }
