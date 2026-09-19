@@ -167,6 +167,7 @@ let
         up      create the disk if needed and start QEMU in the foreground
         ssh     ssh into the running VM (dev@127.0.0.1, password e2b-dev)
         status  print image/seed/disk paths and whether QEMU is running
+        stop    power the VM off (SIGTERM to its QEMU process)
         reset   delete the VM disk (asks for confirmation)
         help    this text
 
@@ -177,8 +178,10 @@ let
         E2B_DEV_VM_SSH_PORT  host SSH port (default: 2222)
         E2B_DEV_VM_SHARE     optional host directory exposed as a 9p mount
 
-      Quit QEMU: Ctrl-A X. The guest keeps its state in the qcow2 disk; delete
-      it with `reset` to boot a fresh VM (cloud-init runs again).
+      Quit QEMU: Ctrl-A X (foreground `up`); a VM started in the background by
+      `make dev` is stopped with `e2b-dev-vm stop`. The guest keeps its state
+      in the qcow2 disk; delete it with `reset` to boot a fresh VM (cloud-init
+      runs again).
       EOF
       }
 
@@ -215,6 +218,24 @@ let
         pgrep -af "qemu-system-x86_64.*$DISK" || echo "qemu:  not running"
       }
 
+      cmd_stop() {
+        if ! pgrep -f "qemu-system-x86_64.*$DISK" >/dev/null 2>&1; then
+          echo "e2b-dev-vm: not running"
+          return 0
+        fi
+        pkill -f "qemu-system-x86_64.*$DISK" || true
+        i=0
+        while [ "$i" -lt 20 ] && pgrep -f "qemu-system-x86_64.*$DISK" >/dev/null 2>&1; do
+          i=$((i + 1))
+          sleep 0.5
+        done
+        if pgrep -f "qemu-system-x86_64.*$DISK" >/dev/null 2>&1; then
+          echo "e2b-dev-vm: still running after SIGTERM"
+          return 1
+        fi
+        echo "e2b-dev-vm: stopped"
+      }
+
       cmd_reset() {
         [ -f "$DISK" ] || { echo "e2b-dev-vm: no disk at $DISK"; exit 0; }
         printf 'delete %s? [y/N] ' "$DISK"
@@ -229,6 +250,7 @@ let
         up) cmd_up ;;
         ssh) cmd_ssh ;;
         status) cmd_status ;;
+        stop) cmd_stop ;;
         reset) cmd_reset ;;
         ""|help|-h|--help) usage ;;
         *) usage; exit 2 ;;

@@ -134,8 +134,11 @@ make tests      # validate changes: host build/format/lint/tests, then the VM su
 
 - `make dev` enters `nix develop`, and the shell's hook runs
   `nix/scripts/dev.sh --ensure`: it builds the VM runner if needed, starts the
-  VM, and provisions the services inside it. Re-running is cheap and safe;
-  `E2B_DEV_AUTO=0 make dev` gives a plain shell without the bring-up.
+  VM in the background (a cold first boot runs cloud-init in the guest; the
+  console lands in `e2b-dev-vm/qemu.log`), waits for cloud-init to finish, and
+  provisions the services inside it. Re-running is cheap and safe;
+  `E2B_DEV_AUTO=0 make dev` gives a plain shell without the bring-up, and
+  `./result/bin/e2b-dev-vm stop` powers the VM down.
 - `make tests` runs `nix/scripts/dev-tests.sh`: `go build` for the modules,
   `gofmt` on changed files, `golangci-lint` and `go test` for changed packages,
   and then the root-gated storage suites **inside the Ubuntu VM** (the only

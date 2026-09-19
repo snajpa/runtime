@@ -12,7 +12,9 @@
 #   nix/scripts/dev.sh --services  provision the in-VM services only
 #
 # Safe to run repeatedly. It never destroys VM state: resetting is the explicit
-# `./result/bin/e2b-dev-vm reset`.
+# `./result/bin/e2b-dev-vm reset`. The VM is started in the background (its
+# console lands in the VM state directory as `qemu.log`); stop it with
+# `./result/bin/e2b-dev-vm stop`.
 set -eu
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -47,6 +49,16 @@ build_vm_runner() {
 	nix build --out-link "$DIR/result" "$DIR#dev-vm" >/dev/null
 }
 
+vm_runner() {
+	if [ -x "$VM_BIN" ]; then
+		printf '%s\n' "$VM_BIN"
+	elif [ -x "$DIR/result/bin/e2b-dev-vm" ]; then
+		printf '%s\n' "$DIR/result/bin/e2b-dev-vm"
+	else
+		return 127
+	fi
+}
+
 vm() {
 	if [ -x "$VM_BIN" ]; then
 		"$VM_BIN" "$@"
@@ -70,32 +82,69 @@ vm_running() {
 }
 
 ssh_vm() {
+	# No persistent known_hosts: a re-created VM (`e2b-dev-vm reset`, a fresh
+	# state dir) has a new host key, and a stale entry would fail every
+	# connection with "REMOTE HOST IDENTIFICATION HAS CHANGED"; the runner's
+	# own ssh uses the same local-only policy.
 	SSHPASS=$VM_PASSWORD sshpass -e ssh -p "$VM_PORT" \
-		-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		-o LogLevel=ERROR -o ConnectTimeout=10 \
 		"$VM_HOST" "$@"
 }
 
+vm_provisioning_done() {
+	# ssh comes up while cloud-init is still installing; the guest is ready
+	# for provisioning once cloud-init reports done (a cold first boot runs
+	# the full stage and reboots once before that).
+	ssh_vm 'cloud-init status 2>/dev/null | grep -q "status: done"' 2>/dev/null
+}
+
 ensure_vm() {
-	if vm_running; then
+	vm_state=${E2B_DEV_VM_DIR:-$PWD/e2b-dev-vm}
+	vm_log=$vm_state/qemu.log
+
+	if vm_running && vm_provisioning_done; then
 		return 0
 	fi
 
-	have_vm_runner || build_vm_runner || return 1
+	if ! vm_running; then
+		have_vm_runner || build_vm_runner || return 1
 
-	log "dev: starting the Ubuntu dev VM (first boot runs cloud-init, then reboots)"
-	vm up >/dev/null 2>&1 || true
+		runner=$(vm_runner) || return 1
+		mkdir -p "$vm_state" 2>/dev/null || true
+
+		# `vm up` is a foreground QEMU (Ctrl-A X quits it), so it can never be
+		# the automated start: run it in its own session, detached from this
+		# shell - no tty to stop on (SIGTTIN), no hangup, no supervisor's
+		# process-group cleanup - and wait for the guest here instead.
+		log "dev: starting the Ubuntu dev VM in the background (console -> $vm_log)"
+		if command -v setsid >/dev/null 2>&1; then
+			setsid "$runner" up </dev/null >>"$vm_log" 2>&1 &
+		else
+			nohup "$runner" up </dev/null >>"$vm_log" 2>&1 &
+		fi
+	fi
 
 	i=0
-	while [ "$i" -lt 60 ]; do
-		if ssh_vm true 2>/dev/null; then
+	while [ "$i" -lt 240 ]; do
+		if vm_provisioning_done; then
 			return 0
 		fi
 
+		# ssh alone is not readiness - it comes up while cloud-init is still
+		# installing. Give the start a short grace (disk creation, qemu boot),
+		# then treat a VM nowhere to be seen as a failed start instead of
+		# waiting out the whole budget.
+		if [ "$i" -ge 6 ] && ! vm_running; then
+			break
+		fi
+
 		i=$((i + 1))
+		[ $((i % 12)) -ne 0 ] || log "dev: still waiting for the VM ($((i * 5))s; a cold first boot runs cloud-init)"
 		sleep 5
 	done
 
-	log "dev: the VM did not become reachable on port $VM_PORT"
+	log "dev: the VM did not become reachable on port $VM_PORT (see $vm_log)"
 	return 1
 }
 
@@ -156,6 +205,9 @@ print_status() {
 		printf 'running (ssh %s:%s)\n' "$VM_HOST" "$VM_PORT"
 	else
 		printf 'not running\n'
+	fi
+	if runner=$(vm_runner 2>/dev/null); then
+		printf '  stop:      %s stop\n' "$runner"
 	fi
 	printf '  ublk:      '
 	ssh_vm 'test -c /dev/ublk-control && echo present || echo missing' 2>/dev/null || printf 'unknown\n'
