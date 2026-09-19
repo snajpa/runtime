@@ -199,3 +199,176 @@ func TestTryAcquireLock_ConcurrentStaleTakeover(t *testing.T) {
 	require.Len(t, winners, 1, "exactly one writer may take over a stale lock")
 	require.NoError(t, ReleaseLock(ctx, winners[0]))
 }
+
+// TestTryAcquireLock_RespectsTakeoverMarker pins the serialization that makes
+// the takeover safe: while a writer holds the path's takeover marker, no other
+// writer may create a lock there — not even when the lock file itself is
+// absent, which is exactly the state a takeover in flight leaves behind.
+func TestTryAcquireLock_RespectsTakeoverMarker(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	testPath := filepath.Join(t.TempDir(), "test-resource-marker")
+	lockPath := getLockFilePath(testPath)
+	markerPath := getTakeoverMarkerPath(lockPath)
+
+	marker, err := lockTakeoverMarker(ctx, lockPath)
+	require.NoError(t, err)
+
+	_, err = TryAcquireLock(ctx, testPath)
+	require.ErrorIs(t, err, ErrLockAlreadyHeld,
+		"a writer must stay out of the path while its marker is held")
+
+	releaseTakeoverMarker(ctx, marker)
+
+	file, err := TryAcquireLock(ctx, testPath)
+	require.NoError(t, err, "the path must be acquirable once the marker is released")
+	require.NoError(t, ReleaseLock(ctx, file))
+
+	_, err = os.Stat(markerPath)
+	require.True(t, os.IsNotExist(err), "no marker may outlive the takeover that held it")
+}
+
+// TestTryAcquireLock_RecoversAMarkerFromADeadWriter pins crash recovery: a marker
+// left behind by a writer that died must not block the path forever, it is
+// replaced once it is older than the lock TTL.
+func TestTryAcquireLock_RecoversAMarkerFromADeadWriter(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	testPath := filepath.Join(t.TempDir(), "test-resource-dead-marker")
+	lockPath := getLockFilePath(testPath)
+	markerPath := getTakeoverMarkerPath(lockPath)
+
+	require.NoError(t, os.WriteFile(markerPath, []byte("dead-writer"), lockFileMode))
+	past := time.Now().Add(-2 * defaultLockTTL)
+	require.NoError(t, os.Chtimes(markerPath, past, past))
+
+	file, err := TryAcquireLock(ctx, testPath)
+	require.NoError(t, err, "a dead writer's marker must not block the lock")
+	require.NoError(t, ReleaseLock(ctx, file))
+
+	_, err = os.Stat(markerPath)
+	require.True(t, os.IsNotExist(err), "the stale marker must be cleaned up")
+}
+
+// TestTakeoverMarker_LiveAgedHolderIsNotDisplaced pins the marker's ownership
+// rule: a marker whose holder is alive is not replaced, however old its mtime
+// looks. The wall clock only decides lock-file staleness; marker ownership is
+// kernel-tracked (flock).
+func TestTakeoverMarker_LiveAgedHolderIsNotDisplaced(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	testPath := filepath.Join(t.TempDir(), "test-resource-live-marker")
+	lockPath := getLockFilePath(testPath)
+	markerPath := getTakeoverMarkerPath(lockPath)
+
+	holder, err := lockTakeoverMarker(ctx, lockPath)
+	require.NoError(t, err)
+
+	past := time.Now().Add(-2 * defaultLockTTL)
+	require.NoError(t, os.Chtimes(markerPath, past, past))
+
+	_, err = lockTakeoverMarker(ctx, lockPath)
+	require.ErrorIs(t, err, ErrLockAlreadyHeld,
+		"an aged marker with a live holder must not be displaced")
+
+	releaseTakeoverMarker(ctx, holder)
+
+	next, err := lockTakeoverMarker(ctx, lockPath)
+	require.NoError(t, err, "the marker must be acquirable once its holder released it")
+	releaseTakeoverMarker(ctx, next)
+}
+
+// TestReleaseTakeoverMarker_PreservesAReplacedMarker pins the release's
+// ownership check: a marker that is no longer the file the holder locked — for
+// example one replaced by an older build's writer, which does not take the
+// flock — must survive the old holder's release.
+func TestReleaseTakeoverMarker_PreservesAReplacedMarker(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	testPath := filepath.Join(t.TempDir(), "test-resource-replaced-marker")
+	lockPath := getLockFilePath(testPath)
+	markerPath := getTakeoverMarkerPath(lockPath)
+
+	holder, err := lockTakeoverMarker(ctx, lockPath)
+	require.NoError(t, err)
+
+	require.NoError(t, os.Remove(markerPath))
+	require.NoError(t, os.WriteFile(markerPath, nil, lockFileMode))
+
+	releaseTakeoverMarker(ctx, holder)
+
+	_, err = os.Stat(markerPath)
+	require.NoError(t, err, "a marker replaced while held must survive the old holder's release")
+}
+
+// TestTryAcquireLock_AgedLiveMarkerHolderBlocksAcquisition drives the same
+// shape through the public API: while a live writer is inside its critical
+// section with an aged marker, another acquisition reports contention and
+// takes nothing; once the holder finishes, acquisition succeeds.
+func TestTryAcquireLock_AgedLiveMarkerHolderBlocksAcquisition(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	testPath := filepath.Join(t.TempDir(), "test-resource-aged-marker")
+	lockPath := getLockFilePath(testPath)
+	markerPath := getTakeoverMarkerPath(lockPath)
+
+	holder, err := lockTakeoverMarker(ctx, lockPath)
+	require.NoError(t, err)
+
+	past := time.Now().Add(-2 * defaultLockTTL)
+	require.NoError(t, os.Chtimes(markerPath, past, past))
+
+	_, err = TryAcquireLock(ctx, testPath)
+	require.ErrorIs(t, err, ErrLockAlreadyHeld,
+		"a live marker holder must keep other writers out of the path")
+
+	releaseTakeoverMarker(ctx, holder)
+
+	file, err := TryAcquireLock(ctx, testPath)
+	require.NoError(t, err, "the path must be acquirable once the marker is released")
+	require.NoError(t, ReleaseLock(ctx, file))
+}
+
+// TestTryAcquireLock_KeepsAFreshLockAgainstAnOldObservation pins the property
+// the takeover race violated: once a writer has taken the lock over, a later
+// attempt that acts on an outdated view of the path must report contention and
+// leave the fresh lock exactly as it is.
+func TestTryAcquireLock_KeepsAFreshLockAgainstAnOldObservation(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	testPath := filepath.Join(t.TempDir(), "test-resource-fresh")
+	lockPath := getLockFilePath(testPath)
+
+	require.NoError(t, os.WriteFile(lockPath, []byte("stale-owner"), lockFileMode))
+	past := time.Now().Add(-2 * defaultLockTTL)
+	require.NoError(t, os.Chtimes(lockPath, past, past))
+
+	winner, err := TryAcquireLock(ctx, testPath)
+	require.NoError(t, err, "the stale lock must be taken over")
+
+	fresh, err := os.Stat(lockPath)
+	require.NoError(t, err)
+
+	token, err := os.ReadFile(lockPath)
+	require.NoError(t, err)
+
+	_, err = tryAcquireLock(ctx, lockPath)
+	require.ErrorIs(t, err, ErrLockAlreadyHeld,
+		"an attempt must not displace the fresh lock it finds")
+
+	after, err := os.Stat(lockPath)
+	require.NoError(t, err, "the fresh lock must still be at its path")
+	require.True(t, os.SameFile(fresh, after), "the fresh lock must not be replaced")
+
+	afterToken, err := os.ReadFile(lockPath)
+	require.NoError(t, err)
+	require.Equal(t, string(token), string(afterToken), "the owner's token must survive")
+
+	require.NoError(t, ReleaseLock(ctx, winner))
+}
