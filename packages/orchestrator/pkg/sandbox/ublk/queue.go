@@ -262,8 +262,14 @@ func (o *queueOwner) chunk(remaining int64) []byte {
 // buffers per call and rejects a position past the request's data, so the
 // offset it is given has to stay inside the request.
 func preadFull(fd int, buf []byte, pos int64) error {
+	return preadFullWith(unix.Pread, fd, buf, pos)
+}
+
+// preadFullWith is preadFull with the read syscall injected, so the retry and
+// short-transfer paths are unit-testable without a ring (U-10).
+func preadFullWith(readAt func(fd int, p []byte, off int64) (int, error), fd int, buf []byte, pos int64) error {
 	for done := 0; done < len(buf); {
-		n, err := unix.Pread(fd, buf[done:], pos+int64(done))
+		n, err := readAt(fd, buf[done:], pos+int64(done))
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue
@@ -283,8 +289,14 @@ func preadFull(fd int, buf []byte, pos int64) error {
 
 // pwriteFull writes all of buf at pos, for the same reason as preadFull.
 func pwriteFull(fd int, buf []byte, pos int64) error {
+	return pwriteFullWith(unix.Pwrite, fd, buf, pos)
+}
+
+// pwriteFullWith is pwriteFull with the write syscall injected, for the same
+// reason as preadFullWith.
+func pwriteFullWith(writeAt func(fd int, p []byte, off int64) (int, error), fd int, buf []byte, pos int64) error {
 	for done := 0; done < len(buf); {
-		n, err := unix.Pwrite(fd, buf[done:], pos+int64(done))
+		n, err := writeAt(fd, buf[done:], pos+int64(done))
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue

@@ -4,6 +4,7 @@ package ublk
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -205,5 +206,88 @@ func TestHandleResults(t *testing.T) {
 
 	if got, want := owner.handle(0), int32(512); got != want {
 		t.Errorf("result = %d, want %d", got, want)
+	}
+}
+
+// U-10: in production these loops run against the kernel's device fd, where a
+// retry or a short transfer is invisible; the injected syscall makes those
+// paths deterministic here. The offset has to advance by exactly what each
+// call consumed, so a short transfer never rewrites bytes it already filled.
+func TestFullTransfersRetryAndAccumulate(t *testing.T) {
+	t.Parallel()
+
+	type step struct {
+		n   int
+		err error
+	}
+	cases := []struct {
+		name    string
+		buf     []byte
+		steps   []step
+		wantErr error
+	}{
+		{name: "one full transfer", buf: []byte("abcd"), steps: []step{{n: 4}}},
+		{name: "short transfers accumulate", buf: []byte("abcd"), steps: []step{{n: 1}, {n: 2}, {n: 1}}},
+		{name: "EINTR is retried", buf: []byte("abcd"), steps: []step{{err: unix.EINTR}, {n: 4}}},
+		{name: "EINTR between short transfers", buf: []byte("abcd"), steps: []step{{n: 1}, {err: unix.EINTR}, {n: 3}}},
+		{name: "a zero-length transfer is EIO", buf: []byte("abcd"), steps: []step{{n: 2}, {n: 0}}, wantErr: unix.EIO},
+		{name: "a fatal error is returned", buf: []byte("abcd"), steps: []step{{err: unix.EPERM}}, wantErr: unix.EPERM},
+		{name: "an empty buffer needs no transfer", buf: nil},
+	}
+
+	for _, direction := range []struct {
+		name string
+		call func(inject func(fd int, p []byte, off int64) (int, error), fd int, buf []byte, pos int64) error
+	}{
+		{"read", preadFullWith},
+		{"write", pwriteFullWith},
+	} {
+		for _, tc := range cases {
+			t.Run(direction.name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				var (
+					calls int
+					offs  []int64
+				)
+				inject := func(_ int, _ []byte, off int64) (int, error) {
+					calls++
+					offs = append(offs, off)
+
+					if calls > len(tc.steps) {
+						t.Fatalf("call %d: unexpected extra transfer", calls)
+
+						return 0, nil
+					}
+
+					return tc.steps[calls-1].n, tc.steps[calls-1].err
+				}
+
+				if err := direction.call(inject, 7, tc.buf, 100); !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+
+				wantCalls := len(tc.steps)
+				for i, s := range tc.steps {
+					if (s.err != nil && !errors.Is(s.err, unix.EINTR)) || (s.err == nil && s.n == 0) {
+						wantCalls = i + 1
+
+						break
+					}
+				}
+				if calls != wantCalls {
+					t.Fatalf("transfers = %d, want %d", calls, wantCalls)
+				}
+
+				wantOff := int64(100)
+				for i := range wantCalls {
+					if offs[i] != wantOff {
+						t.Fatalf("transfer %d at offset %d, want %d", i+1, offs[i], wantOff)
+					}
+
+					wantOff += int64(tc.steps[i].n)
+				}
+			})
+		}
 	}
 }
