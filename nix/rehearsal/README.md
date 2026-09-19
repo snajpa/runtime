@@ -28,6 +28,11 @@ driver that exited non-zero, a fault read that did not name the tampered
 entry, or a rollback read the reader floor blocks. Every phase is still
 recorded and rendered (`render.sh` runs either way).
 
+Payload sizes must be a multiple of the block size (4096): header mappings are
+block-aligned, so `header.NewHeader` refuses anything else with
+`not block-aligned` — a custom payload that is not a multiple fails loudly at
+write time.
+
 ## Status (first runs, 2026-09-19)
 
 Against Silo in the dev VM, with the old node at upstream `44a8a7549` and the
@@ -105,6 +110,7 @@ same profiles (`tiny`/`small`/`big`/`auto`):
 |--------|-----|
 | `E2B_REHEARSAL_NODES=n` | `n` concurrent nodes *mixing versions*: even nodes write with the new binary, odd with the old, then each node reads its neighbour's artifacts with the opposite version, plus existence checks |
 | `E2B_REHEARSAL_SPRAY=n` | object-count shape: `n` small objects (4 KiB) written by `E2B_REHEARSAL_SPRAY_CONCURRENCY` workers (default cores/2, 4..32), with throughput and p50/p95/p99; then the inventory (`count`), a **dry run** of the destructive step (`purge --dry-run`), the real `purge` (the GC/delete cost) and a second inventory proving the prefix is empty |
+| `E2B_REHEARSAL_SPRAY_RETRIES=n` | attempts per object write in the spray (default 3, capped backoff); the leg reports `N retries (x% of writes)` so saturation stays visible |
 | `E2B_REHEARSAL_FLAG_ROLLBACK=1` | format-affecting setting rehearsed end to end: the old build writes the older header format (in the **product layout**, so the runtime's own tooling can read it), the new build reads it, the new build writes the current format, the old build reads that, then the **runtime's `migrate-builds`** backfills the older artifacts and a `reconcile` pass confirms every reference resolves — after which both readers must still read them and nothing may be stranded. Checkouts without the tool fall back to the harness `migrate` phase and say so |
 | `E2B_REHEARSAL_PEER=1` | peer prefetch with two node processes: an old-build peer serves over the repository's chunk service, a new-build client fetches ranges (and the other way around), every range is byte-compared against the store and hashed, and both latencies are reported |
 | `E2B_REHEARSAL_FAULT=1` | fault injection: overwrite one artifact with different bytes, then read it cold with the other version; the verdict is `ok` only if the tampered entry itself is *named* in a loud refusal or a misread — an unrelated refusal is not detection |
