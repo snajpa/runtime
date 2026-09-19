@@ -2,12 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://e2b.local/perf/perf-2.schema.json",
   "title": "perf/2 T1 record (one line of perf-runs.jsonl)",
-  "description": "Draft validator for lane F's perf/2 stream (result-schema.md v0.2, R23 v1.0-PASS). The harness validates every record before the write; renders (T2/T3) consume validated records only.",
+  "description": "Draft validator for lane F's perf/2 stream (result-schema.md v0.3; R23 v1.1-PASS perf-suite f4272351a). The harness validates every record before the write; replay/compare consume validated records only (the T2 `perf-run.json` aggregate is designed-not-landed).",
   "type": "object",
   "required": ["schema", "record", "run_id", "ts", "phase", "mode", "suite"],
   "properties": {
     "schema": {"const": "perf/2"},
-    "record": {"enum": ["env", "capability", "oracle", "resolution", "block", "sample", "artifact", "note"]},
+    "record": {"enum": ["env", "capability", "oracle", "resolution", "block", "sample", "snapshot", "artifact", "note"]},
     "run_id": {"type": "string", "pattern": "^run-[0-9]{8}T[0-9]{6}$"},
     "ts": {"type": "string", "format": "date-time"},
     "phase": {"enum": ["calibrate", "run", "confirm", "diagnose", "report"]},
@@ -64,6 +64,40 @@
         "acquired": {"type": "boolean"}
       }
     },
+    "snapshot": {
+      "type": "object",
+      "required": ["snapshot_id", "content_sha256"],
+      "properties": {
+        "snapshot_id": {"type": "string"},
+        "content_sha256": {"$ref": "#/$defs/sha"},
+        "source_tree": {"type": "object"},
+        "firecracker": {"type": "object"},
+        "kernel": {"type": "object"},
+        "rootfs": {"type": "object"},
+        "init": {"type": "object"},
+        "config": {"type": "object"},
+        "vcpu": {"type": "integer"},
+        "memory_mib": {"type": "integer"},
+        "cpu_template": {"type": "string"},
+        "network": {"type": "object"},
+        "ports": {"type": "array"},
+        "uffd": {"type": "object"},
+        "object_store_state": {"type": "object"},
+        "restore_state_dir": {"type": "string"},
+        "quiesced_marker": {"type": "object"}
+      }
+    },
+    "restore_state": {
+      "type": "object",
+      "properties": {
+        "class": {"enum": ["cold", "warm"]},
+        "cache_state_evidence": {"type": "object"},
+        "reset_procedure": {"type": "object"},
+        "ready_barrier": {"type": "string"}
+      }
+    },
+    "profile_digest": {"$ref": "#/$defs/sha"},
+    "workload_digest": {"$ref": "#/$defs/sha"},
     "replay_cmd": {"type": "string"},
     "cmds": {"type": "array", "items": {"type": "string"}},
     "env_vars": {
@@ -114,9 +148,9 @@
     "side": {"enum": ["baseline", "candidate"]},
     "seed": {"type": "integer"},
 
-    "workload": {"type": "string", "pattern": "^W[1-6]$"},
+    "workload": {"type": "string", "pattern": "^W[1-8]$"},
     "profile": {"type": "string"},
-    "leg": {"enum": ["A", "B", "AA"]},
+    "leg": {"type": "string", "pattern": "^(A|B|AA)(1|2)?$", "description": "per-position leg token (A1..A2 / B1..B2 per the harness contract); the comparator normalizes A*->A / B*->B when pairing"},
     "block": {"type": "integer"},
     "stage": {"enum": ["warmup", "measure"]},
     "unit_id": {"type": "string"},
@@ -164,7 +198,14 @@
      ]},
     {"properties": {"record": {"const": "resolution"}}, "required": ["metric", "sample_count", "bands", "method", "fitted", "discriminability"]},
     {"properties": {"record": {"const": "block"}}, "required": ["index", "warmup", "order", "namespace", "seed"]},
-    {"properties": {"record": {"const": "sample"}}, "required": ["workload", "profile", "side", "leg", "block", "stage", "metric", "unit_id", "chunk", "samples"]},
+    {"properties": {"record": {"const": "sample"}}, "required": ["workload", "profile", "side", "leg", "block", "stage", "metric", "unit_id", "chunk", "samples"],
+     "allOf": [
+       {"if": {"properties": {"workload": {"enum": ["W7", "W8"]}}},
+        "then": {"required": ["snapshot_id", "class", "profile_digest"]}},
+       {"if": {"properties": {"workload": {"const": "W8"}}},
+        "then": {"required": ["workload_digest", "window", "op_class"]}}
+     ]},
+    {"properties": {"record": {"const": "snapshot"}}, "required": ["snapshot_id", "content_sha256", "source_tree", "firecracker", "kernel", "rootfs", "init", "config", "vcpu", "memory_mib", "cpu_template", "network", "ports", "uffd", "object_store_state", "restore_state_dir", "quiesced_marker", "class", "cache_state_evidence", "reset_procedure"]},
     {"properties": {"record": {"const": "artifact"}}, "required": ["kind", "path", "sha256"]},
     {"properties": {"record": {"const": "note"}}, "required": ["text"]}
   ],

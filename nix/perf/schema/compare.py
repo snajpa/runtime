@@ -335,10 +335,16 @@ def summary(recs, bands, iters, seed, stream):
     best = "pass" if out["metrics"] else "inconclusive"
     if out["metrics"]:
         best = max(out["metrics"].values(), key=lambda r: order[r["verdict"]])["verdict"]
-    if env_invalid:
+    if ev == "setup_error":
+        best = "setup_error"
+        out["evidence_problem"] = ev_reason
+    elif ev:
+        best = "inconclusive"
+        out["evidence_problem"] = ev_reason
+    if env_invalid and best != "setup_error":
         best = "inconclusive"
         out["env_invalid"] = True
-    if dup_records:
+    if dup_records and best != "setup_error":
         best = "inconclusive"
         out["duplicate_identities"] = dup_records
         out["duplicate_example"] = list(dup_example) if dup_example else None
@@ -358,6 +364,9 @@ def report_md(s):
                  s["bootstrap"]["ci"]), ""]
     if s.get("env_invalid"):
         lines.append("- **invalid comparability** - overall INCONCLUSIVE (ruling 2)")
+        lines.append("")
+    if s.get("evidence_problem"):
+        lines.append("- **runtime evidence problem** - %s (\u00a711)" % s["evidence_problem"])
         lines.append("")
     lines += ["| cell | metric | n | sev (pt [lo, hi]) | bands (warn/fail) | p (holm) | verdict |",
               "|---|---|---|---|---|---|---|"]
@@ -422,6 +431,12 @@ def calibrate(recs, bands, iters, seed, stream):
                 "duplicate_identities": dup_records,
                 "duplicate_example": list(dup_example) if dup_example else None,
                 "rows": []}
+    ev, ev_reason = runtime_evidence_problem(recs)
+    if ev:
+        print("compare: runtime evidence problem (%s) - calibration INVALID"
+              % ev_reason, file=sys.stderr)
+        return {"schema": "perf/resolution/1", "stream": stream, "valid": False,
+                "evidence_problem": ev_reason, "rows": []}
     g = group_samples(recs)
     rows = []
     items = [] if ev else sorted(g, key=lambda k: (str(k[0]), str(k[1]), str(k[2]), str(k[4])))

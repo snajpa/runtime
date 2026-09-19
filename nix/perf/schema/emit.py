@@ -26,6 +26,11 @@ RECORD_REQUIRED = {
     "block": ["index", "warmup", "order", "namespace", "seed"],
     "sample": ["workload", "profile", "side", "leg", "block", "stage",
                "metric", "unit_id", "chunk", "samples"],
+    "snapshot": ["snapshot_id", "content_sha256", "source_tree", "firecracker",
+                 "kernel", "rootfs", "init", "config", "vcpu", "memory_mib",
+                 "cpu_template", "network", "ports", "uffd",
+                 "object_store_state", "restore_state_dir", "quiesced_marker",
+                 "class", "cache_state_evidence", "reset_procedure"],
     "artifact": ["kind", "path", "sha256"],
     "note": ["text"],
 }
@@ -38,7 +43,7 @@ ENUMS = {
     "baseline": ["shared_path", "no_historical_baseline"],
     "order": ["ABBA", "BAAB"],
     "side": ["baseline", "candidate"],
-    "leg": ["A", "B", "AA"],
+    "leg": ["A", "B", "AA", "A1", "A2", "B1", "B2"],
     "stage": ["warmup", "measure"],
     "class": ["cold", "warm"],
     "window": ["first_io", "steady"],
@@ -154,6 +159,19 @@ def main(argv):
     if rkind == "sample" and not isinstance(rec.get("samples"), list):
         fail("samples must be a list (raw sample records are mandatory)")
     if rkind == "sample":
+        ch = rec.get("chunk")
+        if (not isinstance(ch, dict) or not isinstance(ch.get("i"), int)
+                or not isinstance(ch.get("n"), int)):
+            fail("sample chunk must be an object {i,n}; got %r" % (ch,))
+        wl = rec.get("workload")
+        if wl in ("W7", "W8"):
+            for key in ("snapshot_id", "class", "profile_digest"):
+                if key not in rec:
+                    fail("W7/W8 sample requires %s (section 11 evidence linkage)" % key)
+            if wl == "W8":
+                for key in ("workload_digest", "window", "op_class"):
+                    if key not in rec:
+                        fail("W8 sample requires %s (section 11 evidence linkage)" % key)
         reg = load_registry()
         if reg is not None:
             mid = (rec.get("metric") or {}).get("id")

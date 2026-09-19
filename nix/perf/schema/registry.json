@@ -1,7 +1,7 @@
 {
   "schema": "perf/registry/1",
-  "doc": "result-schema.md §9 (v0.2, v1.0-PASS 2026-09-19); ids/units reviewer-owned",
-  "units": ["us", "ms", "s", "MiB", "count", "count/s", "MiB/s", "us/op"],
+  "doc": "result-schema.md §9 (v0.3; R23 v1.1-PASS 2026-09-19, perf-suite f4272351a); ids/units reviewer-owned",
+  "units": ["us", "ms", "s", "MiB", "bytes", "count", "count/s", "MiB/s", "us/op"],
   "sources": {
     "fio": "fio JSON",
     "perf": "perf-stat",
@@ -36,7 +36,23 @@
     {"id": "contention_wait_ms", "unit": "ms", "scope": ["W5"], "source": "ext"},
     {"id": "cold_bringup_s", "unit": "s", "scope": ["W6"], "source": "ext"},
     {"id": "warm_bringup_s", "unit": "s", "scope": ["W6"], "source": "ext"},
-    {"id": "stop_s", "unit": "s", "scope": ["W6"], "source": "ext"}
+    {"id": "stop_s", "unit": "s", "scope": ["W6"], "source": "ext"},
+    {"id": "restore_to_ready", "unit": "s", "scope": ["W7"], "source": "ext", "note": "primary W7 metric: predeclared restore-invocation boundary -> authoritative StartTypeResume/envd ready-to-serve signal; cold/warm are separate immutable profiles with their own A/A resolution and bands"},
+    {"id": "restore_invocation_to_fc_restored", "unit": "ms", "scope": ["W7", "diagnostic"], "source": "ext", "note": "diagnostic subspan: restore invocation -> FC restored; never alters the primary timing"},
+    {"id": "fc_restored_to_ready", "unit": "ms", "scope": ["W7", "diagnostic"], "source": "ext", "note": "diagnostic subspan: FC restored -> ready; never alters the primary timing"},
+    {"id": "uffd_faults", "unit": "count", "scope": ["W7", "diagnostic"], "source": "ext", "note": "lazy-fetch fault activity during restore; latency side rides fault_serve_latency_us"},
+    {"id": "uffd_fetch_bytes", "unit": "bytes", "scope": ["W7", "diagnostic"], "source": "ext", "note": "lazy-fetch bytes served during restore (UFFD)"},
+    {"id": "post_resume_lat_p50_us", "unit": "us", "scope": ["W8"], "source": "fio", "note": "steady-state window; op class (read/write/modify/mixed) rides the profile digest"},
+    {"id": "post_resume_lat_p95_us", "unit": "us", "scope": ["W8"], "source": "fio", "note": "steady-state window"},
+    {"id": "post_resume_lat_p99_us", "unit": "us", "scope": ["W8"], "source": "fio", "note": "steady-state window"},
+    {"id": "post_resume_throughput_mib_s", "unit": "MiB/s", "scope": ["W8"], "source": "fio", "note": "steady-state window"},
+    {"id": "post_resume_iops", "unit": "count/s", "scope": ["W8"], "source": "fio", "note": "steady-state window"},
+    {"id": "first_io_latency_us", "unit": "us", "scope": ["W8"], "source": "ext", "note": "first-I/O/fault window (first_io), separately named from the steady-state ids; window/op_class are schema-required on W8 samples"},
+    {"id": "first_io_faults", "unit": "count", "scope": ["W8"], "source": "ext", "note": "first-I/O/fault count in the first_io window"}
+  ],
+  "classes": [
+    {"id": "cold", "family": ["W7", "W8"], "state": "cold UFFD-lazy", "note": "immutable profile/cell class: predeclared cache/reset procedure + objective state evidence; own quiet+busy A/A resolution and bands; no ad-hoc warming/reset after an outcome"},
+    {"id": "warm", "family": ["W7", "W8"], "state": "warm restore", "note": "immutable profile/cell class: own quiet+busy A/A resolution and bands; cold<->warm is a state-condition/SLO contrast, never an automatic historical regression baseline"}
   ],
   "proposed": [
     {"id": "fault_serve_latency_us", "unit": "us", "scope": ["diagnostic"], "note": "UFFD serve/fault + REMOVE-vs-read under stall"},
@@ -55,6 +71,9 @@
     "latency is reported per operation class (read / write / modify-rmw / mixed) — the class rides the profile digest; aggregates never substitute",
     "op class, block size, mix, queue depth, cache state ride `profile`, never the metric id",
     "W1 and W4 carry capability baseline no_historical_baseline (descriptive/SLO, non-gating)",
-    "proposed entries finalize with the harness implementation and the cell cut; renames are a new id plus a deprecated alias"
+    "proposed entries finalize with the harness implementation and the cell cut; renames are a new id plus a deprecated alias",
+    "W7/W8 (v1.1 §11): restore_to_ready is the single primary ready boundary (StartTypeResume/envd ready signal); subspans, uffd_faults and uffd_fetch_bytes are diagnostic-only; W8 starts only after the W7 ready barrier and excludes startup; post_resume_* ids are separate from the W1/W2 fio ids; a resumed-vs-never-resumed contrast is descriptive resume-penalty/SLO only",
+    "W7/W8 evidence is enforced: a runtime resolution requires a linked snapshot record (identity+hashes+class+cache/reset evidence) + passed oracle + host and guest capability records; W8 samples require workload_digest + window (first_io|steady) + op_class (read|write|modify|mixed); the emitter refuses W7/W8 samples without the linkage",
+    "snapshot/restore identity+hashes and guest+host load/capabilities are mandatory comparability fields for W7/W8; missing required capabilities map per the sealed classes (to_execute -> SETUP_ERROR, validity -> INCONCLUSIVE, optional -> recorded)"
   ]
 }
