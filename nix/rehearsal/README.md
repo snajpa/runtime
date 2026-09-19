@@ -17,13 +17,16 @@ object store *is* a mixed-version fleet. The matrix:
 | step | writer | reader | expected outcome |
 |------|--------|--------|------------------|
 | probe ×2 | old, new | same version | ok — both can round-trip through the store |
-| upgrade leg | **new** | **old** | ok, or a loud rejection (old refusing what it cannot parse); never a misread |
+| upgrade leg | **new** | **old** | ok — the rollback binary must read the rollout-created artifacts; a loud refusal fails the matrix (rollback below the reader floor is blocked, never silent); never a misread |
 | rollback leg | **old** | **new** | ok — new code must read what the fleet already wrote |
 | stranding check | — | both | every object the other version wrote still exists |
 
 Outcomes are classified per phase: `ok`, `rejected` (loud, allowed), `misread`
-(data came back wrong — the failure this exists to catch) and `error`. `misread`
-exits non-zero so a rehearsal cannot quietly pass.
+(data came back wrong — the failure this exists to catch) and `error`. The
+matrix aggregates the required outcomes and exits non-zero if any failed: a
+driver that exited non-zero, a fault read that did not name the tampered
+entry, or a rollback read the reader floor blocks. Every phase is still
+recorded and rendered (`render.sh` runs either way).
 
 ## Status (first runs, 2026-09-19)
 
@@ -104,7 +107,7 @@ same profiles (`tiny`/`small`/`big`/`auto`):
 | `E2B_REHEARSAL_SPRAY=n` | object-count shape: `n` small objects (4 KiB) written by `E2B_REHEARSAL_SPRAY_CONCURRENCY` workers (default cores/2, 4..32), with throughput and p50/p95/p99; then the inventory (`count`), a **dry run** of the destructive step (`purge --dry-run`), the real `purge` (the GC/delete cost) and a second inventory proving the prefix is empty |
 | `E2B_REHEARSAL_FLAG_ROLLBACK=1` | format-affecting setting rehearsed end to end: the old build writes the older header format, the new build reads it, the new build writes the current format, the old build reads that, then `migrate` backfills the older artifacts onto the current format — after which both readers must still read them and nothing may be stranded |
 | `E2B_REHEARSAL_PEER=1` | peer prefetch with two node processes: an old-build peer serves over the repository's chunk service, a new-build client fetches ranges (and the other way around), every range is byte-compared against the store and hashed, and both latencies are reported |
-| `E2B_REHEARSAL_FAULT=1` | fault injection: overwrite one artifact with different bytes, then read it with the other version; the verdict is `ok` only if the tampering is *detected* (loud refusal or misread) |
+| `E2B_REHEARSAL_FAULT=1` | fault injection: overwrite one artifact with different bytes, then read it cold with the other version; the verdict is `ok` only if the tampered entry itself is *named* in a loud refusal or a misread — an unrelated refusal is not detection |
 | `E2B_REHEARSAL_NFS=1` | put every node's chunk cache on the VM's NFS export (`/mnt/nfs-cache`) instead of a local temp dir |
 | `E2B_REHEARSAL_SOAK=k` | repeat the whole matrix `k` times (drift/soak) |
 

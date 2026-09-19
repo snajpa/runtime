@@ -46,6 +46,11 @@ STORE=${E2B_STORAGE_URL:-s3://e2b-rehearsal?endpoint=http://127.0.0.1:9000&s3For
 RUN=${E2B_RUN_ID:-run-$(date +%Y%m%dT%H%M%S)}
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+# The exit status is the verdict; the evidence is rendered either way. The
+# remote matrix reports its own verdict and the fetched results are re-checked
+# here across soak rounds (reviewer1 R2).
+failed=0
+
 export SSHPASS=${E2B_VM_PASSWORD:-e2b-dev}
 SSH="sshpass -e ssh -p $PORT -o StrictHostKeyChecking=accept-new $VM"
 SCP="sshpass -e scp -P $PORT -o StrictHostKeyChecking=accept-new"
@@ -98,6 +103,56 @@ OUT=${OUT:-$BASE/results-$RUN.jsonl}
 mkdir -p "$MAN"
 : > "$OUT"
 
+# The aggregate verdict: every phase still runs and is recorded, but this
+# script exits non-zero if a required outcome did not hold: a failed driver,
+# an undetected tamper, or a rollback the reader floor blocks (reviewer1 R2).
+failed=0
+
+# Rollback readability (reviewer1 R10): the rollback binary must read every
+# rollout-created artifact. A loud refusal is format safety, but it is not
+# rollback evidence; it blocks rollback below the reader floor, so the run
+# records that explicitly instead of passing silently.
+require_rollback_read() {
+	record=$1
+	leg=$2
+
+	case "$record" in
+	*'"outcome":"ok"'*)
+		if printf '%s' "$record" | grep -q 'refused'; then
+			printf '{"phase":"rollback-readability","outcome":"error","detail":"%s: the rollback binary refused rollout-created artifacts; the reader floor is below the write format, so rollback is blocked and the matrix must not claim rollback safety"}\n' "$leg" >>"$OUT"
+			failed=1
+		else
+			printf '{"phase":"rollback-readability","outcome":"ok","detail":"%s: the rollback binary read every rollout-created artifact"}\n' "$leg" >>"$OUT"
+		fi
+		;;
+	*)
+		printf '{"phase":"rollback-readability","outcome":"error","detail":"%s: the rollback binary did not read the rollout-created artifacts cleanly"}\n' "$leg" >>"$OUT"
+		failed=1
+		;;
+	esac
+}
+
+# Per-artifact fault detection (reviewer1 R2): the tampered entry (index 0,
+# the first build in the manifest) must be the one the reader names, in a
+# loud refusal or a misread. "Something was refused" is not evidence.
+fault_detected() {
+	build=$1
+	result=$2
+
+	[ -n "$build" ] || return 1
+	grep -qF "$build" "$result" || return 1
+
+	if grep -qE ', 1 refused loudly' "$result"; then
+		return 0
+	fi
+
+	if grep -qE '1 of [0-9]+ MISREAD' "$result"; then
+		return 0
+	fi
+
+	return 1
+}
+
 phase() {
 	bin=$1
 	shift
@@ -108,11 +163,12 @@ phase() {
 	fi
 
 	# Record the phase, then keep going: a rejection is an outcome here, not a
-	# reason to stop the matrix.
+	# reason to stop the matrix. A failed driver still marks the run.
 	if "$bin" "$@" >> "$OUT" 2>>"$OUT.err"; then
 		:
 	else
 		echo "{\"phase\":\"$1\",\"outcome\":\"exit\",\"detail\":\"non-zero exit\"}" >> "$OUT"
+		failed=1
 	fi
 }
 
@@ -130,6 +186,7 @@ phase "$NEW" probe --storage-url "$STORE" --prefix "$RUN/probe-new"
 echo "== new node writes, old node reads (upgrade leg) =="
 phase "$NEW" write --storage-url "$STORE" --prefix "$RUN/new" --manifest "$MAN/$RUN-new.json" --profile "$PROFILE"
 phase "$OLD" read  --manifest "$MAN/$RUN-new.json"
+require_rollback_read "$(tail -n 1 "$OUT")" "upgrade leg"
 phase "$OLD" exists --manifest "$MAN/$RUN-new.json"
 
 echo "== old node writes, new node reads (rollback leg) =="
@@ -227,6 +284,7 @@ if [ "${FLAG_ROLLBACK:-0}" = "1" ]; then
 	# 2) the new binary writes the current format; the old binary must read that too
 	phase "$NEW" write --storage-url "$STORE" --prefix "$RUN/flagroll/v5" --manifest "$MAN/$RUN-v5.json" --profile "$PROFILE"
 	phase "$OLD" read --manifest "$MAN/$RUN-v5.json"
+	require_rollback_read "$(tail -n 1 "$OUT")" "flag-rollback leg"
 	# 3) backfill the older artifacts onto the current format
 	phase "$NEW" migrate --manifest "$MAN/$RUN-v4.json" --header-version 5
 	# 4) after the rewrite both readers must still read them, and nothing may be stranded
@@ -240,9 +298,11 @@ if [ "${FAULT:-0}" = "1" ]; then
 	echo "== fault injection: tamper with one artifact, the old version must detect it =="
 	phase "$NEW" tamper --manifest "$MAN/$RUN-old.json" --index 0
 
-	# Detection is either a misread (checksum/frame CRC) or a loud refusal
-	# (the reader rejecting what it cannot parse). Both are correct; the only
-	# wrong outcome is the tampered artifact reading back as valid.
+	# Detection must be per-artifact (reviewer1 R2): the tampered entry
+	# (index 0, the first build in the manifest) must be the one the reader
+	# names, in a loud refusal or a misread; an unrelated refusal is not
+	# evidence that the tamper was seen.
+	tampered_build=$(grep -o '"build": *"[^"]*"' "$MAN/$RUN-old.json" | head -n 1 | cut -d'"' -f4)
 	fault_read="$BASE/fault-read.json"
 	# A fault read must be cold: an inherited, already-warm cache would serve
 	# the pre-tamper bytes and mask the tamper. Dedicated empty cache dir.
@@ -253,15 +313,22 @@ if [ "${FAULT:-0}" = "1" ]; then
 	cat "$fault_read" >>"$OUT"
 	cat "$fault_read.err" >>"$OUT.err"
 
-	if grep -qE '"outcome":"(misread|rejected)"' "$fault_read" || grep -q "refused" "$fault_read" "$fault_read.err"; then
+	if fault_detected "$tampered_build" "$fault_read"; then
 		printf '%s\n' '{"phase":"fault-injection","outcome":"ok","detail":"tampering detected (loud refusal or misread), never silent"}' >>"$OUT"
 	else
-		printf '%s\n' '{"phase":"fault-injection","outcome":"error","detail":"tampering went undetected: the tampered artifact read back as valid"}' >>"$OUT"
+		printf '%s\n' '{"phase":"fault-injection","outcome":"error","detail":"tampering went undetected for the tampered entry: not named in a loud refusal or misread"}' >>"$OUT"
+		failed=1
 	fi
 fi
 
 echo "== results =="
 cat "$OUT"
+
+if [ "$failed" != "0" ]; then
+	echo "rehearsal FAILED: at least one required outcome did not hold" >&2
+fi
+
+exit "$failed"
 REMOTE
 
 $SCP "$DIR/bin/remote-matrix.sh" "$VM:~/s3-rehearsal/remote-matrix.sh" >/dev/null
@@ -273,10 +340,26 @@ while [ "$i" -le "$SOAK" ]; do
 		run_id="$RUN-$i"
 	fi
 
-	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' SPRAY_CONCURRENCY='$SPRAY_CONCURRENCY' FAULT='$FAULT' FLAG_ROLLBACK='$FLAG_ROLLBACK' PEER='$PEER' OLD_PEER_BIN='$OLD_PEER_BIN' NEW_PEER_BIN='$NEW_PEER_BIN' sh ~/s3-rehearsal/remote-matrix.sh"
+	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' SPRAY_CONCURRENCY='$SPRAY_CONCURRENCY' FAULT='$FAULT' FLAG_ROLLBACK='$FLAG_ROLLBACK' PEER='$PEER' OLD_PEER_BIN='$OLD_PEER_BIN' NEW_PEER_BIN='$NEW_PEER_BIN' sh ~/s3-rehearsal/remote-matrix.sh" || failed=1
 
 	i=$((i + 1))
 done
 
-# Render the JSONL (all soak rounds) as Markdown for the notes.
-$SSH "cat ~/s3-rehearsal/results-$RUN*.jsonl" | "$DIR/render.sh" "$RUN"
+# Aggregate the required outcomes and render the JSONL (all soak rounds) as
+# Markdown for the notes; the evidence is printed even when the verdict fails.
+results=$(mktemp)
+$SSH "cat ~/s3-rehearsal/results-$RUN*.jsonl" > "$results" || failed=1
+if [ ! -s "$results" ]; then
+	failed=1
+fi
+if grep -qE '"outcome":"(error|exit)"' "$results"; then
+	failed=1
+fi
+"$DIR/render.sh" "$RUN" < "$results"
+rm -f "$results"
+
+if [ "$failed" != "0" ]; then
+	echo "rehearsal FAILED: at least one required outcome did not hold" >&2
+fi
+
+exit "$failed"
