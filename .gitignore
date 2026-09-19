@@ -22,6 +22,9 @@ go.work.sum
 /driver
 /peer
 
-# `go build ./cmd/migrate-builds` from packages/orchestrator drops a binary
-# inside the package directory; it is a build artifact, never a source file.
+# `go build ./cmd/migrate-builds` drops a binary in the working directory
+# (the repo root, packages/orchestrator, or the package directory); it is a
+# build artifact, never a source file.
+/migrate-builds
+/packages/orchestrator/migrate-builds
 /packages/orchestrator/cmd/migrate-builds/migrate-builds
