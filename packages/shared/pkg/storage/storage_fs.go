@@ -351,7 +351,7 @@ func writeFileAtomic(path string, perm os.FileMode, write func(io.Writer) error)
 
 	if err := write(tmp); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
+		removeTempFile(tmp.Name())
 
 		return fmt.Errorf("failed to write %s: %w", path, err)
 	}
@@ -375,6 +375,14 @@ func createTempFor(path string) (*os.File, error) {
 	return tmp, nil
 }
 
+// removeTempFile removes a temp file, counting it as residue when the removal
+// fails for any reason other than the file already being gone.
+func removeTempFile(name string) {
+	if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+		recordTempResidue()
+	}
+}
+
 // commitTempFile fsyncs and atomically renames a same-directory temp file into
 // place, removing it on any failure.
 func commitTempFile(tmp *os.File, path string, perm os.FileMode) error {
@@ -382,22 +390,22 @@ func commitTempFile(tmp *os.File, path string, perm os.FileMode) error {
 
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(tmpName)
+		removeTempFile(tmpName)
 
 		return fmt.Errorf("failed to sync %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
+		removeTempFile(tmpName)
 
 		return fmt.Errorf("failed to close %s: %w", path, err)
 	}
 	if err := os.Chmod(tmpName, perm); err != nil {
-		_ = os.Remove(tmpName)
+		removeTempFile(tmpName)
 
 		return fmt.Errorf("failed to chmod %s: %w", path, err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
+		removeTempFile(tmpName)
 
 		return fmt.Errorf("failed to rename temp file into %s: %w", path, err)
 	}
@@ -524,7 +532,7 @@ func (u *fsPartUploader) Close() error {
 	u.tmp = nil
 	name := tmp.Name()
 	_ = tmp.Close()
-	_ = os.Remove(name)
+	removeTempFile(name)
 
 	return nil
 }
