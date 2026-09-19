@@ -167,12 +167,14 @@ local-infra:
 #                   the Ubuntu VM
 #   make rehearsal  run the S3 mixed-version storage rehearsal (old/new runtime
 #                   checkouts against one Silo store, upgrade + rollback legs)
+#   make perf-regress  run the R23 perf-regression suite (opt-in, heavy;
+#                   see nix/perf/README.md)
 #
 # The existing test/lint/fmt targets above stay as they are: `make dev` and
 # `make tests` are the environment and the full validation path, not a
 # replacement for the per-module targets.
 
-.PHONY: dev dev-up dev-status dev-services tests rehearsal
+.PHONY: dev dev-up dev-status dev-services tests rehearsal perf-regress
 
 dev:
 	exec nix develop
@@ -191,3 +193,6 @@ tests:
 
 rehearsal:
 	./nix/rehearsal/run-matrix.sh
+
+perf-regress:
+	./nix/perf/perf-suite.sh run $(PERF_ARGS)
