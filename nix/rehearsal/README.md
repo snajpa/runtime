@@ -91,3 +91,32 @@ with `minioadmin:minioadmin` credentials; override with `E2B_STORAGE_URL`.
 - the NFS chunk cache (needs an NFS server in the VM);
 - GC/lifecycle rule changes under rehearsal (`prune` is the primitive);
 - real 10¹⁰-object counts — see the note's §7 "not replicable locally".
+
+## Legs and switches
+
+The base matrix always runs: probe → new writes/old reads → old writes/new
+reads → existence checks on both sides. These switches add legs, sized by the
+same profiles (`tiny`/`small`/`big`/`auto`):
+
+| switch | leg |
+|--------|-----|
+| `E2B_REHEARSAL_NODES=n` | `n` concurrent nodes *mixing versions*: even nodes write with the new binary, odd with the old, then each node reads its neighbour's artifacts with the opposite version, plus existence checks |
+| `E2B_REHEARSAL_SPRAY=n` | object-count shape: `n` small objects (4 KiB) with p50/p95/p99 latencies, an inventory (`count`) of the prefix, a rewrite with `--cleanup`, and a second inventory proving the delete |
+| `E2B_REHEARSAL_FAULT=1` | fault injection: overwrite one artifact with different bytes, then read it with the other version; the verdict is `ok` only if the tampering is *detected* (loud refusal or misread) |
+| `E2B_REHEARSAL_NFS=1` | put every node's chunk cache on the VM's NFS export (`/mnt/nfs-cache`) instead of a local temp dir |
+| `E2B_REHEARSAL_SOAK=k` | repeat the whole matrix `k` times (drift/soak) |
+
+## Evidence (2026-09-19, dev VM, Silo)
+
+- sequential matrix: green — 8/8 artifacts each way, v5 headers, 16/16 objects
+  present on both sides
+- fan-out: 3 concurrent nodes, versions mixed, every write ok and every
+  cross-version read 8/8
+- object-count: 1500 × 4 KiB sprayed at p50 18 ms / p95 34 ms / p99 50 ms; the
+  inventory counted exactly 1500 objects (5.9 MiB); the prefix delete took
+  1.7 s and the second inventory read 0
+- fault injection: the tampered artifact was refused loudly ("magic number
+  mismatch") in both soak rounds — never silently accepted
+- NFS: caches land on `/mnt/nfs-cache/<run>/<node>` (105 files, 85 MiB in the
+  first run)
+- soak: 2 rounds, 28 `ok` outcomes, no errors or misreads

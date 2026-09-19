@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPayloadDataIsDeterministicAndSized(t *testing.T) {
@@ -189,5 +190,91 @@ func TestBytesBufferAccumulates(t *testing.T) {
 
 	if got := string(buf.Bytes()); got != "abcde" {
 		t.Fatalf("buffer = %q, want %q", got, "abcde")
+	}
+}
+
+func TestSprayProfile(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		count     int
+		size      int64
+		wantCount int
+		wantSize  int64
+	}{
+		{"tiny", 0, 0, 500, 4 << 10},
+		{"small", 0, 0, 2000, 4 << 10},
+		{"big", 0, 0, 20000, 4 << 10},
+		// explicit overrides win, whatever the profile says
+		{"tiny", 7, 1 << 20, 7, 1 << 20},
+	}
+
+	for _, tc := range cases {
+		gotCount, gotSize := sprayProfile(tc.name, tc.count, tc.size)
+		if gotCount != tc.wantCount || gotSize != tc.wantSize {
+			t.Errorf("sprayProfile(%q, %d, %d) = (%d, %d), want (%d, %d)",
+				tc.name, tc.count, tc.size, gotCount, gotSize, tc.wantCount, tc.wantSize)
+		}
+	}
+
+	// auto must stay inside the documented bounds on any machine
+	gotCount, gotSize := sprayProfile("auto", 0, 0)
+	if gotCount < 500 || gotCount > 20000 {
+		t.Errorf("auto count = %d, want 500..20000", gotCount)
+	}
+
+	if gotSize != 4<<10 {
+		t.Errorf("auto size = %d, want 4096", gotSize)
+	}
+}
+
+func TestPercentile(t *testing.T) {
+	t.Parallel()
+
+	if got := percentile(nil, 0.5); got != 0 {
+		t.Errorf("percentile(nil) = %v, want 0", got)
+	}
+
+	durations := make([]time.Duration, 100)
+	for i := range durations {
+		durations[i] = time.Duration(i+1) * time.Millisecond
+	}
+
+	cases := []struct {
+		p    float64
+		want time.Duration
+	}{
+		{0, 1 * time.Millisecond},
+		{0.5, 50 * time.Millisecond},
+		{0.95, 95 * time.Millisecond},
+		{1, 100 * time.Millisecond},
+	}
+
+	for _, tc := range cases {
+		if got := percentile(durations, tc.p); got != tc.want {
+			t.Errorf("percentile(p=%v) = %v, want %v", tc.p, got, tc.want)
+		}
+	}
+}
+
+func TestHumanBytes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{0, "0 B"},
+		{999, "999 B"},
+		{1024, "1.0 KiB"},
+		{1 << 20, "1.0 MiB"},
+		{3 << 30, "3.0 GiB"},
+	}
+
+	for _, tc := range cases {
+		if got := humanBytes(tc.in); got != tc.want {
+			t.Errorf("humanBytes(%d) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

@@ -22,6 +22,15 @@ PROFILE=${E2B_PROFILE:-auto}
 # (mountable at /mnt/nfs-cache), so the cache-on-NFS path is exercised rather
 # than a local directory. `make dev-up` provisions the export.
 NFS=${E2B_REHEARSAL_NFS:-0}
+# E2B_REHEARSAL_NODES=N runs N concurrent nodes (mixed versions) after the
+# sequential matrix; E2B_REHEARSAL_SPRAY=N adds an object-count leg (N small
+# objects, inventory before and after delete); E2B_REHEARSAL_FAULT=1 tampers
+# with one artifact and checks the other version detects it;
+# E2B_REHEARSAL_SOAK=K repeats the whole matrix K times.
+NODES=${E2B_REHEARSAL_NODES:-0}
+SPRAY=${E2B_REHEARSAL_SPRAY:-0}
+FAULT=${E2B_REHEARSAL_FAULT:-0}
+SOAK=${E2B_REHEARSAL_SOAK:-1}
 STORE=${E2B_STORAGE_URL:-s3://e2b-rehearsal?endpoint=http://127.0.0.1:9000&s3ForcePathStyle=true&region=us-east-1}
 RUN=${E2B_RUN_ID:-run-$(date +%Y%m%dT%H%M%S)}
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -115,13 +124,97 @@ phase "$OLD" write --storage-url "$STORE" --prefix "$RUN/old" --manifest "$MAN/$
 phase "$NEW" read  --manifest "$MAN/$RUN-old.json"
 phase "$NEW" exists --manifest "$MAN/$RUN-old.json"
 
+if [ "${NODES:-0}" -gt 1 ]; then
+	echo "== fan-out: $NODES concurrent mixed-version nodes =="
+	FAN="$BASE/fanout-$RUN"
+	mkdir -p "$FAN"
+
+	i=0
+	while [ "$i" -lt "$NODES" ]; do
+		if [ $((i % 2)) -eq 0 ]; then bin=$NEW; else bin=$OLD; fi
+
+		(
+			if [ -n "${NFS_BASE:-}" ]; then
+				S3_REHEARSAL_CACHE_DIR="$NFS_BASE/node-$i"
+				export S3_REHEARSAL_CACHE_DIR
+			fi
+
+			"$bin" write --storage-url "$STORE" --prefix "$RUN/fanout/node-$i" \
+				--manifest "$MAN/$RUN-fanout-$i.json" --profile "$PROFILE"
+		) >"$FAN/write-$i.json" 2>&1 &
+
+		i=$((i + 1))
+	done
+	wait
+
+	i=0
+	while [ "$i" -lt "$NODES" ]; do
+		next=$(( (i + 1) % NODES ))
+
+		# The reader is the opposite version of the writer of $next, so every
+		# cross-node read in the fan-out is a mixed-version read.
+		if [ $((next % 2)) -eq 0 ]; then bin=$OLD; else bin=$NEW; fi
+
+		(
+			if [ -n "${NFS_BASE:-}" ]; then
+				S3_REHEARSAL_CACHE_DIR="$NFS_BASE/node-$i-read"
+				export S3_REHEARSAL_CACHE_DIR
+			fi
+
+			"$bin" read --manifest "$MAN/$RUN-fanout-$next.json"
+			"$bin" exists --manifest "$MAN/$RUN-fanout-$next.json"
+		) >>"$FAN/read-$i.json" 2>&1 &
+
+		i=$((i + 1))
+	done
+	wait
+
+	cat "$FAN"/*.json >>"$OUT"
+fi
+
+if [ "${SPRAY:-0}" -gt 0 ]; then
+	echo "== object-count shape: $SPRAY small objects =="
+	phase "$NEW" spray --storage-url "$STORE" --prefix "$RUN/objects" --count "$SPRAY"
+	phase "$NEW" count --storage-url "$STORE" --prefix "$RUN/objects"
+	phase "$NEW" spray --storage-url "$STORE" --prefix "$RUN/objects" --count "$SPRAY" --cleanup
+	phase "$NEW" count --storage-url "$STORE" --prefix "$RUN/objects"
+fi
+
+if [ "${FAULT:-0}" = "1" ]; then
+	echo "== fault injection: tamper with one artifact, the old version must detect it =="
+	phase "$NEW" tamper --manifest "$MAN/$RUN-old.json" --index 0
+
+	# Detection is either a misread (checksum/frame CRC) or a loud refusal
+	# (the reader rejecting what it cannot parse). Both are correct; the only
+	# wrong outcome is the tampered artifact reading back as valid.
+	fault_read="$BASE/fault-read.json"
+	"$OLD" read --manifest "$MAN/$RUN-old.json" >"$fault_read" 2>&1 || true
+	cat "$fault_read" >>"$OUT"
+
+	if grep -qE '"outcome":"(misread|rejected)"' "$fault_read" || grep -q "refused" "$fault_read"; then
+		printf '%s\n' '{"phase":"fault-injection","outcome":"ok","detail":"tampering detected (loud refusal or misread), never silent"}' >>"$OUT"
+	else
+		printf '%s\n' '{"phase":"fault-injection","outcome":"error","detail":"tampering went undetected: the tampered artifact read back as valid"}' >>"$OUT"
+	fi
+fi
+
 echo "== results =="
 cat "$OUT"
 REMOTE
 
 $SCP "$DIR/bin/remote-matrix.sh" "$VM:~/s3-rehearsal/remote-matrix.sh" >/dev/null
 
-$SSH "RUN='$RUN' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' sh ~/s3-rehearsal/remote-matrix.sh"
+i=1
+while [ "$i" -le "$SOAK" ]; do
+	run_id="$RUN"
+	if [ "$SOAK" -gt 1 ]; then
+		run_id="$RUN-$i"
+	fi
 
-# Render the JSONL as Markdown for the notes.
-$SSH "cat ~/s3-rehearsal/results-$RUN.jsonl" | "$DIR/render.sh" "$RUN"
+	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' FAULT='$FAULT' sh ~/s3-rehearsal/remote-matrix.sh"
+
+	i=$((i + 1))
+done
+
+# Render the JSONL (all soak rounds) as Markdown for the notes.
+$SSH "cat ~/s3-rehearsal/results-$RUN*.jsonl" | "$DIR/render.sh" "$RUN"

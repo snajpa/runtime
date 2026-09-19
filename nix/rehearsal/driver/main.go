@@ -26,6 +26,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -96,6 +97,12 @@ func main() {
 	switch os.Args[1] {
 	case "ensure-bucket":
 		ensureBucket(args)
+	case "count":
+		countObjects(args)
+	case "spray":
+		spray(args)
+	case "tamper":
+		tamper(args)
 	case "probe":
 		probe(args)
 	case "write":
@@ -157,6 +164,302 @@ func readObject(ctx context.Context, provider storage.StorageProvider, path stri
 	return out, nil
 }
 
+// newS3Client builds the SDK client used by the phases that need the S3 API
+// itself (bucket creation, inventory): they work on the same spec the storage
+// layer gets.
+func newS3Client(spec storage.Spec) *s3.Client {
+	region := spec.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	cfg := aws.Config{
+		Credentials: credentials.NewStaticCredentialsProvider(
+			os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"), ""),
+		Region: region,
+	}
+
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if spec.Endpoint != "" {
+			o.BaseEndpoint = aws.String(spec.Endpoint)
+		}
+
+		o.UsePathStyle = spec.UsePathStyle
+	})
+}
+
+// countObjects is the inventory primitive the readiness note calls G1: how
+// many artifacts exist under a prefix and how big they are, by suffix. A
+// fleet-wide rollback or deprecation decision needs this before it can claim
+// that nothing was stranded.
+func countObjects(args []string) {
+	fs := flag.NewFlagSet("count", flag.ExitOnError)
+	storageURL := fs.String("storage-url", "", "storage URL (required)")
+	prefix := fs.String("prefix", "", "prefix to inventory (required)")
+	_ = fs.Parse(args)
+
+	spec, err := storage.ParseStorageURL(*storageURL)
+	if err != nil {
+		emit(result{Phase: "count", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	if spec.Provider != storage.AWSStorageProvider {
+		emit(result{
+			Phase: "count", Version: version, Outcome: "error",
+			Detail: fmt.Sprintf("inventory needs the S3 API; provider is %s", spec.Provider),
+		})
+
+		return
+	}
+
+	started := time.Now()
+	client := newS3Client(spec)
+	ctx := context.Background()
+
+	var (
+		objects  int
+		bytes    int64
+		bySuffix = map[string]int{}
+		token    *string
+	)
+
+	for {
+		out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(spec.Bucket),
+			Prefix:            aws.String(*prefix),
+			ContinuationToken: token,
+			MaxKeys:           aws.Int32(1000),
+		})
+		if err != nil {
+			emit(result{Phase: "count", Version: version, Outcome: "error", Detail: err.Error()})
+
+			return
+		}
+
+		for _, object := range out.Contents {
+			objects++
+			bytes += aws.ToInt64(object.Size)
+			bySuffix[path.Ext(aws.ToString(object.Key))]++
+		}
+
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+
+		token = out.NextContinuationToken
+	}
+
+	suffixes := make([]string, 0, len(bySuffix))
+	for suffix, n := range bySuffix {
+		suffixes = append(suffixes, fmt.Sprintf("%s=%d", suffix, n))
+	}
+
+	slices.Sort(suffixes)
+
+	emit(result{
+		Phase: "count", Version: version, Outcome: "ok",
+		Detail: fmt.Sprintf("%s: %d objects, %s, %s", *prefix, objects,
+			humanBytes(bytes), strings.Join(suffixes, " ")),
+		Objects: objects, Bytes: bytes, Seconds: time.Since(started).Seconds(),
+	})
+}
+
+// sprayProfile sizes a spray to the machine: many small objects is the shape
+// production actually holds (see the note's arithmetic on 10^10 chunks), and a
+// dev box cannot hold all of them, so the counts scale with cores.
+func sprayProfile(name string, count int, size int64) (int, int64) {
+	var defaults int
+
+	switch name {
+	case "tiny":
+		defaults = 500
+	case "small":
+		defaults = 2000
+	case "big":
+		defaults = 20000
+	default: // auto
+		defaults = min(max(runtime.NumCPU()*125, 500), 20000)
+	}
+
+	// explicit flags win over the profile
+	if count <= 0 {
+		count = defaults
+	}
+
+	if size <= 0 {
+		size = 4 << 10
+	}
+
+	return count, size
+}
+
+// percentile returns the p-quantile (0..1) of a sorted duration slice.
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+
+	idx := int(float64(len(sorted)-1) * p)
+	idx = max(idx, 0)
+	idx = min(idx, len(sorted)-1)
+
+	return sorted[idx]
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(n)/float64(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/float64(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// spray publishes many small objects and reports the tail latencies a fleet
+// would feel per object; -cleanup measures the prefix delete that GC would do.
+func spray(args []string) {
+	fs := flag.NewFlagSet("spray", flag.ExitOnError)
+	storageURL := fs.String("storage-url", "", "storage URL (required)")
+	prefix := fs.String("prefix", "", "object prefix (required)")
+	profileName := fs.String("profile", "auto", "tiny|small|big|auto")
+	count := fs.Int("count", 0, "number of objects (overrides the profile)")
+	size := fs.Int64("bytes", 0, "bytes per object (overrides the profile)")
+	cleanup := fs.Bool("cleanup", false, "delete the sprayed objects afterwards")
+	_ = fs.Parse(args)
+
+	started := time.Now()
+	n, objectSize := sprayProfile(*profileName, *count, *size)
+
+	provider, err := openProvider(*storageURL)
+	if err != nil {
+		emit(result{Phase: "spray", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	ctx := context.Background()
+	durations := make([]time.Duration, 0, n)
+
+	var written int64
+
+	for i := range n {
+		objectPath := fmt.Sprintf("%s/objects/%06d.bin", *prefix, i)
+
+		blob, err := provider.OpenBlob(ctx, objectPath)
+		if err != nil {
+			emit(result{Phase: "spray", Version: version, Outcome: "error", Detail: err.Error()})
+
+			return
+		}
+
+		t0 := time.Now()
+		if err := blob.Put(ctx, payloadData(int64(i)+1, objectSize)); err != nil {
+			emit(result{
+				Phase: "spray", Version: version, Outcome: "error",
+				Detail: fmt.Sprintf("object %d: %v", i, err),
+			})
+
+			return
+		}
+
+		durations = append(durations, time.Since(t0))
+		written += objectSize
+	}
+
+	slices.Sort(durations)
+
+	detail := fmt.Sprintf("wrote %d objects of %d B in %s (p50 %s, p95 %s, p99 %s)",
+		n, objectSize, time.Since(started).Round(time.Millisecond),
+		percentile(durations, 0.50).Round(time.Microsecond),
+		percentile(durations, 0.95).Round(time.Microsecond),
+		percentile(durations, 0.99).Round(time.Microsecond))
+
+	if *cleanup {
+		t0 := time.Now()
+		if err := provider.DeleteObjectsWithPrefix(ctx, *prefix); err != nil {
+			emit(result{
+				Phase: "spray", Version: version, Outcome: "error",
+				Detail: fmt.Sprintf("cleanup: %v", err),
+			})
+
+			return
+		}
+
+		detail += fmt.Sprintf("; deleted the prefix in %s", time.Since(t0).Round(time.Millisecond))
+	}
+
+	emit(result{
+		Phase: "spray", Version: version, Outcome: "ok",
+		Detail: detail, Objects: n, Bytes: written,
+		Seconds: time.Since(started).Seconds(), Protocol: "small objects",
+	})
+}
+
+// tamper overwrites an artifact's payload with different bytes of the same
+// length: fault injection for the read path. Reading a tampered artifact must
+// come back as a misread (whole-file checksum or a frame CRC on Close), never
+// as valid data - silent corruption is the failure mode this checks for.
+func tamper(args []string) {
+	fs := flag.NewFlagSet("tamper", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "manifest to tamper with (required)")
+	index := fs.Int("index", 0, "entry to tamper with")
+	_ = fs.Parse(args)
+
+	m, err := loadManifest(*manifestPath)
+	if err != nil {
+		emit(result{Phase: "tamper", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	if *index < 0 || *index >= len(m.Entries) {
+		emit(result{
+			Phase: "tamper", Version: version, Outcome: "error",
+			Detail: fmt.Sprintf("index %d out of range (%d entries)", *index, len(m.Entries)),
+		})
+
+		return
+	}
+
+	entry := m.Entries[*index]
+
+	provider, err := openProvider(m.StorageURL)
+	if err != nil {
+		emit(result{Phase: "tamper", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	blob, err := provider.OpenBlob(context.Background(), entry.Payload)
+	if err != nil {
+		emit(result{Phase: "tamper", Version: version, Outcome: "error", Detail: err.Error()})
+
+		return
+	}
+
+	// Same length as the original, different content.
+	if err := blob.Put(context.Background(), payloadData(9999, entry.Size)); err != nil {
+		emit(result{
+			Phase: "tamper", Version: version, Outcome: "error",
+			Detail: fmt.Sprintf("overwrite: %v", err),
+		})
+
+		return
+	}
+
+	emit(result{
+		Phase: "tamper", Version: version, Outcome: "ok",
+		Detail:  fmt.Sprintf("overwrote %s (%d B) with different bytes", entry.Payload, entry.Size),
+		Objects: 1, Bytes: entry.Size,
+	})
+}
+
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: s3-rehearsal <phase> [flags]
 
@@ -167,6 +470,9 @@ phases:
   exists    check every artifact in a manifest still exists
   prune     delete the artifacts of a manifest (rollback/GC leg)
   versions  print the stamped version
+  count     inventory an object prefix (count and bytes, S3 ListObjectsV2)
+  spray     publish many small objects with tail latencies (-cleanup deletes)
+  tamper    overwrite one artifact with different bytes (fault injection)
 
 flags: --storage-url, --prefix, --manifest, --profile, --builds, --bytes, --codec
 `)
@@ -297,24 +603,7 @@ func ensureBucket(args []string) {
 		return
 	}
 
-	region := spec.Region
-	if region == "" {
-		region = "us-east-1"
-	}
-
-	cfg := aws.Config{
-		Credentials: credentials.NewStaticCredentialsProvider(
-			os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"), ""),
-		Region: region,
-	}
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if spec.Endpoint != "" {
-			o.BaseEndpoint = aws.String(spec.Endpoint)
-		}
-
-		o.UsePathStyle = spec.UsePathStyle
-	})
+	client := newS3Client(spec)
 
 	_, err = client.CreateBucket(context.Background(), &s3.CreateBucketInput{Bucket: aws.String(spec.Bucket)})
 	if err != nil {
