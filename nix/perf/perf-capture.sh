@@ -104,17 +104,28 @@ artifact() { # unit kind path
 	printf '{"record":"artifact","unit":"%s","kind":"%s","path":"%s","sha256":"%s","retain":true}\n' "$1" "$2" "$3" "$(sha256_of "$3")"
 }
 
-make_flamegraph() { # unit adir - regenerate script/folded/SVG from retained perf.data
+make_flamegraph() { # unit adir [mode: combined|kernel|user]
 	unit=$1
 	adir=$2
+	mode=${3:-combined}
 	if [ ! -f "$adir/$unit.perf.data" ]; then
 		echo "no retained perf.data: $adir/$unit.perf.data" >&2
 		return 2
 	fi
+	case "$mode" in
+		combined) out="$adir/$unit.svg"; folded="$adir/$unit.folded" ;;
+		kernel)   out="$adir/$unit.kernel.svg"; folded="$adir/$unit.kernel.folded" ;;
+		user)     out="$adir/$unit.user.svg"; folded="$adir/$unit.user.folded" ;;
+		*) echo "unknown flamegraph mode: $mode" >&2; return 2 ;;
+	esac
 	perf script -i "$adir/$unit.perf.data" >"$adir/$unit.perf.script" 2>/dev/null || true
-	"$FGRAPH/stackcollapse-perf.pl" "$adir/$unit.perf.script" >"$adir/$unit.folded" 2>/dev/null || true
-	"$FGRAPH/flamegraph.pl" "$adir/$unit.folded" >"$adir/$unit.svg" 2>/dev/null || true
-	artifact "$unit" flamegraph "$adir/$unit.svg"
+	case "$mode" in
+	combined) "$FGRAPH/stackcollapse-perf.pl" "$adir/$unit.perf.script" >"$folded" 2>/dev/null || true ;;
+	kernel)   awk '!/^\t/ || /\(\[kernel/' "$adir/$unit.perf.script" | "$FGRAPH/stackcollapse-perf.pl" >"$folded" 2>/dev/null || true ;;
+	user)     awk '!/^\t/ || !/\(\[kernel/' "$adir/$unit.perf.script" | "$FGRAPH/stackcollapse-perf.pl" >"$folded" 2>/dev/null || true ;;
+	esac
+	"$FGRAPH/flamegraph.pl" "$folded" >"$out" 2>/dev/null || true
+	artifact "$unit" flamegraph "$out"
 }
 
 run() {
@@ -168,6 +179,7 @@ run() {
 
 cmd=${1:-}
 if [ "$cmd" = flamegraph ]; then
+	shift
 	make_flamegraph "$@"
 	exit $?
 fi
@@ -180,7 +192,7 @@ run)
 	run "$@"
 	;;
 *)
-	echo "usage: $0 capabilities | run <clean|trace|diagnostic> <unit> <dir> [--lock] -- <cmd...> | flamegraph <unit> <dir>" >&2
+	echo "usage: $0 capabilities | run <clean|trace|diagnostic> <unit> <dir> [--lock] -- <cmd...> | flamegraph <unit> <dir> [mode]" >&2
 	exit 2
 	;;
 esac

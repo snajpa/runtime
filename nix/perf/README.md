@@ -28,7 +28,7 @@ product-tree implementation.
         [--seed N] [--dry-run]
     ./nix/perf/perf-suite.sh calibrate --candidate <dir|ref> --env quiet|busy
     ./nix/perf/perf-suite.sh compare --run <run-id>
-    ./nix/perf/perf-suite.sh flamegraph --run <run-id>
+    ./nix/perf/perf-suite.sh flamegraph --run <run-id> [--mode kernel|user|combined]
     ./nix/perf/perf-suite.sh report --run <run-id>
 
 `--dry-run` prints the block/leg plan without touching a workload — use it to
@@ -68,7 +68,7 @@ verify wiring.
   (records sha/describe/dirty/go/tool-versions/
   flake + build hashes).
 - `perf-capture.sh` / `perf-rusage.py` — **lane C** (landed): clean/trace/
-  diagnostic capture wrapper + exact rusage summary; env knobs `FGRAPH` /
+  diagnostic capture wrapper + exact rusage summary; `flamegraph <unit> <dir> [mode]` regeneration (kernel/user via dso filtering); env knobs `FGRAPH` /
   `TRACE_EVENTS` / `PERF_FREQ` / `CALLGRAPH`.
 - `busy-ref.sh` — **lane E**: busy-class reference load (`run` one-shot;
   `start`/`stop` session spanning the measured window). Emits the identity

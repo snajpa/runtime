@@ -461,7 +461,7 @@ cmd_flamegraph() {
 		esac
 	done
 	[ -n "$run_id" ] || die "flamegraph: --run <run-id> is required"
-	[ "$mode" = combined ] || die "flamegraph: --mode $mode not wired (combined only)"
+	case "$mode" in combined|kernel|user) ;; *) die "flamegraph: --mode must be combined|kernel|user" ;; esac
 	RUN_ID="$run_id"; RUN_DIR="$LOG_ROOT/$RUN_ID"; STREAM="$RUN_DIR/perf-runs.jsonl"
 	[ -d "$RUN_DIR" ] || die "flamegraph: no such run: $RUN_DIR"
 	local f d unit n files
@@ -470,7 +470,7 @@ cmd_flamegraph() {
 	n=0
 	for f in $files; do
 		d=$(dirname -- "$f"); unit=$(basename -- "$f" .perf.data)
-		"$PERF_ROOT/perf-capture.sh" flamegraph "$unit" "$d" | while IFS= read -r line; do
+		"$PERF_ROOT/perf-capture.sh" flamegraph "$unit" "$d" "$mode" | while IFS= read -r line; do
 			[ -n "$line" ] || continue
 			printf '%s\n' "$line" | emit artifact diagnose diagnostic
 		done
