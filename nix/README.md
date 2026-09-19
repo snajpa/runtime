@@ -119,3 +119,48 @@ behind can wedge the driver's control mutex, and every later device operation
 blocks with it. Reboot the VM in that case instead of hunting the device: the
 daemon-side fix is in the transport, but a device already in that state cannot
 be cleaned up any other way.
+
+## Two easy ways to develop
+
+The product is validated on Ubuntu, as the repo's spec requires
+(`embed/compose/scripts/preflight.sh`, `host-setup.sh`); Nix defines that
+environment and brings it up. Two commands are all a developer needs, on any
+machine with Nix:
+
+```sh
+make dev        # enter the dev environment: Nix shell + Ubuntu dev VM + services
+make tests      # validate changes: host build/format/lint/tests, then the VM suites
+```
+
+- `make dev` enters `nix develop`, and the shell's hook runs
+  `nix/scripts/dev.sh --ensure`: it builds the VM runner if needed, starts the
+  VM, and provisions the services inside it. Re-running is cheap and safe;
+  `E2B_DEV_AUTO=0 make dev` gives a plain shell without the bring-up.
+- `make tests` runs `nix/scripts/dev-tests.sh`: `go build` for the modules,
+  `gofmt` on changed files, `golangci-lint` and `go test` for changed packages,
+  and then the root-gated storage suites **inside the Ubuntu VM** (the only
+  place the host-shape requirements hold). `--no-vm` skips the VM half,
+  `--base <rev>` changes the diff base (default `origin/main`).
+- `make rehearsal` runs the S3 mixed-version rehearsal (below).
+
+## Services inside the VM
+
+`nix/scripts/dev.sh` provisions, and `make dev` keeps alive:
+
+| service | why |
+|---------|-----|
+| `ublk_drv` | the ublk transport's control plane (`/dev/ublk-control`) |
+| Silo (`pgsty/silo`) | the S3-compatible object store the storage code and the rehearsal use (S-53) |
+| NFS export `/srv/nfs-cache` | the chunk-cache path (`WrapInNFSCache`) can be pointed at it |
+| `busybox-static` | the guest rootfs the Firecracker tests build |
+
+State lives on the VM disk (`e2b-dev-vm/disk.qcow2`); `./result/bin/e2b-dev-vm
+reset` is the explicit way to start from scratch.
+
+## S3 rehearsal (mixed versions on one store)
+
+`nix/rehearsal/` builds one driver against two runtime checkouts — an old one
+and a new one — and runs the upgrade and rollback legs against the Silo store
+inside the VM: new writes/old reads, old writes/new reads, and existence checks
+proving nothing is stranded. Profiles (`tiny`/`small`/`big`/`auto`) size the run
+to the machine. See `nix/rehearsal/README.md`.
