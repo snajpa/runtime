@@ -29,6 +29,12 @@ stamped by `schema/emit.sh`. The rich block summary is kept as
 per-position token (`A1..A2`/`B1..B2`) and `side` comes from `PERF_SIDE`
 (`baseline` | `candidate`; fallback `candidate` for envelope mode).
 
+`missing` is the tool's `action:"missing"` metadata — an artifact kind absent
+in the fixture (e.g. the `large` class carries no memfile headers, so
+header-c1 reports `missing=4`). It is by design, **not** a correctness signal;
+the correctness check is the oracle's `missing-payload=0` (agent0 2226 /
+lane F 2222).
+
 `chunk` is the perf/2 object `{i,n}` (1-based) — `{1,1}` for block metrics,
 `{k,chunks}` for the per-artifact latency arrays. Position-leg tokens resolve
 to their side's tree and share the side-keyed tool cache; the comparator

@@ -7,9 +7,9 @@
 #                                -> one measured block; raw record appended to
 #                                   <leg-dir>/samples.jsonl; artifacts in <leg-dir>; no verdicts
 #   profile <profile> <leg-dir>  -> matched-diagnostics capture (never gating)
-# Env: PERF_ENV_CLASS, PERF_TREE_DIR / PERF_TREES_DIR, PERF_LEG, PERF_RUN_ID/PERF_PHASE/
-#      PERF_MODE/PERF_SUITE_*, PERF_W4_FIXTURES (fixture cache), PERF_W4_TOOL (tool
-#      override), PERF_W4_ORACLE_CLASS, PERF_W4_DRY, PERF_CAPTURE.
+# Env: PERF_ENV_CLASS, PERF_TREE_DIR / PERF_TREES_DIR, PERF_LEG, PERF_SIDE, PERF_STAGE,
+#      PERF_RUN_ID/PERF_PHASE/PERF_MODE/PERF_SUITE_*, PERF_W4_FIXTURES (fixture cache),
+#      PERF_W4_TOOL (tool override), PERF_W4_ORACLE_CLASS, PERF_W4_DRY, PERF_CAPTURE.
 # Exit: 0 ok / 30 inconclusive / 40 setup_error (suite scheme).
 set -u
 
