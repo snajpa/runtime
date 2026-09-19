@@ -19,6 +19,9 @@ import (
 // finalized headers second, local publish last (REQ-A1, INV-1/INV-2). Headers
 // and bodies used to run in a single errgroup, so a reader could observe a
 // finalized header before the body it references existed (audit §8.5).
+//
+// Rollback-only: the S-41 roadmap removes this write path once the framed
+// write formats are the only ones enabled (readers keep V3 support).
 func (u *Upload) runV3(ctx context.Context) error {
 	memfilePath, err := u.snap.MemorySnapshot.Diff.CachePath(ctx)
 	if err != nil {

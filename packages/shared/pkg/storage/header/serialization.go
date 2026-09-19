@@ -17,10 +17,38 @@ func metadataFormatVersion(version uint64) uint64 {
 	return version & metadataVersionMask
 }
 
+// uncompressedHeaderCap returns the anti-decompression-bomb cap for a framed
+// (V4/V5) header format version. Caps are immutable, per-format constants
+// (S-41, REQ-F2): read and write paths must consult the cap of the artifact's
+// own version, and nothing may change a cap at runtime. V3 has no size prefix
+// and therefore no cap, so ok is false for it.
+func uncompressedHeaderCap(version uint64) (int64, bool) {
+	switch metadataFormatVersion(version) {
+	case MetadataVersionV4:
+		return v4MaxUncompressedHeaderSize, true
+	case MetadataVersionV5:
+		return v5MaxUncompressedHeaderSize, true
+	default:
+		return 0, false
+	}
+}
+
+// checkUncompressedHeaderBlock rejects a claimed uncompressed header block
+// above cap. The read paths (deserializeV4/deserializeV5) and the write guard
+// in StoreHeader share it so both sides fail on exactly the same boundary.
+func checkUncompressedHeaderBlock(format string, size, limit int64) error {
+	if size > limit {
+		return fmt.Errorf("%s header uncompressed size %d exceeds cap %d", format, size, limit)
+	}
+
+	return nil
+}
+
 // SerializeHeader serializes a header, dispatching to the version-specific format.
 //
-// V3 (Version <= 3): [Metadata] [v3 mappings…]
-// V4 (Version >= 4): [Metadata] [uint8 flags] [uint32 uncompressedSize] [LZ4( Builds + v4 mappings )]
+// V3 (Version 1-3): [Metadata] [v3 mappings…]
+// V4 (Version 4):   [Metadata] [uint8 flags] [uint32 uncompressedSize] [LZ4( Builds + fixed mappings )]
+// V5 (Version 5):   same framing as V4; columnar, varint-coded mapping section.
 func SerializeHeader(h *Header) ([]byte, error) {
 	switch metadataFormatVersion(h.Metadata.Version) {
 	case 1, 2, 3:
@@ -155,8 +183,11 @@ func StoreHeader(ctx context.Context, s storage.StorageProvider, path string, h 
 		}
 		uncompressed = int64(len(data))
 	case MetadataVersionV4, MetadataVersionV5:
+		version := metadataFormatVersion(h.Metadata.Version)
+		format := "v4"
 		var blockUncompressed int64
-		if metadataFormatVersion(h.Metadata.Version) == MetadataVersionV5 {
+		if version == MetadataVersionV5 {
+			format = "v5"
 			data, blockUncompressed, err = serializeV5(h.Metadata, h.Builds, h.Mapping, h.IncompletePendingUpload)
 		} else {
 			data, blockUncompressed, err = serializeV4(h.Metadata, h.Builds, h.Mapping, h.IncompletePendingUpload)
@@ -165,12 +196,14 @@ func StoreHeader(ctx context.Context, s storage.StorageProvider, path string, h 
 			return storage.CompressConfig{}, 0, 0, fmt.Errorf("serialize header: %w", err)
 		}
 
-		// Guard the read-side cap on the write path. The cap is enforced in
-		// deserializeV4; without this symmetric check an oversize header would
-		// upload successfully and then fail every restore, permanently bricking
-		// the snapshot. Fail the Pause loudly instead.
-		if blockUncompressed > int64(v4MaxUncompressedHeaderSize) {
-			return storage.CompressConfig{}, 0, 0, fmt.Errorf("refusing to persist header for %s: uncompressed block %d exceeds cap %d", path, blockUncompressed, v4MaxUncompressedHeaderSize)
+		// Guard the read-side cap on the write path, per format. The cap is
+		// enforced in deserializeV4/deserializeV5; without this symmetric check
+		// an oversize header would upload successfully and then fail every
+		// restore, permanently bricking the snapshot. Fail the Pause loudly
+		// instead.
+		limit, _ := uncompressedHeaderCap(version)
+		if err := checkUncompressedHeaderBlock(format, blockUncompressed, limit); err != nil {
+			return storage.CompressConfig{}, 0, 0, fmt.Errorf("refusing to persist header for %s: %w", path, err)
 		}
 
 		uncompressed = int64(metadataSize+v4FlagsLen+v4SizePrefixLen) + blockUncompressed

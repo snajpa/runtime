@@ -239,3 +239,32 @@ func TestV5_RejectsOversizePrefix(t *testing.T) {
 	_, err = DeserializeBytes(data)
 	require.ErrorContains(t, err, "exceeds cap")
 }
+
+// TestV5_UsesItsOwnCap pins that the V5 reader enforces the V5 cap: a block
+// above an injected lower cap is rejected, and the same bytes decode under the
+// V5 cap (S-41: caps are per-format and immutable).
+func TestV5_UsesItsOwnCap(t *testing.T) {
+	t.Parallel()
+
+	bs := uint64(4096)
+	a, b := uuid.New(), uuid.New()
+	mappings := []BuildMap{
+		{Offset: 0, Length: bs, BuildId: a, BuildStorageOffset: 0},
+		{Offset: bs, Length: bs, BuildId: b, BuildStorageOffset: 0},
+	}
+	meta := &Metadata{BlockSize: bs, Size: 2 * bs, BuildId: a, BaseBuildId: b}
+	h := v5Header(t, meta, mappings, map[uuid.UUID]BuildData{a: {Size: int64(bs)}, b: {Size: int64(bs)}})
+
+	data, err := SerializeHeader(h)
+	require.NoError(t, err)
+
+	metadata, err := deserializeMetadata(data[:metadataSize])
+	require.NoError(t, err)
+
+	_, err = deserializeV5WithCap(metadata, data[metadataSize:], 16)
+	require.ErrorContains(t, err, "exceeds cap")
+
+	got, err := deserializeV5WithCap(metadata, data[metadataSize:], v5MaxUncompressedHeaderSize)
+	require.NoError(t, err)
+	require.Equal(t, 2, got.Mapping.Len())
+}
