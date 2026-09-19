@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
@@ -228,6 +231,76 @@ func TestSprayProfile(t *testing.T) {
 
 	if gotSize != 4<<10 {
 		t.Errorf("auto size = %d, want 4096", gotSize)
+	}
+}
+
+func TestRetryBackoffStaysBounded(t *testing.T) {
+	t.Parallel()
+
+	for attempt := range 5 {
+		got := retryBackoff(attempt)
+		if got < 0 || got > 2*time.Second {
+			t.Fatalf("retryBackoff(%d) = %v, want 0..2s", attempt, got)
+		}
+	}
+}
+
+func TestRetrySummary(t *testing.T) {
+	t.Parallel()
+
+	if got := retrySummary(0, 100); got != "no retries" {
+		t.Errorf("retrySummary(0, 100) = %q", got)
+	}
+
+	if got := retrySummary(5, 100); got != "5 retries (5.00% of writes)" {
+		t.Errorf("retrySummary(5, 100) = %q", got)
+	}
+}
+
+// flakyBlob fails the first fails-before-success writes, then succeeds.
+type flakyBlob struct {
+	fails int
+	puts  int
+}
+
+func (b *flakyBlob) WriteTo(context.Context, io.Writer) (int64, error) { return 0, nil }
+func (b *flakyBlob) Exists(context.Context) (bool, error)              { return true, nil }
+
+func (b *flakyBlob) Put(_ context.Context, _ []byte, _ ...storage.PutOption) error {
+	b.puts++
+	if b.puts <= b.fails {
+		return context.DeadlineExceeded
+	}
+
+	return nil
+}
+
+func TestPutWithRetry(t *testing.T) {
+	t.Parallel()
+
+	// succeeds on the second attempt
+	blob := &flakyBlob{fails: 1}
+	attempts, err := putWithRetry(t.Context(), blob, []byte("x"), 3)
+	if err != nil || attempts != 2 {
+		t.Fatalf("putWithRetry = (%d, %v), want (2, nil)", attempts, err)
+	}
+
+	// gives up after the configured attempts
+	blob = &flakyBlob{fails: 99}
+	attempts, err = putWithRetry(t.Context(), blob, []byte("x"), 2)
+	if err == nil || attempts != 2 {
+		t.Fatalf("putWithRetry = (%d, %v), want (2, error)", attempts, err)
+	}
+
+	if blob.puts != 2 {
+		t.Fatalf("blob saw %d puts, want 2", blob.puts)
+	}
+
+	// never fewer than one attempt
+	blob = &flakyBlob{}
+	attempts, err = putWithRetry(t.Context(), blob, []byte("x"), 0)
+	if err != nil || attempts != 1 {
+		t.Fatalf("putWithRetry with 0 attempts = (%d, %v), want (1, nil)", attempts, err)
 	}
 }
 

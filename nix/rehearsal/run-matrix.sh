@@ -30,6 +30,10 @@ NFS=${E2B_REHEARSAL_NFS:-0}
 NODES=${E2B_REHEARSAL_NODES:-0}
 SPRAY=${E2B_REHEARSAL_SPRAY:-0}
 SPRAY_CONCURRENCY=${E2B_REHEARSAL_SPRAY_CONCURRENCY:-0}
+# Attempts per object write: the storage layer bounds every write with its own
+# 30s deadline, and a store under sustained pressure can exceed it, so the ramp
+# retries and reports how often (that signal is the point).
+SPRAY_RETRIES=${E2B_REHEARSAL_SPRAY_RETRIES:-3}
 # E2B_REHEARSAL_FLAG_ROLLBACK=1 rehearses a format-affecting setting: the old
 # binary writes the older header format, the new one reads it, the new one
 # writes the current format, the old one reads it, and then a backfill rewrites
@@ -67,6 +71,13 @@ NEW_PEER_BIN=s3-rehearsal-peer-$(basename "$NEW")
 
 echo "== shipping to $VM ==" >&2
 $SSH 'mkdir -p ~/s3-rehearsal/bin ~/s3-rehearsal/manifests' >/dev/null
+
+# Unlink our own binaries before upload: scp cannot overwrite a binary a
+# lingering process still has mapped (it fails with ETXTBSY), and unlinking is
+# what makes the upload work. Only our four names - the directory is shared
+# with other lanes working on the same VM.
+$SSH "rm -f ~/s3-rehearsal/bin/$OLD_BIN ~/s3-rehearsal/bin/$NEW_BIN ~/s3-rehearsal/bin/$OLD_PEER_BIN ~/s3-rehearsal/bin/$NEW_PEER_BIN" >/dev/null
+
 $SCP "$DIR/bin/$OLD_BIN" "$DIR/bin/$NEW_BIN" "$DIR/bin/$OLD_PEER_BIN" "$DIR/bin/$NEW_PEER_BIN" "$VM:~/s3-rehearsal/bin/" >/dev/null
 
 # The remote script runs the phases inside the VM, where Silo and the box are:
@@ -245,7 +256,7 @@ fi
 
 if [ "${SPRAY:-0}" -gt 0 ]; then
 	echo "== object-count shape: $SPRAY small objects =="
-	phase "$NEW" spray --storage-url "$STORE" --prefix "$RUN/objects" --count "$SPRAY" --concurrency "$SPRAY_CONCURRENCY"
+	phase "$NEW" spray --storage-url "$STORE" --prefix "$RUN/objects" --count "$SPRAY" --concurrency "$SPRAY_CONCURRENCY" --retry-attempts "$SPRAY_RETRIES"
 	phase "$NEW" count --storage-url "$STORE" --prefix "$RUN/objects"
 	# A destructive operation gets a dry run first: it must report the same
 	# objects and bytes the purge then removes.
@@ -340,7 +351,8 @@ while [ "$i" -le "$SOAK" ]; do
 		run_id="$RUN-$i"
 	fi
 
-	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' SPRAY_CONCURRENCY='$SPRAY_CONCURRENCY' FAULT='$FAULT' FLAG_ROLLBACK='$FLAG_ROLLBACK' PEER='$PEER' OLD_PEER_BIN='$OLD_PEER_BIN' NEW_PEER_BIN='$NEW_PEER_BIN' sh ~/s3-rehearsal/remote-matrix.sh" || failed=1
+	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' SPRAY_CONCURRENCY='$SPRAY_CONCURRENCY' SPRAY_RETRIES='$SPRAY_RETRIES' FAULT='$FAULT' FLAG_ROLLBACK='$FLAG_ROLLBACK' PEER='$PEER' OLD_PEER_BIN='$OLD_PEER_BIN' NEW_PEER_BIN='$NEW_PEER_BIN' sh ~/s3-rehearsal/remote-matrix.sh" || failed=1
+
 
 	i=$((i + 1))
 done

@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -334,6 +335,53 @@ func sprayConcurrency(requested int) int {
 	return min(max(runtime.NumCPU()/2, 4), 32)
 }
 
+// putWithRetry stores one object, retrying a failed write up to attempts times.
+// The storage layer bounds every write with its own deadline (awsWriteTimeout,
+// 30s); a store under sustained pressure can exceed it - the 1M-object ramp
+// found exactly that at ~725k objects - and production retries such writes. The
+// rehearsal retries too and reports how often it had to, so saturation stays
+// visible instead of being hidden.
+func putWithRetry(ctx context.Context, blob storage.Blob, data []byte, attempts int) (int, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var err error
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = blob.Put(ctx, data); err == nil {
+			return attempt, nil
+		}
+
+		if attempt < attempts {
+			select {
+			case <-ctx.Done():
+				return attempt, ctx.Err()
+			case <-time.After(retryBackoff(attempt)):
+			}
+		}
+	}
+
+	return attempts, err
+}
+
+// retrySummary renders how often writes had to be retried, which is the
+// saturation signal a large ramp must not hide.
+func retrySummary(retries, objects int64) string {
+	if retries == 0 {
+		return "no retries"
+	}
+
+	pct := float64(retries) / float64(objects) * 100
+
+	return fmt.Sprintf("%d retries (%.2f%% of writes)", retries, pct)
+}
+
+// retryBackoff is the pause before retry number attempt (1-based).
+func retryBackoff(attempt int) time.Duration {
+	return min(time.Duration(attempt)*250*time.Millisecond, 2*time.Second)
+}
+
 // percentile returns the p-quantile (0..1) of a sorted duration slice.
 func percentile(sorted []time.Duration, p float64) time.Duration {
 	if len(sorted) == 0 {
@@ -371,6 +419,7 @@ func spray(args []string) {
 	size := fs.Int64("bytes", 0, "bytes per object (overrides the profile)")
 	cleanup := fs.Bool("cleanup", false, "delete the sprayed objects afterwards")
 	concurrency := fs.Int("concurrency", 0, "parallel writers (default: cores/2, 4..32)")
+	retryAttempts := fs.Int("retry-attempts", 3, "attempts per object write before failing")
 	_ = fs.Parse(args)
 
 	started := time.Now()
@@ -392,8 +441,9 @@ func spray(args []string) {
 	done := make(chan struct{})
 
 	var (
-		once sync.Once
-		wg   sync.WaitGroup
+		once    sync.Once
+		wg      sync.WaitGroup
+		retries atomic.Int64
 	)
 
 	report := func(err error) {
@@ -420,12 +470,15 @@ func spray(args []string) {
 				}
 
 				t0 := time.Now()
-				if err := blob.Put(ctx, payloadData(int64(i)+1, objectSize)); err != nil {
-					report(fmt.Errorf("object %d: %w", i, err))
+
+				attemptsUsed, err := putWithRetry(ctx, blob, payloadData(int64(i)+1, objectSize), *retryAttempts)
+				if err != nil {
+					report(fmt.Errorf("object %d after %d attempts: %w", i, attemptsUsed, err))
 
 					return
 				}
 
+				retries.Add(int64(attemptsUsed - 1))
 				local = append(local, time.Since(t0))
 			}
 
@@ -463,8 +516,9 @@ produce:
 	elapsed := time.Since(started)
 	written := int64(n) * objectSize
 
-	detail := fmt.Sprintf("wrote %d objects of %d B in %s with %d workers (%.0f objects/s, p50 %s, p95 %s, p99 %s)",
+	detail := fmt.Sprintf("wrote %d objects of %d B in %s with %d workers (%.0f objects/s, %s, p50 %s, p95 %s, p99 %s)",
 		n, objectSize, elapsed.Round(time.Millisecond), workers, float64(n)/elapsed.Seconds(),
+		retrySummary(retries.Load(), int64(n)),
 		percentile(durations, 0.50).Round(time.Microsecond),
 		percentile(durations, 0.95).Round(time.Microsecond),
 		percentile(durations, 0.99).Round(time.Microsecond))
