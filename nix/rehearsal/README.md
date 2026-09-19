@@ -113,19 +113,38 @@ same profiles (`tiny`/`small`/`big`/`auto`):
 
 ## Evidence (2026-09-19, dev VM, Silo)
 
-Object-count ramp (first scale numbers, 32 writers): 100,000 x 4 KiB written in
-5m46s (**289 objects/s**, p50 89 ms, p95 191 ms, p99 649 ms); the inventory
-counted exactly 100,000 objects / 390.6 MiB in **16.0 s**; the prefix purge
-took **1m16.6 s**; the inventory afterwards read 0 in 17 ms. The 1M run and the
-migration/peer legs are recorded below as they complete.
-
 - sequential matrix: green — 8/8 artifacts each way, v5 headers, 16/16 objects
   present on both sides
 - fan-out: 3 concurrent nodes, versions mixed, every write ok and every
   cross-version read 8/8
-- object-count: 1500 × 4 KiB sprayed at p50 18 ms / p95 34 ms / p99 50 ms; the
-  inventory counted exactly 1500 objects (5.9 MiB); the prefix delete took
-  1.7 s and the second inventory read 0
+- object-count ramps (32 writers, store-only writes):
+  - **100k** — 100,000 × 4 KiB written in 5m46s (**289 objects/s**, p50 89 ms,
+    p95 191 ms, p99 649 ms); inventory counted exactly 100,000 objects /
+    390.6 MiB in **16.0 s**; prefix purge **1m16.6 s**; count afterwards 0 in
+    17 ms
+  - **725k (first 1M attempt)** — the spray stopped at 725,090 objects with
+    `PutObject ... context deadline exceeded`: the repository's own write budget
+    (`awsWriteTimeout`, 30 s, `packages/shared/pkg/storage/storage_aws.go`)
+    firing once the single node had accumulated ~725k objects / 2.8 GiB. The
+    ramp now retries writes (bounded, reported as "N retries (x% of writes)") so
+    that saturation stays visible instead of killing a multi-hour run. The
+    inventory of those 725,090 objects took **145.2 s** and the purge
+    **12m31.7 s** (≈1.04 ms/object, about 5× the per-object listing cost)
+- small-shape object-count (1500 × 4 KiB): p50 18 ms / p95 34 ms / p99 50 ms;
+  inventory exactly 1500 (5.9 MiB); prefix delete 1.7 s; count afterwards 0
+- flag rollback (`E2B_REHEARSAL_FLAG_ROLLBACK=1`): the old build wrote v4
+  headers → the new build read them (`v4×2`); the new build wrote v5 → the old
+  build read them (`v5×2`); `migrate` rewrote the v4 artifacts into v5
+  (8.0 MiB in 1.05 s); **both** builds then read the backfilled artifacts
+  (`v5×2`) and existence was 4/4 on both sides — nothing stranded
+- peer prefetch (`E2B_REHEARSAL_PEER=1`): old-build peer → new-build client,
+  8.0 MiB, peer p50 182.8 ms vs the same ranges read from the store 73.7 ms;
+  new-build peer → old-build client, 8.0 MiB, peer p50 238.2 ms vs 78.2 ms.
+  Every range was byte-compared against the store and the whole file hashed in
+  both directions. The peer is *slower* here on purpose: this harness's peer
+  reads through to the same store instead of serving from a warm template
+  cache, so the leg proves the protocol, the mixed-version interop and the
+  verification — not the cache benefit production gets
 - fault injection: the tampered artifact was refused loudly ("magic number
   mismatch") in both soak rounds — never silently accepted
 - NFS: caches land on `/mnt/nfs-cache/<run>/<node>` (105 files, 85 MiB in the
