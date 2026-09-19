@@ -85,7 +85,9 @@ verify wiring.
 - Suite run lock — **lane E**: `run`/`calibrate` take `flock` on
   `$PERF_LOG_ROOT/.suite.lock` before the run dir is created; a second run
   refuses (exit 40) unless `PERF_SUITE_WAIT=<s>` is set for a bounded wait
-  (a real wait records a `note` with `wait_s`).
+  (a real wait records a `note` with `wait_s`). Any new module invocation
+  added to the dispatch must carry `9>&-` (fd 9 must never reach modules,
+  VMs or daemons — `0e896a341`; lane C 2385 watch item).
 - Stale-holder containment — **lane E** (**retraction of the earlier
   move-aside recipe**, reviewer1 2373): a live child can still hold the lock's
   open file description after its suite exits — do **not** move/delete the
