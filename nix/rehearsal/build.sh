@@ -57,3 +57,13 @@ CGO_ENABLED=0 go build -ldflags "-X main.version=$VERSION" -o "$DIR/$OUTDIR/s3-r
 CGO_ENABLED=0 go build -ldflags "-X main.version=$VERSION" -o "$DIR/$OUTDIR/s3-rehearsal-peer-$NAME" ./peer
 
 echo "built $OUTDIR/s3-rehearsal-$NAME and $OUTDIR/s3-rehearsal-peer-$NAME ($VERSION)"
+
+# The runtime's own migration tool, when the checkout has one. The flag-rollback
+# leg drives it, so what gets rehearsed is the product path rather than a
+# harness-only primitive; older checkouts simply do not have it.
+if [ -d "$CHECKOUT/packages/orchestrator/cmd/migrate-builds" ]; then
+	(cd "$CHECKOUT/packages/orchestrator" && CGO_ENABLED=0 go build -o "$DIR/$OUTDIR/s3-rehearsal-migrate-$NAME" ./cmd/migrate-builds)
+	echo "built $OUTDIR/s3-rehearsal-migrate-$NAME ($VERSION)"
+else
+	echo "note: $CHECKOUT has no cmd/migrate-builds; the flag-rollback leg will use the harness migrate phase"
+fi

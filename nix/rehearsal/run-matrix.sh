@@ -80,6 +80,16 @@ $SSH "rm -f ~/s3-rehearsal/bin/$OLD_BIN ~/s3-rehearsal/bin/$NEW_BIN ~/s3-rehears
 
 $SCP "$DIR/bin/$OLD_BIN" "$DIR/bin/$NEW_BIN" "$DIR/bin/$OLD_PEER_BIN" "$DIR/bin/$NEW_PEER_BIN" "$VM:~/s3-rehearsal/bin/" >/dev/null
 
+# The runtime's own migration tool, when the checkout under test has one: the
+# flag-rollback leg drives it, so the product path is what gets rehearsed.
+MIGRATE_BIN=s3-rehearsal-migrate-$(basename "$NEW")
+if [ -f "$DIR/bin/$MIGRATE_BIN" ]; then
+	$SSH "rm -f ~/s3-rehearsal/bin/$MIGRATE_BIN" >/dev/null
+	$SCP "$DIR/bin/$MIGRATE_BIN" "$VM:~/s3-rehearsal/bin/" >/dev/null
+else
+	MIGRATE_BIN=""
+fi
+
 # The remote script runs the phases inside the VM, where Silo and the box are:
 # it is the mixed-version matrix and it records one JSON result per phase.
 cat > "$DIR/bin/remote-matrix.sh" <<'REMOTE'
@@ -288,16 +298,57 @@ if [ "${PEER:-0}" = "1" ]; then
 fi
 
 if [ "${FLAG_ROLLBACK:-0}" = "1" ]; then
-	echo "== flag rollback: older write format, then backfill, read back by both =="
+	echo "== flag rollback: older write format, backfill with the runtime's tool, read back by both =="
 	# 1) the old binary writes the older header format; the new binary must read it
-	phase "$OLD" write --storage-url "$STORE" --prefix "$RUN/flagroll/v4" --manifest "$MAN/$RUN-v4.json" --profile "$PROFILE" --header-version 4
+	phase "$OLD" write --storage-url "$STORE" --prefix "$RUN/flagroll/v4" --manifest "$MAN/$RUN-v4.json" --profile "$PROFILE" --header-version 4 --layout product
 	phase "$NEW" read --manifest "$MAN/$RUN-v4.json"
 	# 2) the new binary writes the current format; the old binary must read that too
-	phase "$NEW" write --storage-url "$STORE" --prefix "$RUN/flagroll/v5" --manifest "$MAN/$RUN-v5.json" --profile "$PROFILE"
+	phase "$NEW" write --storage-url "$STORE" --prefix "$RUN/flagroll/v5" --manifest "$MAN/$RUN-v5.json" --profile "$PROFILE" --layout product
 	phase "$OLD" read --manifest "$MAN/$RUN-v5.json"
 	require_rollback_read "$(tail -n 1 "$OUT")" "flag-rollback leg"
-	# 3) backfill the older artifacts onto the current format
-	phase "$NEW" migrate --manifest "$MAN/$RUN-v4.json" --header-version 5
+
+	# 3) backfill the older artifacts onto the current format. When the checkout
+	# under test ships the runtime's own migrate-builds, that is what runs - the
+	# product path, not a harness primitive; older checkouts fall back to the
+	# harness phase, which says so in the report.
+	if [ -n "${MIGRATE_BIN:-}" ] && [ -x "$BASE/bin/$MIGRATE_BIN" ]; then
+		echo "== backfill with the runtime's own migrate-builds =="
+		jq -r '.entries[].build' "$MAN/$RUN-v4.json" | sort -u > "$BASE/migrate-$RUN-builds.txt"
+
+		if "$BASE/bin/$MIGRATE_BIN" -builds-file "$BASE/migrate-$RUN-builds.txt" \
+			-storage-url "$STORE" -apply -report "$BASE/migrate-$RUN-report.json" \
+			>"$BASE/migrate-$RUN.out" 2>&1; then
+			tail -n 1 "$BASE/migrate-$RUN-report.json" \
+				| jq -c '{phase:"migrate",version:"product:migrate-builds",outcome:"ok",
+					detail:("product migrate-builds: migrated=" + ((.summary.migrate // 0)|tostring)
+						+ " skipped=" + ((.summary.skip // 0)|tostring)
+						+ " missing=" + ((.summary.missing // 0)|tostring))}' >>"$OUT" \
+				|| printf '%s\n' '{"phase":"migrate","version":"product:migrate-builds","outcome":"ok","detail":"product migrate-builds ran (no summary)"}' >>"$OUT"
+		else
+			printf '%s\n' '{"phase":"migrate","version":"product:migrate-builds","outcome":"error","detail":"product migrate-builds failed; see the VM log"}' >>"$OUT"
+			failed=1
+		fi
+
+		# The reconcile pass is the "before anything is removed" check: every
+		# reference the headers carry must resolve to an object that verifies.
+		if "$BASE/bin/$MIGRATE_BIN" -mode reconcile -builds-file "$BASE/migrate-$RUN-builds.txt" \
+			-storage-url "$STORE" -verify -report "$BASE/reconcile-$RUN-report.json" \
+			>"$BASE/reconcile-$RUN.out" 2>&1; then
+			tail -n 1 "$BASE/reconcile-$RUN-report.json" \
+				| jq -c '{phase:"reconcile",version:"product:migrate-builds",outcome:"ok",
+					detail:("product reconcile: complete=" + ((.summary.complete // 0)|tostring)
+						+ " missing-payload=" + ((.summary["missing-payload"] // 0)|tostring)
+						+ " mismatch=" + ((.summary.mismatch // 0)|tostring))}' >>"$OUT" \
+				|| printf '%s\n' '{"phase":"reconcile","version":"product:migrate-builds","outcome":"ok","detail":"product reconcile ran (no summary)"}' >>"$OUT"
+		else
+			printf '%s\n' '{"phase":"reconcile","version":"product:migrate-builds","outcome":"error","detail":"product reconcile failed; see the VM log"}' >>"$OUT"
+			failed=1
+		fi
+	else
+		printf '%s\n' '{"phase":"migrate","version":"harness:migrate",outcome:"ok","detail":"checkout has no migrate-builds; used the harness migrate phase"}'
+		phase "$NEW" migrate --manifest "$MAN/$RUN-v4.json" --header-version 5
+	fi
+
 	# 4) after the rewrite both readers must still read them, and nothing may be stranded
 	phase "$OLD" read --manifest "$MAN/$RUN-v4.json"
 	phase "$NEW" read --manifest "$MAN/$RUN-v4.json"
@@ -351,7 +402,7 @@ while [ "$i" -le "$SOAK" ]; do
 		run_id="$RUN-$i"
 	fi
 
-	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' SPRAY_CONCURRENCY='$SPRAY_CONCURRENCY' SPRAY_RETRIES='$SPRAY_RETRIES' FAULT='$FAULT' FLAG_ROLLBACK='$FLAG_ROLLBACK' PEER='$PEER' OLD_PEER_BIN='$OLD_PEER_BIN' NEW_PEER_BIN='$NEW_PEER_BIN' sh ~/s3-rehearsal/remote-matrix.sh" || failed=1
+	$SSH "RUN='$run_id' PROFILE='$PROFILE' OLD_BIN='$OLD_BIN' NEW_BIN='$NEW_BIN' STORE='$STORE' NFS='$NFS' NODES='$NODES' SPRAY='$SPRAY' SPRAY_CONCURRENCY='$SPRAY_CONCURRENCY' SPRAY_RETRIES='$SPRAY_RETRIES' FAULT='$FAULT' FLAG_ROLLBACK='$FLAG_ROLLBACK' PEER='$PEER' OLD_PEER_BIN='$OLD_PEER_BIN' NEW_PEER_BIN='$NEW_PEER_BIN' MIGRATE_BIN='$MIGRATE_BIN' sh ~/s3-rehearsal/remote-matrix.sh" || failed=1
 
 
 	i=$((i + 1))

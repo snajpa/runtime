@@ -105,7 +105,7 @@ same profiles (`tiny`/`small`/`big`/`auto`):
 |--------|-----|
 | `E2B_REHEARSAL_NODES=n` | `n` concurrent nodes *mixing versions*: even nodes write with the new binary, odd with the old, then each node reads its neighbour's artifacts with the opposite version, plus existence checks |
 | `E2B_REHEARSAL_SPRAY=n` | object-count shape: `n` small objects (4 KiB) written by `E2B_REHEARSAL_SPRAY_CONCURRENCY` workers (default cores/2, 4..32), with throughput and p50/p95/p99; then the inventory (`count`), a **dry run** of the destructive step (`purge --dry-run`), the real `purge` (the GC/delete cost) and a second inventory proving the prefix is empty |
-| `E2B_REHEARSAL_FLAG_ROLLBACK=1` | format-affecting setting rehearsed end to end: the old build writes the older header format, the new build reads it, the new build writes the current format, the old build reads that, then `migrate` backfills the older artifacts onto the current format — after which both readers must still read them and nothing may be stranded |
+| `E2B_REHEARSAL_FLAG_ROLLBACK=1` | format-affecting setting rehearsed end to end: the old build writes the older header format (in the **product layout**, so the runtime's own tooling can read it), the new build reads it, the new build writes the current format, the old build reads that, then the **runtime's `migrate-builds`** backfills the older artifacts and a `reconcile` pass confirms every reference resolves — after which both readers must still read them and nothing may be stranded. Checkouts without the tool fall back to the harness `migrate` phase and say so |
 | `E2B_REHEARSAL_PEER=1` | peer prefetch with two node processes: an old-build peer serves over the repository's chunk service, a new-build client fetches ranges (and the other way around), every range is byte-compared against the store and hashed, and both latencies are reported |
 | `E2B_REHEARSAL_FAULT=1` | fault injection: overwrite one artifact with different bytes, then read it cold with the other version; the verdict is `ok` only if the tampered entry itself is *named* in a loud refusal or a misread — an unrelated refusal is not detection |
 | `E2B_REHEARSAL_NFS=1` | put every node's chunk cache on the VM's NFS export (`/mnt/nfs-cache`) instead of a local temp dir |
@@ -154,6 +154,13 @@ same profiles (`tiny`/`small`/`big`/`auto`):
   reads through to the same store instead of serving from a warm template
   cache, so the leg proves the protocol, the mixed-version interop and the
   verification — not the cache benefit production gets
+- flag rollback through the **runtime's own tool** (`nix/rehearsal` writes the
+  product layout, the tool does the work): old build wrote 4 artifacts with v4
+  headers → new build read them (`v4×4`); new build wrote v5 → old build read
+  them (`v5×4`); `migrate-builds -apply` reported **migrated=4 skipped=0
+  missing=0**; a `reconcile -verify` pass reported **complete=4
+  missing-payload=0 mismatch=0**; both builds then read all four back
+  (`v5×4`) with **8/8 objects present on both sides** — nothing stranded
 - fault injection: the tampered artifact was refused loudly ("magic number
   mismatch") in both soak rounds — never silently accepted
 - NFS: caches land on `/mnt/nfs-cache/<run>/<node>` (105 files, 85 MiB in the

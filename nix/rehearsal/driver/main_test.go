@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
@@ -351,6 +353,54 @@ func TestHumanBytes(t *testing.T) {
 		if got := humanBytes(tc.in); got != tc.want {
 			t.Errorf("humanBytes(%d) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestArtifactPlans(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+
+	// The flat layout is the harness's own shape: one artifact per build.
+	flat, err := artifactPlans(layoutFlat, "run-1", id)
+	if err != nil {
+		t.Fatalf("flat plans: %v", err)
+	}
+
+	wantFlat := "run-1/builds/" + id.String() + "/" + storage.RootfsName
+	if len(flat) != 1 || flat[0].payload != wantFlat || flat[0].header != wantFlat+storage.HeaderSuffix {
+		t.Fatalf("flat plans = %+v, want one plan at %s", flat, wantFlat)
+	}
+
+	// The product layout is what the runtime's own tooling reads: both artifact
+	// kinds, payloads under the codec suffix, headers beside them.
+	product, err := artifactPlans(layoutProduct, "run-1", id)
+	if err != nil {
+		t.Fatalf("product plans: %v", err)
+	}
+
+	wantPayload := map[string]string{
+		storage.RootfsName:  id.String() + "/" + storage.RootfsName + ".zstd",
+		storage.MemfileName: id.String() + "/" + storage.MemfileName + ".zstd",
+	}
+
+	if len(product) != len(wantPayload) {
+		t.Fatalf("product plans = %d, want %d (rootfs + memfile)", len(product), len(wantPayload))
+	}
+
+	for _, plan := range product {
+		if plan.payload != wantPayload[plan.name] {
+			t.Errorf("%s payload = %s, want %s", plan.name, plan.payload, wantPayload[plan.name])
+		}
+
+		wantHeader := id.String() + "/" + plan.name + storage.HeaderSuffix
+		if plan.header != wantHeader {
+			t.Errorf("%s header = %s, want %s", plan.name, plan.header, wantHeader)
+		}
+	}
+
+	if _, err := artifactPlans("nonsense", "run-1", id); err == nil {
+		t.Fatal("an unknown layout must fail loudly")
 	}
 }
 
