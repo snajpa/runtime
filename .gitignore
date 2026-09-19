@@ -18,8 +18,9 @@ go.work.sum
 /e2b-dev-vm/
 
 # `go build ./nix/rehearsal/...` (and the push gate's build step) writes the
-# rehearsal driver's binary into the working directory.
+# rehearsal driver's and peer's binaries into the working directory.
 /driver
+/peer
 
 # `go build ./cmd/migrate-builds` from packages/orchestrator drops a binary
 # inside the package directory; it is a build artifact, never a source file.
