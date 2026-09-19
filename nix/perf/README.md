@@ -1,7 +1,8 @@
 # nix/perf — R23 performance-regression suite
 
-Orchestrator skeleton for the frozen R23 design (v1.0, reviewer1 v1-PASS
-2026-09-19). The design record lives with the project notes
+Orchestrator skeleton for the R23 design (v1.0 storage scope reviewer1 v1-PASS
+2026-09-19; v1.1 adds the runtime W7/W8 families — snapshot-resume + post-resume —
+under reviewer hardening). The design record lives with the project notes
 (`~/ai/docs/projects/e2b/subprojects/perf-regression/`); this directory is the
 product-tree implementation.
 
@@ -103,7 +104,7 @@ verify wiring.
 Dispatch v1 (2026-09-19): the run path is wired end-to-end — per cell
 (oracle-first), 2 warmup + 12 measured ABBA/BAAB blocks with emitted `block`
 records, module `run` legs, and each leg's `samples.jsonl` fed to the T1
-emitter. Modules landed: W4 (lane B) · W6 (lane A); W1 pending (lane D).
+emitter. Modules landed: W4 (lane B) · W6 (lane A) · W1 scaffold (`modules/w1.sh`, fail-closed; lane D runner semantics + lane C capture/device-window fill-ins).
 `emit.sh` + `compare.sh` + `busy-ref.sh` + `guest-capabilities.sh` + the
 capture wrapper are in. `selftest`, `--dry-run`, `calibrate`, `compare` and
 `report --replay|--verify` work today.
