@@ -9,7 +9,9 @@ printf '### S3 rehearsal: %s\n\n' "$RUN"
 printf '| phase | version | outcome | objects | bytes | s | detail |\n'
 printf '|-------|---------|---------|--------:|------:|--:|--------|\n'
 
-python3 - <<'PY'
+# The JSONL results arrive on stdin, so the program cannot also come from a
+# stdin heredoc: hand the program in on fd 3 and leave stdin to the data.
+python3 /dev/fd/3 3<<'PY'
 import json
 import sys
 
