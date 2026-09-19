@@ -210,8 +210,37 @@ func frameTable(ctx context.Context, provider storage.StorageProvider, headerPat
 }
 
 // readRange reads [off, off+length) the way a node does: chunk-aligned range
-// readers whose Close verifies every frame's CRC.
+// readers whose Close verifies every frame's CRC. The requested range itself
+// may be unaligned (callers read partial chunks), so the enclosing aligned
+// window is read and the requested slice returned.
 func readRange(ctx context.Context, provider storage.StorageProvider, path string, off, length int64, ft *storage.FrameTable) ([]byte, error) {
+	start, end := alignedWindow(off, length)
+
+	data, err := readAligned(ctx, provider, path, start, end-start, ft)
+	if err != nil {
+		return nil, err
+	}
+
+	if int64(len(data)) < off-start+length {
+		return nil, fmt.Errorf("read %d..%d returned only %d bytes", off, off+length, len(data))
+	}
+
+	return data[off-start : off-start+length], nil
+}
+
+// alignedWindow returns the chunk-aligned window that encloses [off, off+length),
+// which is what the cache layer's range reader needs; the caller then slices the
+// requested part out of it.
+func alignedWindow(off, length int64) (int64, int64) {
+	chunk := int64(storage.MemoryChunkSize)
+	start := off - off%chunk
+	end := (off + length + chunk - 1) / chunk * chunk
+
+	return start, end
+}
+
+// readAligned reads a chunk-aligned window.
+func readAligned(ctx context.Context, provider storage.StorageProvider, path string, off, length int64, ft *storage.FrameTable) ([]byte, error) {
 	seekable, err := provider.OpenSeekable(ctx, path)
 	if err != nil {
 		return nil, err

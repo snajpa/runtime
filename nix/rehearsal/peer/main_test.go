@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
 func TestPlanRanges(t *testing.T) {
@@ -66,5 +68,37 @@ func TestHumanBytes(t *testing.T) {
 
 	if got := humanBytes(1 << 20); got != "1.0 MiB" {
 		t.Errorf("humanBytes(1MiB) = %q", got)
+	}
+}
+
+func TestAlignedWindow(t *testing.T) {
+	t.Parallel()
+
+	chunk := int64(storage.MemoryChunkSize)
+
+	cases := []struct {
+		name        string
+		off, length int64
+		wantStart   int64
+		wantEnd     int64
+	}{
+		{"aligned start, short", 0, 1024, 0, chunk},
+		{"aligned exact", 0, chunk, 0, chunk},
+		{"unaligned start", 1, 512, 0, chunk},
+		{"crosses boundary", chunk - 1, 2, 0, 2 * chunk},
+		{"second window", chunk, 1024, chunk, 2 * chunk},
+		{"unaligned, spans three", chunk + 7, chunk + 1, chunk, 3 * chunk},
+	}
+
+	for _, tc := range cases {
+		gotStart, gotEnd := alignedWindow(tc.off, tc.length)
+		if gotStart != tc.wantStart || gotEnd != tc.wantEnd {
+			t.Errorf("%s: alignedWindow(%d, %d) = (%d, %d), want (%d, %d)",
+				tc.name, tc.off, tc.length, gotStart, gotEnd, tc.wantStart, tc.wantEnd)
+		}
+
+		if gotStart > tc.off || gotEnd < tc.off+tc.length {
+			t.Errorf("%s: window (%d, %d) does not enclose [%d, %d)", tc.name, gotStart, gotEnd, tc.off, tc.off+tc.length)
+		}
 	}
 }
