@@ -487,3 +487,31 @@ func TestCompatWindow(t *testing.T) {
 		t.Fatal("an unsupported header version must be refused loudly")
 	}
 }
+
+func TestRunMigrateRejectsOutOfRangeRate(t *testing.T) {
+	t.Parallel()
+
+	_, _, dir := testProvider(t)
+
+	for _, rate := range []int{-1, maxRatePerSecond + 1} {
+		opts := migrateOptions()
+		opts.builds = buildList{uuid.New().String()}
+		opts.storageURL = "file://" + dir
+		opts.rate = rate
+
+		err := runMigrate(t.Context(), opts)
+		if err == nil || !strings.Contains(err.Error(), "-rate") {
+			t.Fatalf("runMigrate(rate=%d) = %v, want the -rate range error", rate, err)
+		}
+	}
+
+	// The bound itself stays valid: 1e9/s is a 1 ns ticker interval.
+	opts := migrateOptions()
+	opts.builds = buildList{uuid.New().String()}
+	opts.storageURL = "file://" + dir
+	opts.rate = maxRatePerSecond
+
+	if err := runMigrate(t.Context(), opts); err != nil {
+		t.Fatalf("runMigrate(rate=%d) = %v, want success at the bound", maxRatePerSecond, err)
+	}
+}

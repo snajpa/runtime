@@ -57,6 +57,11 @@ const (
 	defaultConcurrency = 4
 	defaultFrameSizeKB = 2048
 	defaultLevel       = 2
+
+	// maxRatePerSecond bounds -rate to values whose ticker interval
+	// (time.Second / rate) still fits: above it the division truncates to a
+	// zero interval and time.NewTicker panics.
+	maxRatePerSecond = 1_000_000_000
 )
 
 type buildList []string
@@ -158,7 +163,7 @@ func parseFlags() options {
 	flag.BoolVar(&opts.confirm, "confirm", false, "required to perform any deletion")
 
 	flag.IntVar(&opts.concurrency, "concurrency", defaultConcurrency, "artifacts processed in parallel")
-	flag.IntVar(&opts.rate, "rate", 0, "maximum artifacts started per second (0 = unbounded)")
+	flag.IntVar(&opts.rate, "rate", 0, "maximum artifacts started per second (0 = unbounded; max 1000000000)")
 	flag.IntVar(&opts.limit, "limit", 0, "stop after this many artifacts (0 = no limit)")
 
 	flag.Uint64Var(&opts.targetHeaderVersion, "target-header-version", defaultTargetHeaderVersion, "header format to migrate to (4 or 5)")

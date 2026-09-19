@@ -544,6 +544,12 @@ func runMigrate(ctx context.Context, opts options) error {
 		return fmt.Errorf("-target-header-version %d: only 4 (V4) and 5 (V5) are supported", opts.targetHeaderVersion)
 	}
 
+	// -rate above this bound would truncate its ticker interval to zero and
+	// panic in time.NewTicker; refuse it loudly instead.
+	if opts.rate < 0 || opts.rate > maxRatePerSecond {
+		return fmt.Errorf("-rate %d: outside the supported range 0 (unbounded) to %d per second", opts.rate, maxRatePerSecond)
+	}
+
 	if opts.deleteSuperseded && opts.dryRun {
 		log.Printf("migrate-builds: note: -delete-superseded with -dry-run reports the deletions without performing them")
 	}
