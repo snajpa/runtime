@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://e2b.local/perf/perf-2.schema.json",
+  "title": "perf/2 T1 record (one line of perf-runs.jsonl)",
+  "description": "Draft validator for lane F's perf/2 stream (result-schema.md v0.2, R23 v1.0-PASS). The harness validates every record before the write; renders (T2/T3) consume validated records only.",
+  "type": "object",
+  "required": ["schema", "record", "run_id", "ts", "phase", "mode", "suite"],
+  "properties": {
+    "schema": {"const": "perf/2"},
+    "record": {"enum": ["env", "capability", "oracle", "resolution", "block", "sample", "artifact", "note"]},
+    "run_id": {"type": "string", "pattern": "^run-[0-9]{8}T[0-9]{6}$"},
+    "ts": {"type": "string", "format": "date-time"},
+    "phase": {"enum": ["calibrate", "run", "confirm", "diagnose", "report"]},
+    "mode": {"enum": ["clean", "confirmation", "diagnostic"]},
+    "suite": {
+      "type": "object",
+      "required": ["ref", "sha"],
+      "properties": {"ref": {"type": "string"}, "sha": {"$ref": "#/$defs/sha"}}
+    },
+
+    "env_class": {"enum": ["quiet", "busy"]},
+    "host": {
+      "type": "object",
+      "required": ["fingerprint"],
+      "properties": {
+        "fingerprint": {"$ref": "#/$defs/sha"},
+        "uname": {"type": "string"},
+        "kernel_cmdline_sha256": {"$ref": "#/$defs/sha"},
+        "kernel_config_sha256": {"$ref": "#/$defs/sha"},
+        "mitigations": {"type": "string"},
+        "cpu_model": {"type": "string"},
+        "microcode": {"type": "string"},
+        "governor": {"type": "string"},
+        "backing_layout": {"type": "string"}
+      }
+    },
+    "cpu_set": {"type": "object"},
+    "limits": {"type": "object"},
+    "clock": {"type": "object"},
+    "rights": {"type": "object"},
+    "tools": {"type": "object", "description": "per environment/side: {version, sha256}"},
+    "busy_load": {
+      "type": "object",
+      "required": ["recipe", "params_digest"],
+      "properties": {"recipe": {"type": "string"}, "params_digest": {"$ref": "#/$defs/sha"}}
+    },
+    "disk_guard": {
+      "type": "object",
+      "required": ["path", "free_gb", "floor_gb", "tmpfs"],
+      "properties": {
+        "path": {"type": "string"},
+        "free_gb": {"type": "number"},
+        "floor_gb": {"type": "number"},
+        "tmpfs": {"type": "boolean"}
+      }
+    },
+    "lock": {
+      "type": "object",
+      "required": ["path", "scope", "wait_s", "acquired"],
+      "properties": {
+        "path": {"type": "string"},
+        "scope": {"type": "string"},
+        "wait_s": {"type": "number"},
+        "acquired": {"type": "boolean"}
+      }
+    },
+    "replay_cmd": {"type": "string"},
+    "cmds": {"type": "array", "items": {"type": "string"}},
+    "env_vars": {
+      "type": "object",
+      "properties": {"path": {"type": "string"}, "sha256": {"$ref": "#/$defs/sha"}}
+    },
+    "seeds": {
+      "type": "object",
+      "properties": {"block_order": {"type": "integer"}, "bootstrap": {"type": "integer"}}
+    },
+
+    "name": {"type": "string"},
+    "status": {"enum": ["available", "unavailable", "permission-denied"]},
+    "requirement": {"enum": ["to_execute", "validity", "optional"]},
+    "substitute": {
+      "type": "object",
+      "properties": {"for": {"type": "string"}, "via": {"type": "string"}}
+    },
+    "baseline": {"enum": ["shared_path", "no_historical_baseline"]},
+    "version": {"type": "string"},
+    "note": {"type": "string"},
+
+    "kind": {"type": "string"},
+    "passed": {"type": "boolean"},
+    "detail": {"type": "string"},
+
+    "metric": {"$ref": "#/$defs/metric"},
+    "sample_count": {"type": "integer", "minimum": 1},
+    "bands": {"$ref": "#/$defs/bands"},
+    "method": {"const": "fixed"},
+    "fitted": {"const": false},
+    "discriminability": {
+      "type": "object",
+      "required": ["able_to_separate_warn_fail", "n", "ci_level"],
+      "properties": {
+        "able_to_separate_warn_fail": {"type": "boolean"},
+        "n": {"type": "integer"},
+        "ci_level": {"type": "number"},
+        "rule": {"type": "string"}
+      }
+    },
+    "aa_false_fails": {"type": "integer"},
+
+    "index": {"type": "integer"},
+    "warmup": {"type": "boolean"},
+    "order": {"enum": ["ABBA", "BAAB"]},
+    "namespace": {"type": "string"},
+    "side": {"enum": ["baseline", "candidate"]},
+    "seed": {"type": "integer"},
+
+    "workload": {"type": "string", "pattern": "^W[1-6]$"},
+    "profile": {"type": "string"},
+    "leg": {"enum": ["A", "B", "AA"]},
+    "block": {"type": "integer"},
+    "stage": {"enum": ["warmup", "measure"]},
+    "unit_id": {"type": "string"},
+    "cmd": {"type": "string"},
+    "chunk": {
+      "type": "object",
+      "required": ["i", "n"],
+      "properties": {"i": {"type": "integer", "minimum": 1}, "n": {"type": "integer", "minimum": 1}}
+    },
+    "samples": {"type": "array", "items": {"type": "number"}},
+    "snapshot_id": {"type": "string"},
+    "class": {"enum": ["cold", "warm"]},
+    "window": {"enum": ["first_io", "steady"]},
+    "op_class": {"enum": ["read", "write", "modify", "mixed"]},
+    "scope": {"enum": ["host", "guest"]},
+    "covariates": {
+      "type": "object",
+      "properties": {
+        "load1_host": {"type": "number"},
+        "load1_guest": {"type": "number"},
+        "dev_util": {"type": "number"},
+        "mem_free": {"type": "number"},
+        "clock_mhz": {"type": "number"}
+      }
+    },
+    "artifacts": {"type": "array"},
+
+    "path": {"type": "string"},
+    "sha256": {"$ref": "#/$defs/sha"},
+    "bytes": {"type": "integer"},
+    "retain": {"type": "boolean"},
+
+    "text": {"type": "string"}
+  },
+  "oneOf": [
+    {"properties": {"record": {"const": "env"}}, "required": ["env_class", "host", "tools", "disk_guard"]},
+    {"properties": {"record": {"const": "capability"}}, "required": ["name", "status", "requirement"]},
+    {"properties": {"record": {"const": "oracle"}}, "required": ["kind", "passed"]},
+    {"properties": {"record": {"const": "resolution"}}, "required": ["metric", "sample_count", "bands", "method", "fitted", "discriminability"]},
+    {"properties": {"record": {"const": "block"}}, "required": ["index", "warmup", "order", "namespace", "seed"]},
+    {"properties": {"record": {"const": "sample"}}, "required": ["workload", "profile", "side", "leg", "block", "stage", "metric", "unit_id", "chunk", "samples"]},
+    {"properties": {"record": {"const": "artifact"}}, "required": ["kind", "path", "sha256"]},
+    {"properties": {"record": {"const": "note"}}, "required": ["text"]}
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+    "metric": {
+      "type": "object",
+      "required": ["id", "unit"],
+      "properties": {"id": {"type": "string", "pattern": "^[a-z0-9_]+$"}, "unit": {"type": "string"}}
+    },
+    "bands": {
+      "type": "object",
+      "required": ["warn", "fail"],
+      "properties": {"warn": {"type": "number"}, "fail": {"type": "number"}}
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "schema": "perf/registry/1",
+  "doc": "result-schema.md §9 (v0.2, v1.0-PASS 2026-09-19); ids/units reviewer-owned",
+  "units": ["us", "ms", "s", "MiB", "count", "count/s", "MiB/s", "us/op"],
+  "sources": {
+    "fio": "fio JSON",
+    "perf": "perf-stat",
+    "tool": "product/tool-reported counters",
+    "ext": "external harness sampler"
+  },
+  "metrics": [
+    {"id": "throughput_mib_s", "unit": "MiB/s", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "iops", "unit": "count/s", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "lat_p50_us", "unit": "us", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "lat_p95_us", "unit": "us", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "lat_p99_us", "unit": "us", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "lat_p999_us", "unit": "us", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "lat_max_us", "unit": "us", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "cpu_us_per_op", "unit": "us/op", "scope": ["W1", "W2"], "source": "fio"},
+    {"id": "ctx_switches", "unit": "count", "scope": ["W1", "W2", "W4"], "source": "fio+perf"},
+    {"id": "task_clock_s", "unit": "s", "scope": ["W1", "W2", "W4"], "source": "perf"},
+    {"id": "wall_s", "unit": "s", "scope": ["W4"], "source": "ext"},
+    {"id": "user_cpu_s", "unit": "s", "scope": ["W4"], "source": "ext"},
+    {"id": "sys_cpu_s", "unit": "s", "scope": ["W4"], "source": "ext"},
+    {"id": "peak_rss_mib", "unit": "MiB", "scope": ["W4"], "source": "ext", "mechanism": "getrusage(RUSAGE_CHILDREN).ru_maxrss"},
+    {"id": "scratch_peak_mib", "unit": "MiB", "scope": ["W4"], "source": "ext", "mechanism": "du sampler"},
+    {"id": "migrate_latency_ms", "unit": "ms", "scope": ["W4"], "source": "tool"},
+    {"id": "migrated", "unit": "count", "scope": ["W4"], "source": "tool"},
+    {"id": "skipped", "unit": "count", "scope": ["W4"], "source": "tool"},
+    {"id": "missing", "unit": "count", "scope": ["W4"], "source": "tool"},
+    {"id": "failed", "unit": "count", "scope": ["W4"], "source": "tool"},
+    {"id": "drain_latency_ms", "unit": "ms", "scope": ["W3"], "source": "ext"},
+    {"id": "seal_duration_ms", "unit": "ms", "scope": ["W3"], "source": "tool"},
+    {"id": "fold_duration_ms", "unit": "ms", "scope": ["W3"], "source": "tool"},
+    {"id": "takeover_latency_ms", "unit": "ms", "scope": ["W5"], "source": "ext"},
+    {"id": "contention_wait_ms", "unit": "ms", "scope": ["W5"], "source": "ext"},
+    {"id": "cold_bringup_s", "unit": "s", "scope": ["W6"], "source": "ext"},
+    {"id": "warm_bringup_s", "unit": "s", "scope": ["W6"], "source": "ext"},
+    {"id": "stop_s", "unit": "s", "scope": ["W6"], "source": "ext"}
+  ],
+  "proposed": [
+    {"id": "fault_serve_latency_us", "unit": "us", "scope": ["diagnostic"], "note": "UFFD serve/fault + REMOVE-vs-read under stall"},
+    {"id": "pool_acquire_ms", "unit": "ms", "scope": ["diagnostic"]},
+    {"id": "populate_ms", "unit": "ms", "scope": ["diagnostic"]},
+    {"id": "close_ms", "unit": "ms", "scope": ["diagnostic"]},
+    {"id": "discard_latency_us", "unit": "us", "scope": ["W1", "diagnostic"]},
+    {"id": "zero_latency_us", "unit": "us", "scope": ["W1", "diagnostic"], "note": "blkdiscard -z / BLKZEROOUT — the pre-S-56 hang lens"},
+    {"id": "flush_latency_ms", "unit": "ms", "scope": ["W1"]},
+    {"id": "fsync_latency_ms", "unit": "ms", "scope": ["W1"]}
+  ],
+  "flags": [
+    {"id": "second_flush_silent", "type": "bool", "applies_to": "flush cell", "note": "assertion flag, not a metric"}
+  ],
+  "notes": [
+    "latency is reported per operation class (read / write / modify-rmw / mixed) — the class rides the profile digest; aggregates never substitute",
+    "op class, block size, mix, queue depth, cache state ride `profile`, never the metric id",
+    "W1 and W4 carry capability baseline no_historical_baseline (descriptive/SLO, non-gating)",
+    "proposed entries finalize with the harness implementation and the cell cut; renames are a new id plus a deprecated alias"
+  ]
+}
