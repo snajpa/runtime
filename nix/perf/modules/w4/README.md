@@ -28,6 +28,13 @@ stamped by `schema/emit.sh`. The rich block summary is kept as
 (`warmup` | `measure`) — the harness should set it per block; `leg` is passed
 through (`A` | `B` | `AA`), `side` is `candidate` (W4 is envelope mode).
 
+`chunk` is the perf/2 object `{i,n}` (1-based) — `{1,1}` for block metrics,
+`{k,chunks}` for the per-artifact latency arrays. Under ABBA/BAAB the harness
+runs each leg twice per block and both runs forward (offset-aware `feed_leg`),
+so one block yields two sample records per (leg, block, metric) — the replicate
+pair `compare.paired()` medians. Open question (duplicate-identity guard vs
+replicates): `~/ai/logs/e2b-lane-b/perf-w4-abba-identity-finding.md`.
+
 ## Oracle
 
 `oracle <profile>` runs the correctness leg on the **tiny** class by default
@@ -42,7 +49,10 @@ error.
 - `PERF_W4_FIXTURES` — fixture cache (default `~/ai/logs/e2b-perf/fixtures`).
 - `PERF_W4_TOOL` — tool binary override; otherwise built from
   `PERF_TREE_DIR` (or `${PERF_TREES_DIR:-/root/ai/worktrees/e2b}/perf-<leg>`)
-  into the cache.
+  into the cache. First use builds atomically (tmp + `mv`) with the log at
+  `$FIXTURES/.bin/build-<leg>.log`; failures print its tail. The generator
+  (`fixtures/genstore.sh`) rebuilds the same way, log `.cache/bin/build.log`
+  under the perf log root.
 - `PERF_W4_DRY=1` — plan only.
 - `PERF_W4_ORACLE_CLASS` — oracle class override (default `tiny`).
 - `PERF_STAGE`, `PERF_LEG`, `PERF_ENV_CLASS`, `PERF_CAPTURE` (diagnostics).
