@@ -67,7 +67,14 @@
           packages = devPackages pkgs;
           shellHook = ''
             echo "e2b dev shell — $(go version 2>/dev/null || echo 'go: missing')"
-            echo "dev VM: nix build .#dev-vm && ./result/bin/e2b-dev-vm up"
+            # `make dev` is this shell; entering it is what sets the environment
+            # up. Set E2B_DEV_AUTO=0 to skip the bring-up and just get a shell.
+            if [ "''${E2B_DEV_AUTO:-1}" != "0" ] && [ -x ./nix/scripts/dev.sh ]; then
+              ./nix/scripts/dev.sh --ensure || echo "dev: bring-up failed, retry with 'make dev-up'"
+            fi
+            echo "  make dev        this shell, with the Ubuntu dev VM and its services up"
+            echo "  make tests      validate changes: host build/format/lint/tests, then the Ubuntu VM suites"
+            echo "  make rehearsal  S3 mixed-version storage rehearsal (Silo, old/new checkouts)"
           '';
         };
       });

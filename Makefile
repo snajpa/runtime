@@ -156,3 +156,38 @@ tidy:
 .PHONY: local-infra
 local-infra:
 	$(MAKE) -C packages/local-dev local-infra
+
+# --- dev environment (Nix) --------------------------------------------------
+# Two easy ways to work on this repo; details in nix/README.md.
+#   make dev        enter the dev environment: Nix dev shell, Ubuntu dev VM
+#                   (the shape the product is validated on) and the services
+#                   inside it (ublk_drv, Silo object store, NFS cache dir)
+#   make tests      validate changes here: host build/format/lint/tests for the
+#                   changed packages, then the root-gated storage suites inside
+#                   the Ubuntu VM
+#   make rehearsal  run the S3 mixed-version storage rehearsal (old/new runtime
+#                   checkouts against one Silo store, upgrade + rollback legs)
+#
+# The existing test/lint/fmt targets above stay as they are: `make dev` and
+# `make tests` are the environment and the full validation path, not a
+# replacement for the per-module targets.
+
+.PHONY: dev dev-up dev-status dev-services tests rehearsal
+
+dev:
+	exec nix develop
+
+dev-up:
+	./nix/scripts/dev.sh --ensure
+
+dev-status:
+	./nix/scripts/dev.sh --status
+
+dev-services:
+	./nix/scripts/dev.sh --services
+
+tests:
+	./nix/scripts/dev-tests.sh
+
+rehearsal:
+	./nix/rehearsal/run-matrix.sh
