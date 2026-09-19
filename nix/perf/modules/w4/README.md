@@ -25,15 +25,17 @@ produces oracle evidence + raw samples only — no verdicts.
 block-level metrics and `artifact` for per-artifact ones; the envelope is
 stamped by `schema/emit.sh`. The rich block summary is kept as
 `<leg-dir>/block.json` (artifact). `stage` comes from `PERF_STAGE`
-(`warmup` | `measure`) — the harness should set it per block; `leg` is passed
-through (`A` | `B` | `AA`), `side` is `candidate` (W4 is envelope mode).
+(`warmup` | `measure`) — the harness sets it per block; `leg` is the harness's
+per-position token (`A1..A2`/`B1..B2`) and `side` comes from `PERF_SIDE`
+(`baseline` | `candidate`; fallback `candidate` for envelope mode).
 
 `chunk` is the perf/2 object `{i,n}` (1-based) — `{1,1}` for block metrics,
-`{k,chunks}` for the per-artifact latency arrays. Under ABBA/BAAB the harness
-runs each leg twice per block and both runs forward (offset-aware `feed_leg`),
-so one block yields two sample records per (leg, block, metric) — the replicate
-pair `compare.paired()` medians. Open question (duplicate-identity guard vs
-replicates): `~/ai/logs/e2b-lane-b/perf-w4-abba-identity-finding.md`.
+`{k,chunks}` for the per-artifact latency arrays. Position-leg tokens resolve
+to their side's tree and share the side-keyed tool cache; the comparator
+normalizes `A*→A`/`B*→B` when pairing (identity keeps the raw leg). The earlier
+duplicate-identity conflict
+(`~/ai/logs/e2b-lane-b/perf-w4-abba-identity-finding.md`) is resolved by the
+per-position tokens + `PERF_SIDE`.
 
 ## Oracle
 
@@ -48,11 +50,12 @@ error.
 
 - `PERF_W4_FIXTURES` — fixture cache (default `~/ai/logs/e2b-perf/fixtures`).
 - `PERF_W4_TOOL` — tool binary override; otherwise built from
-  `PERF_TREE_DIR` (or `${PERF_TREES_DIR:-/root/ai/worktrees/e2b}/perf-<leg>`)
+  `PERF_TREE_DIR` (or `${PERF_TREES_DIR:-/root/ai/worktrees/e2b}/perf-<side>`)
   into the cache. First use builds atomically (tmp + `mv`) with the log at
-  `$FIXTURES/.bin/build-<leg>.log`; failures print its tail. The generator
+  `$FIXTURES/.bin/build-<side>.log`; failures print its tail. The generator
   (`fixtures/genstore.sh`) rebuilds the same way, log `.cache/bin/build.log`
   under the perf log root.
 - `PERF_W4_DRY=1` — plan only.
 - `PERF_W4_ORACLE_CLASS` — oracle class override (default `tiny`).
-- `PERF_STAGE`, `PERF_LEG`, `PERF_ENV_CLASS`, `PERF_CAPTURE` (diagnostics).
+- `PERF_STAGE`, `PERF_LEG`, `PERF_SIDE`, `PERF_ENV_CLASS`, `PERF_CAPTURE`
+  (diagnostics).

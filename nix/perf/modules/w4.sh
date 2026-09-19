@@ -62,19 +62,25 @@ ensure_store() {
 
 resolve_tool() {
 	leg=$1
+	# per-position leg tokens (A1/B2/…) share the side's tree + tool cache
+	case "$leg" in
+	A*) side=A ;;
+	B*) side=B ;;
+	*)  side=$leg ;;
+	esac
 	if [ -n "${PERF_W4_TOOL:-}" ]; then
 		echo "$PERF_W4_TOOL"
 		return 0
 	fi
 
-	tree=${PERF_TREE_DIR:-"$TREES/perf-$leg"}
+	tree=${PERF_TREE_DIR:-"$TREES/perf-$side"}
 	if [ ! -d "$tree" ]; then
 		echo "w4: no tree dir $tree (set PERF_TREE_DIR or materialize it via trees.sh)" >&2
 		return 1
 	fi
 
-	bin="$FIXTURES/.bin/migrate-builds-$leg"
-	log="$FIXTURES/.bin/build-$leg.log"
+	bin="$FIXTURES/.bin/migrate-builds-$side"
+	log="$FIXTURES/.bin/build-$side.log"
 	mkdir -p "$FIXTURES/.bin"
 
 	if [ ! -x "$bin" ]; then
@@ -82,7 +88,7 @@ resolve_tool() {
 		tmp="$bin.tmp.$$"
 		if ! (cd "$tree" && go build -o "$tmp" ./packages/orchestrator/cmd/migrate-builds) \
 			>"$log" 2>&1; then
-			echo "w4: tool build failed for $leg (log: $log)" >&2
+			echo "w4: tool build failed for side $side (leg $leg; log: $log)" >&2
 			if [ -s "$log" ]; then
 				tail -n 20 "$log" >&2
 			else

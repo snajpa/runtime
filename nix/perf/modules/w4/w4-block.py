@@ -213,6 +213,7 @@ def main():
         f.write("\n")
 
     stage = os.environ.get("PERF_STAGE", "measure")
+    side = os.environ.get("PERF_SIDE", "candidate")
     samples = []
 
     def add(metric_id, unit, unit_id, values):
@@ -221,7 +222,7 @@ def main():
 
         samples.append({
             "record": "sample", "workload": "W4", "profile": a.profile,
-            "side": "candidate", "leg": a.leg, "block": a.block, "stage": stage,
+            "side": side, "leg": a.leg, "block": a.block, "stage": stage,
             "metric": {"id": metric_id, "unit": unit}, "unit_id": unit_id,
             "chunk": {"i": 1, "n": 1}, "samples": values,
         })
@@ -238,7 +239,7 @@ def main():
         for i in range(0, len(lat), 1024):
             samples.append({
                 "record": "sample", "workload": "W4", "profile": a.profile,
-                "side": "candidate", "leg": a.leg, "block": a.block, "stage": stage,
+                "side": side, "leg": a.leg, "block": a.block, "stage": stage,
                 "metric": {"id": "migrate_latency_ms", "unit": "ms"},
                 "unit_id": "artifact", "chunk": {"i": i // 1024 + 1, "n": nchunks},
                 "samples": lat[i:i + 1024],
