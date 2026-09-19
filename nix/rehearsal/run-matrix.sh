@@ -154,7 +154,7 @@ if [ "${NODES:-0}" -gt 1 ]; then
 
 			"$bin" write --storage-url "$STORE" --prefix "$RUN/fanout/node-$i" \
 				--manifest "$MAN/$RUN-fanout-$i.json" --profile "$PROFILE"
-		) >"$FAN/write-$i.json" 2>&1 &
+		) >"$FAN/write-$i.json" 2>"$FAN/write-$i.err" &
 
 		i=$((i + 1))
 	done
@@ -176,13 +176,14 @@ if [ "${NODES:-0}" -gt 1 ]; then
 
 			"$bin" read --manifest "$MAN/$RUN-fanout-$next.json"
 			"$bin" exists --manifest "$MAN/$RUN-fanout-$next.json"
-		) >>"$FAN/read-$i.json" 2>&1 &
+		) >>"$FAN/read-$i.json" 2>>"$FAN/read-$i.err" &
 
 		i=$((i + 1))
 	done
 	wait
 
 	cat "$FAN"/*.json >>"$OUT"
+	cat "$FAN"/*.err >>"$OUT.err" 2>/dev/null || true
 fi
 
 if [ "${SPRAY:-0}" -gt 0 ]; then
@@ -202,18 +203,18 @@ if [ "${PEER:-0}" = "1" ]; then
 	PEER_NEW=$BASE/bin/$NEW_PEER_BIN
 
 	# The old build serves, the new build fetches (upgrade direction).
-	"$PEER_OLD" serve --addr 127.0.0.1:9101 --manifest "$MAN/$RUN-new.json" >>"$OUT" 2>&1 &
+	"$PEER_OLD" serve --addr 127.0.0.1:9101 --manifest "$MAN/$RUN-new.json" >>"$OUT" 2>>"$OUT.err" &
 	server_old=$!
 	sleep 2
-	"$PEER_NEW" fetch --peer 127.0.0.1:9101 --manifest "$MAN/$RUN-new.json" >>"$OUT" 2>&1
+	"$PEER_NEW" fetch --peer 127.0.0.1:9101 --manifest "$MAN/$RUN-new.json" >>"$OUT" 2>>"$OUT.err"
 	kill "$server_old" 2>/dev/null || true
 	wait "$server_old" 2>/dev/null || true
 
 	# The new build serves, the old build fetches (rollback direction).
-	"$PEER_NEW" serve --addr 127.0.0.1:9102 --manifest "$MAN/$RUN-old.json" >>"$OUT" 2>&1 &
+	"$PEER_NEW" serve --addr 127.0.0.1:9102 --manifest "$MAN/$RUN-old.json" >>"$OUT" 2>>"$OUT.err" &
 	server_new=$!
 	sleep 2
-	"$PEER_OLD" fetch --peer 127.0.0.1:9102 --manifest "$MAN/$RUN-old.json" >>"$OUT" 2>&1
+	"$PEER_OLD" fetch --peer 127.0.0.1:9102 --manifest "$MAN/$RUN-old.json" >>"$OUT" 2>>"$OUT.err"
 	kill "$server_new" 2>/dev/null || true
 	wait "$server_new" 2>/dev/null || true
 fi
@@ -243,10 +244,16 @@ if [ "${FAULT:-0}" = "1" ]; then
 	# (the reader rejecting what it cannot parse). Both are correct; the only
 	# wrong outcome is the tampered artifact reading back as valid.
 	fault_read="$BASE/fault-read.json"
-	"$OLD" read --manifest "$MAN/$RUN-old.json" >"$fault_read" 2>&1 || true
+	# A fault read must be cold: an inherited, already-warm cache would serve
+	# the pre-tamper bytes and mask the tamper. Dedicated empty cache dir.
+	fault_cache=$(mktemp -d)
+	S3_REHEARSAL_CACHE_DIR="$fault_cache" "$OLD" read --manifest "$MAN/$RUN-old.json" \
+		>"$fault_read" 2>"$fault_read.err" || true
+	rm -rf "$fault_cache"
 	cat "$fault_read" >>"$OUT"
+	cat "$fault_read.err" >>"$OUT.err"
 
-	if grep -qE '"outcome":"(misread|rejected)"' "$fault_read" || grep -q "refused" "$fault_read"; then
+	if grep -qE '"outcome":"(misread|rejected)"' "$fault_read" || grep -q "refused" "$fault_read" "$fault_read.err"; then
 		printf '%s\n' '{"phase":"fault-injection","outcome":"ok","detail":"tampering detected (loud refusal or misread), never silent"}' >>"$OUT"
 	else
 		printf '%s\n' '{"phase":"fault-injection","outcome":"error","detail":"tampering went undetected: the tampered artifact read back as valid"}' >>"$OUT"
