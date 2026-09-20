@@ -44,7 +44,7 @@ verify wiring.
   `<dir>/perf-runs.jsonl`); validates against the `perf-2` schema, stamps `ts`,
   appends write-then-fsync (never partial lines); exit 0 / 40. Modules emit
   through the harness, never write the stream directly.
-- `report --replay|--verify --run-dir <dir> [--baseline <p>]` — **lane F**:
+- `report --run <run-id|run-dir>` / `report --verify --run <run-id|run-dir>` [`--baseline <p>`] — **lane F**:
   reads only (`replay-verify` contract). The verdict side (`calibrate` fixed
   bands + discriminability gate; `compare`) is `schema/compare.sh` — **landed**
   (`76697ce80`, with `bands.json` v0 defaults; five outcomes, exact exits).
@@ -104,7 +104,7 @@ verify wiring.
 Dispatch v1 (2026-09-19): the run path is wired end-to-end — per cell
 (oracle-first), 2 warmup + 12 measured ABBA/BAAB blocks with emitted `block`
 records, module `run` legs, and each leg's `samples.jsonl` fed to the T1
-emitter. Modules landed: W4 (lane B) · W6 (lane A) · W1 scaffold (`modules/w1.sh`, fail-closed; lane D runner semantics + lane C capture/device-window fill-ins).
+emitter. Modules landed: W4 (lane B) · W6 (lane A) · W1 (lane D — `modules/w1.sh` + `modules/w1/`; oracle + runner semantics + lane C's capture/device-window region; quiet 17-profile grid run).
 `emit.sh` + `compare.sh` + `busy-ref.sh` + `guest-capabilities.sh` + the
 capture wrapper are in. `selftest`, `--dry-run`, `calibrate`, `compare` and
-`report --replay|--verify` work today.
+`report --run` / `report --verify --run` work today.
