@@ -233,6 +233,10 @@ write("w7-xm.jsonl", [snap("snap-A"), snap("snap-B", fcver="1.13.0")], w7samples
 write("w7-noev.jsonl", [], w7samples(), w7orcs(), caps())
 write("w7-toexec.jsonl", [snap("snap-A"), snap("snap-B")], w7samples(), w7orcs(),
       caps(host_status="unavailable", host_req="to_execute"))
+write("w7-gateonly.jsonl", [snap("snap-A"), snap("snap-B")], w7samples(),
+      [{"record": "oracle", "kind": "gate/W7/restore", "passed": True}], caps())
+write("w8-gateonly.jsonl", [snap("snap-A"), snap("snap-B")], w8samples(),
+      [{"record": "oracle", "kind": "gate/W8/post-resume", "passed": True}], caps())
 PY3
 sh "$DIR/compare.sh" compare --stream "$TMP/w7.jsonl" --iters 200 --seed 7 >/dev/null 2>&1
 [ $? = 0 ] && ok 'W7 role-linked two-side evidence (trees differ) -> PASS' || bad 'W7 role-linked evidence' "$?" 0
@@ -256,6 +260,10 @@ sh "$DIR/compare.sh" compare --stream "$TMP/w7-noev.jsonl" --iters 200 --seed 7 
 [ $? = 30 ] && ok 'W7 without snapshot evidence -> INCONCLUSIVE' || bad 'W7 without snapshot evidence' "$?" 30
 sh "$DIR/compare.sh" compare --stream "$TMP/w7-toexec.jsonl" --iters 200 --seed 7 >/dev/null 2>&1
 [ $? = 40 ] && ok 'W7 to_execute capability missing -> SETUP_ERROR' || bad 'W7 to_execute missing' "$?" 40
+sh "$DIR/compare.sh" compare --stream "$TMP/w7-gateonly.jsonl" --iters 200 --seed 7 >/dev/null 2>&1
+[ $? = 30 ] && ok 'W7 gate-only (no role-linked oracle) -> INCONCLUSIVE' || bad 'W7 gate-only' "$?" 30
+sh "$DIR/compare.sh" compare --stream "$TMP/w8-gateonly.jsonl" --iters 200 --seed 7 >/dev/null 2>&1
+[ $? = 30 ] && ok 'W8 gate-only (no role-linked oracle) -> INCONCLUSIVE' || bad 'W8 gate-only' "$?" 30
 
 # unit_id grouping (reviewer1 2309): read/write series must not pool
 python3 - "$TMP/uid.jsonl" <<'PY3'

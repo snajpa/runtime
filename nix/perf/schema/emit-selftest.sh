@@ -32,6 +32,10 @@ run 0  'valid W7 runtime oracle' \
   '{"class":"warm","kind":"W7/restore","passed":true,"profile_digest":"abc1234","record":"oracle","role":"ready","side":"baseline","snapshot_id":"snap-1","workload":"W7"}'
 run 40 'runtime oracle missing role' \
   '{"class":"warm","kind":"W7/restore","passed":true,"profile_digest":"abc1234","record":"oracle","side":"baseline","snapshot_id":"snap-1","workload":"W7"}'
+run 0  'gate/W7 record accepted as setup evidence' \
+  '{"record":"oracle","kind":"gate/W7/seqread","passed":true}'
+run 0  'gate/W8 record accepted as setup evidence' \
+  '{"record":"oracle","kind":"gate/W8/post-resume","passed":true}'
 run 40 'chunk must be an object' \
   '{"record":"sample","workload":"W1","profile":"p","side":"baseline","leg":"A","block":1,"stage":"measure","metric":{"id":"iops","unit":"count/s"},"unit_id":"u","chunk":0,"samples":[1]}'
 run 40 'missing chunk' \
@@ -57,7 +61,7 @@ EOF
 run 0  'note ok' '{"record":"note","text":"x"}'
 
 n=$(wc -l < "$S" 2>/dev/null || echo 0)
-if [ "$n" = 6 ]; then ok 'stream has only the valid lines (6)'; else bad "stream lines=$n want 6"; fi
+if [ "$n" = 8 ]; then ok 'stream has only the valid lines (8)'; else bad "stream lines=$n want 8"; fi
 
 rm -rf "$TMP"
 if [ "$fails" = 0 ]; then echo 'selftest ok'; exit 0; fi
