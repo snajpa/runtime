@@ -53,6 +53,11 @@ import (
 const (
 	baseImage = "ubuntu:22.04"
 	proxyPort = 5009
+
+	// These opt-in paths let the smoke fixture run in an isolated VM without
+	// changing the default public artifact downloads.
+	localKernelFixtureEnv      = "E2B_SMOKETEST_KERNEL_PATH"
+	localFirecrackerFixtureEnv = "E2B_SMOKETEST_FIRECRACKER_PATH"
 )
 
 // TestSmokeAllFCVersions builds a template and resumes from it for every
@@ -388,12 +393,39 @@ func setupEnvVars(t *testing.T, dataDir, envdPath string) {
 func downloadKernel(t *testing.T, dataDir string) {
 	t.Helper()
 	dst := filepath.Join(dataDir, "kernels", featureflags.DefaultKernelVersion, artifact.KernelFileName)
+	if src := os.Getenv(localKernelFixtureEnv); src != "" {
+		copyLocalFixture(t, src, dst, 0o644)
+		t.Logf("using local kernel fixture %s", src)
+
+		return
+	}
+
 	url := fmt.Sprintf("https://storage.googleapis.com/e2b-artifact-binaries/kernels/%s/%s", featureflags.DefaultKernelVersion, artifact.KernelFileName)
 	downloadFile(t, url, dst, 0o644)
 }
 
 func downloadFC(t *testing.T, dataDir, version string) {
 	t.Helper()
+
+	localFixture := os.Getenv(localFirecrackerFixtureEnv)
+	if localFixture != "" {
+		if info, err := fcversion.New(version); err == nil {
+			if _, isE2B := info.E2BVersion(); isE2B {
+				arch := utils.TargetArch()
+				archDst := filepath.Join(dataDir, "fc-versions", version, arch, artifact.FirecrackerBinaryName)
+				copyLocalFixture(t, localFixture, archDst, 0o755)
+				t.Logf("using local Firecracker fixture %s", localFixture)
+
+				return
+			}
+		}
+
+		dst := filepath.Join(dataDir, "fc-versions", version, artifact.FirecrackerBinaryName)
+		copyLocalFixture(t, localFixture, dst, 0o755)
+		t.Logf("using local Firecracker fixture %s", localFixture)
+
+		return
+	}
 
 	dst := filepath.Join(dataDir, "fc-versions", version, artifact.FirecrackerBinaryName)
 
@@ -425,6 +457,38 @@ func downloadFC(t *testing.T, dataDir, version string) {
 
 	url := fmt.Sprintf("https://github.com/e2b-dev/fc-versions/releases/download/%s/%s", version, assetName)
 	downloadFile(t, url, dst, 0o755)
+}
+
+func copyLocalFixture(t *testing.T, src, dst string, perm os.FileMode) {
+	t.Helper()
+
+	info, err := os.Stat(src)
+	require.NoError(t, err, "stat local fixture %q", src)
+	require.True(t, info.Mode().IsRegular(), "local fixture %q is not a regular file", src)
+	require.Greater(t, info.Size(), int64(0), "local fixture %q is empty", src)
+
+	if filepath.Clean(src) == filepath.Clean(dst) {
+		require.NoError(t, os.Chmod(dst, perm))
+
+		return
+	}
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+
+	in, err := os.Open(src)
+	require.NoError(t, err, "open local fixture %q", src)
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	require.NoError(t, err, "create staged fixture %q", dst)
+
+	_, copyErr := io.Copy(out, in)
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	require.NoError(t, copyErr, "copy local fixture %q to %q", src, dst)
+	require.NoError(t, syncErr, "sync staged fixture %q", dst)
+	require.NoError(t, closeErr, "close staged fixture %q", dst)
+	require.NoError(t, os.Chmod(dst, perm))
 }
 
 func downloadFile(t *testing.T, url, dst string, perm os.FileMode) {
