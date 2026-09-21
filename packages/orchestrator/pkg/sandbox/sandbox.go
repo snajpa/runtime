@@ -317,6 +317,10 @@ type Sandbox struct {
 	// Server.checkpointInPlace.
 	inPlaceCheckpointInFlight atomic.Bool
 
+	// rootfsTransport records the transport selected before Firecracker attach.
+	// It is immutable for the sandbox lifecycle and is used by runtime evidence.
+	rootfsTransport rootfs.Transport
+
 	// useSyncWP records whether this sandbox was resumed with synchronous
 	// userfault write-protect delivery (use_sync_wp on snapshot load). Only
 	// then can the page tracker serve as the pause-time dirty source.
@@ -444,6 +448,11 @@ func (s *Sandbox) RunUpdate(update func() error) error {
 // during resume before the sandbox is published, so it needs no locking.
 func (s *Sandbox) UseSyncWP() bool {
 	return s.useSyncWP
+}
+
+// RootfsTransport reports the transport selected for this sandbox lifecycle.
+func (s *Sandbox) RootfsTransport() rootfs.Transport {
+	return s.rootfsTransport
 }
 
 func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
@@ -854,7 +863,18 @@ func (f *Factory) CreateSandbox(
 	}
 
 	var rootfsProvider rootfs.Provider
-	if rootfsCachePath == "" {
+	selectedTransport := rootfs.TransportDirect
+	useUblk := rootfsCachePath == "" && f.featureFlags.BoolFlag(ctx, featureflags.UblkRootfsFlag)
+	if useUblk {
+		rootfsProvider, selectedTransport, err = rootfs.NewUblkProviderWithFallback(
+			execCtx,
+			rootFS,
+			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
+			f.devicePool,
+			f.featureFlags,
+		)
+	} else if rootfsCachePath == "" {
+		selectedTransport = rootfs.TransportNBD
 		rootfsProvider, err = rootfs.NewNBDProvider(
 			ctx,
 			rootFS,
@@ -875,12 +895,14 @@ func (f *Factory) CreateSandbox(
 		return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
 	}
 	cleanup.Add(ctx, rootfsProvider.Close)
-	go func() {
-		runErr := rootfsProvider.Start(execCtx)
-		if runErr != nil {
-			runtime.Logger().Error(ctx, "rootfs overlay error", zap.Error(runErr))
-		}
-	}()
+	if !useUblk {
+		go func() {
+			runErr := rootfsProvider.Start(execCtx)
+			if runErr != nil {
+				runtime.Logger().Error(ctx, "rootfs overlay error", zap.Error(runErr))
+			}
+		}()
+	}
 
 	memfile, err := template.Memfile(ctx)
 	if err != nil {
@@ -962,6 +984,7 @@ func (f *Factory) CreateSandbox(
 	sbx := &Sandbox{
 		LifecycleID:        lifecycleID,
 		LifecycleStartedAt: time.Now().UTC(),
+		rootfsTransport:    selectedTransport,
 
 		Resources:    resources,
 		Metadata:     metadata,
@@ -1335,7 +1358,10 @@ func (f *Factory) ResumeSandbox(
 	// Slot initialization
 	ipsPromise := getNetworkSlot(ctx, f.networkPool, cleanup, config.Network, f.Sandboxes.NetworkReleased, runtime.SandboxType.EgressClass())
 
-	// Rootfs initialization
+	// Rootfs initialization. The opt-in ublk arm starts synchronously so a
+	// pre-attachment admission failure can still fall back to NBD safely.
+	useUblk := f.featureFlags.BoolFlag(ctx, featureflags.UblkRootfsFlag)
+	selectedTransport := rootfs.TransportNBD
 	overlayPromise := utils.NewPromise(func() (rootfs.Provider, error) {
 		readonlyRootfs, err := t.Rootfs()
 		if err != nil {
@@ -1344,13 +1370,24 @@ func (f *Factory) ResumeSandbox(
 
 		telemetry.ReportEvent(ctx, "got template rootfs")
 
-		overlay, err := rootfs.NewNBDProvider(
-			ctx,
-			readonlyRootfs,
-			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
-			f.devicePool,
-			f.featureFlags,
-		)
+		var overlay rootfs.Provider
+		if useUblk {
+			overlay, selectedTransport, err = rootfs.NewUblkProviderWithFallback(
+				execCtx,
+				readonlyRootfs,
+				sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
+				f.devicePool,
+				f.featureFlags,
+			)
+		} else {
+			overlay, err = rootfs.NewNBDProvider(
+				ctx,
+				readonlyRootfs,
+				sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
+				f.devicePool,
+				f.featureFlags,
+			)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
 		}
@@ -1359,12 +1396,14 @@ func (f *Factory) ResumeSandbox(
 
 		telemetry.ReportEvent(ctx, "created rootfs overlay")
 
-		go func() {
-			runErr := overlay.Start(execCtx)
-			if runErr != nil {
-				sbxLogger.Error(ctx, "rootfs overlay error", zap.Error(runErr))
-			}
-		}()
+		if !useUblk {
+			go func() {
+				runErr := overlay.Start(execCtx)
+				if runErr != nil {
+					sbxLogger.Error(ctx, "rootfs overlay error", zap.Error(runErr))
+				}
+			}()
+		}
 
 		return overlay, nil
 	})
@@ -1538,6 +1577,7 @@ func (f *Factory) ResumeSandbox(
 	sbx := &Sandbox{
 		LifecycleID:        lifecycleID,
 		LifecycleStartedAt: time.Now().UTC(),
+		rootfsTransport:    selectedTransport,
 
 		Resources:    resources,
 		Metadata:     metadata,

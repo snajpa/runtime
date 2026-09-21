@@ -232,9 +232,16 @@ Key mechanisms (all under `pkg/sandbox/`):
 - **Lazy memory / UFFD** (`uffd/`): on resume, Firecracker restores the VM without loading
   memory; a userfaultfd handler serves page faults directly from the template's memfile, so only
   touched pages are read. An optional prefetcher warms known-hot pages.
-- **Copy-on-write rootfs** (`rootfs/`, `nbd/`, `block/`): the template rootfs stays read-only;
-  writes go to a per-sandbox COW cache exposed to Firecracker as an NBD block device served by
-  an in-process userspace NBD server. On pause, the dirty blocks are exported as a diff.
+- **Copy-on-write rootfs** (`rootfs/`, `nbd/`, `ublk/`, `block/`): the template rootfs stays
+  read-only; writes go to a per-sandbox COW cache. By default, an in-process NBD server exposes
+  that overlay as a host block device. The opt-in `ublk-rootfs` flag selects Linux ublk instead,
+  serving the same overlay through io_uring queue owners; Firecracker still attaches a host
+  block device and the guest still uses virtio-blk. The selector can fall back to NBD only
+  before kernel side effects and after successful local cleanup; uncertain partial startup
+  fails admission and retains ownership. `Sandbox.RootfsTransport()` reports the selected
+  transport. Dirty-block diff formats, parent chains and publication are unchanged, including
+  the existing deferred cache eject/swap/fold path. Ublk cleanup retains the overlay until
+  device release is proven; a later release does not erase an earlier timeout/cleanup error.
 - **Template cache** (`template/`): templates are fetched lazily from object storage and cached
   on local disk (and optionally on a shared NFS chunk cache, or fetched peer-to-peer from other
   nodes before upload completes).
@@ -396,7 +403,7 @@ sequenceDiagram
     API->>API: best-of-K placement → pick node
     API->>O: gRPC SandboxService.Create(SandboxConfig)
     O->>O: fetch template (local cache / NFS / object storage)
-    O->>O: acquire network slot + NBD rootfs overlay + uffd memory
+    O->>O: acquire network slot + rootfs overlay (NBD default, ublk opt-in) + uffd memory
     O->>FC: load snapshot, resume VM
     O->>E: POST /init (env vars, access token) — retried until ready
     E-->>O: 204

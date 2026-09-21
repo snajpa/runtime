@@ -515,6 +515,10 @@ var (
 	// as guest I/O errors. Disabled by default.
 	NBDAsyncWriteZeroesFlag = NewBoolFlag("nbd-async-write-zeroes", false)
 
+	// UblkRootfsFlag enables the opt-in ublk rootfs provider. NBD remains the
+	// default until ublk lifecycle and runtime evidence justify broader use.
+	UblkRootfsFlag = NewBoolFlag("ublk-rootfs", false)
+
 	// MemoryPrefetchMaxFetchWorkers is the maximum number of parallel fetch workers per sandbox for memory prefetching.
 	// Fetching is I/O bound so we can have more parallelism.
 	MemoryPrefetchMaxFetchWorkers = NewIntFlag("memory-prefetch-max-fetch-workers", 16)

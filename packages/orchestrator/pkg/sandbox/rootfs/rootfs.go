@@ -33,7 +33,9 @@ type Provider interface {
 	ExportDiff(ctx context.Context, out *os.File, closeSandbox func(context.Context) error) (*header.DiffMetadata, error)
 	// PrepareExportDiff ejects the writable cache and stops the sandbox, returning
 	// the frozen ejected cache without reflinking it, so the caller can seal it
-	// into a diff in the background. Only the NBD provider supports it.
+	// into a diff in the background. Providers with a live overlay lifecycle
+	// may support it; providers without that lifecycle return
+	// ErrDeferredExportNotSupported.
 	PrepareExportDiff(ctx context.Context, closeSandbox func(context.Context) error) (*block.Cache, error)
 	// ExportDiffInPlace exports the rootfs diff without destroying the overlay, so
 	// a sandbox that resumes in place keeps running on the same cache.
